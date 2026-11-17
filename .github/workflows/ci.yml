@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: linux
     timeout-minutes: 10
 
     steps:
@@ -47,7 +47,7 @@ jobs:
   fixture-stale:
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: linux
     timeout-minutes: 5
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
 
