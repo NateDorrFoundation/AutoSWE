@@ -542,6 +542,10 @@ Canonical reference: `docs/antigravity/` (mirror of antigravity.google docs, raw
 endpoints — see its README for the ToC and refresh commands). Start with
 `sdk-overview.md`, `sdk-tools.md`, `sdk-mcp.md`, `cli-headless.md`.
 
+**Implementation plan:** `docs/autoswe/PLAN-antigravity-backend/` (README + Phases 0–7,
+proposed 2026-11-18). Headless CLI (`agy`, `stream-json`) is the chosen core
+transport; the Python SDK transport is deferred to Phase 7.
+
 **Open questions before implementation:** whether headless print mode emits a usable
 streaming event protocol (vs. final-only text), how credits/quota map to
 `cost_usd` (no per-run USD reported; likely report-not-estimate is impossible → null),
