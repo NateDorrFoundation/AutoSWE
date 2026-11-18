@@ -19,8 +19,13 @@ A harness profile like this one should drive a full plan → fix → review cycl
 from issue comments:
 
 ```json
-"agy-neon": { "backend": "antigravity", "model": "gemini-4-neon-high" }
+`"agy-neon": { "backend": "antigravity", "model": "gemini-4-neon-high" }`
 ```
+
+**Host decision (2026-11-18, Nate):** the workstream executes on the **Linux dev box
+`megibot`** (agy 1.5.11 + SDK already staged). Windows-specific spike answers and
+shim/kill paths are marked **windows-pending**: the code still ships the Windows
+branches, but verification happens in a later Windows parity pass (Phase 6 follow-up).
 
 ## Transport decision: headless CLI first, SDK later
 

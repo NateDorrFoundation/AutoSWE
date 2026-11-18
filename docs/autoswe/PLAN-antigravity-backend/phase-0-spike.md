@@ -17,14 +17,18 @@ project, **not** in this repo.
 
 ## 0.1 Install & auth
 
-1. Install the CLI following `docs/antigravity/getting-started.md` (CLI tab,
-   PowerShell installer). Record:
-   - the resolved binary (`(Get-Command agy).Source`): is it `.exe`, `.cmd`, or `.ps1`?
-     This decides the `_resolve_agy_executable` branch in Phase 1.
-   - `agy --version`. This becomes the floor for the Phase 6 version test.
+1. Install/verify the CLI (`curl -fsSL https://antigravity.google/cli/install.sh | bash`,
+   see `docs/antigravity/getting-started.md`). Record:
+   - the resolved binary (`which agy`): on megibot it is a Linux ELF at
+     `~/.local/bin/agy`. The `.cmd`/`.ps1` branches of `_resolve_agy_executable`
+     (Phase 1) stay implemented but **windows-pending**.
+   - `agy --version` (megibot: 1.5.11). This becomes the floor for the Phase 6 version test.
 2. Authenticate in each mode autoSWE might use, and note which one works
-   **without a TTY** (run from a scheduled task / `Start-Process -NoNewWindow`):
-   - OAuth (keyring: Windows Credential Manager, `install.md:73`).
+   **without a TTY** (run from cron / `systemd-run`):
+   - OAuth (keyring: Linux Secret Service/dbus — megibot may have no keyring daemon;
+     record what happens, and whether the printed OAuth URL completes when opened from
+     a *different* machine, since `redirect_uri` is `https://antigravity.google/oauth-callback`,
+     not localhost).
    - Gemini API key: `GEMINI_API_KEY` + `"modelProvider": "gemini"` in
      `~/.gemini/antigravity-cli/settings.json` (`cli-reference.md:193`). Confirm whether
      the env var alone is enough or the setting is also required. This decides
@@ -49,7 +53,7 @@ Run each one with `--output-format stream-json` and save the raw stdout:
 | T5 | `--model does-not-exist` | Error envelope, exit code 1 | `unknown_model.jsonl` |
 | T6 | `--json-schema <file>` **plus** tool use (read a file, then answer in the schema) | Is `structured_output` populated after a multi-step agentic run, not just a one-shot answer? A schema-violation case? | `structured_output.jsonl` |
 | T7 | Resume: run T1, then `--conversation <id>` with "what did I ask?" | Resume works headless. Does the id stay the same or change? | `resume.jsonl` |
-| T8 | Kill mid-run (`taskkill /T /F` on the tree after 5 s) | Does the CLI leave child processes behind? Is the conversation still resumable? Last line written? | `killed_partial.jsonl` |
+| T8 | Kill mid-run (`kill -TERM -<pgid>` on the process group after 5 s, `start_new_session`) | Does the CLI leave child processes behind (`ps -o pgid` check)? Is the conversation still resumable? Last line written? (`taskkill /T /F` shape stays windows-pending) | `killed_partial.jsonl` |
 | T9 | `--print-timeout 10s` on a long task | Timeout status (`CANCELED`? `ERROR`?) and exit code | `print_timeout.jsonl` |
 | T10 | A prompt that makes the agent call `ask_question` | Does the run end with `status: "WAITING"`? Can `ask_question` be denied (`permissions.deny`) or is it absent in headless? | `waiting.jsonl` |
 | T11 | Prompt that starts with `/plan` text, with and without `--disable-slash-commands` | Proves the flag stops issue-comment text from being run as a CLI slash command | — |
@@ -70,8 +74,8 @@ global `~/.gemini/antigravity-cli/settings.json`** (that would race under
 |---|---|---|
 | P1 | `--mode plan` without `--dangerously-skip-permissions`, prompt: "write a file named x.txt" | No file is written. Record whether it is soft-denied (the stderr notice, `cli-headless.md` "Permissions in headless mode") or refused by the model |
 | P2 | Default mode, no skip flag, `permissions.deny: ["write_file(<abs repo path>)", "command(*)"]` | Writes and commands are blocked, but reads (`view_file`, `search_directory`) work |
-| P3 | Is there a **per-invocation config override**? Try in order: (a) workspace `<repo>/.agents/settings.json` (does it exist? MCP has a workspace file at `.agents/mcp_config.json`); (b) overriding `USERPROFILE`/`HOME` to an isolated dir. Does auth survive, given it lives in the OS keyring rather than a file? (c) any `--settings`/config-dir flag in `agy --help` (not in the mirrored docs, so check the live binary) | Find a lever that scopes the deny rules to one run |
-| P4 | Same as P2 under `--sandbox` | Does the sandbox add OS-level write blocking on Windows (`sandbox.md`; v1.4.4+)? |
+| P3 | Is there a **per-invocation config override**? Try in order: (a) workspace `<repo>/.agents/settings.json` (does it exist? MCP has a workspace file at `.agents/mcp_config.json`); (b) overriding `HOME` to an isolated dir (`USERPROFILE` is the Windows twin, windows-pending). Does auth survive, given it may live in the OS keyring rather than a file? (c) any `--settings`/config-dir flag in `agy --help` (not in the mirrored docs, so check the live binary) | Find a lever that scopes the deny rules to one run |
+| P4 | Same as P2 under `--sandbox` | Does the sandbox add OS-level write blocking on Linux (`sandbox.md`)? Windows behavior stays windows-pending |
 | P5 | Does a read-only run still allow MCP tool calls (needed for `post_plan`)? `mcp(autoswe_comment/*)` allow rule | The MCP call goes through while `write_file` stays denied |
 
 **Decision rule:** if P3 finds a per-run lever and P1 or P2 blocks writes,

@@ -138,10 +138,11 @@ Copy `PiBackend._run_async`:
   headless soft-deny notice (Phase 0 P1 records the exact text) are logged as
   `[WARN][ANTIGRAVITY] soft-denied: …`. They are the first sign of a permission
   misconfiguration.
-- On timeout: kill the **process tree**. On Windows use `taskkill /T /F /PID`, because
-  `process.kill()` only kills the `cmd` shim and leaves `agy` orphaned (confirm with
-  Phase 0 T8). On POSIX use `os.killpg` with `start_new_session=True`. Put this in a
-  small `_kill_tree(process)` helper. If pi.py has the same latent gap, flag it
+- On timeout: kill the **process tree**. On POSIX (the live path on megibot) use
+  `os.killpg` with `start_new_session=True` (confirm with Phase 0 T8). Keep the Windows
+  branch — `taskkill /T /F /PID`, because `process.kill()` only kills the `cmd` shim —
+  implemented but **windows-pending** until the parity pass. Put both in a small
+  `_kill_tree(process)` helper. If pi.py has the same latent gap, flag it
   in the PR, but don't fix it here.
 
 ## 1.8 Capabilities (Phase 1)

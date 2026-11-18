@@ -48,25 +48,28 @@ Then the downstream files:
   queried, so CI without `agy` stays green. Expose `MIN_AGY_VERSION` from
   `antigravity.py`, and have the backend log `[WARN]` once per process when the
   installed CLI is below it (don't fail the run).
-- **`setup.ps1` / `setup.sh`**: no install step (the CLI is a user-level install that
+- **`setup.sh` / `setup.ps1`**: no install step (the CLI is a user-level install that
   needs interactive auth). Add a **check** that, when any harness profile uses
   `backend: antigravity`, runs `agy --version` and prints the one-time
   "run `agy` interactively once to authenticate" hint. Add the Phase 5 warm-up call only
   if Phase 5 §5.5 was needed.
 - **`update.ps1` / `update.sh`**: no change (the CLI updates itself). Document this in
   `debugging.md`.
-- **Live profile:** add an `agy-live` profile to the dedicated box's
-  `config/harnesses.json` (gitignored), with absolute Windows `cli_path`/`log_dir` and
-  a `_comment` in the same style as `pi-local`.
+- **Live profile:** add an `agy-live` profile to the Linux dev box megibot's
+  `config/harnesses.json` (gitignored), with absolute Linux `cli_path`
+  (`~/.local/bin/agy`, expanded) / `log_dir` and a `_comment` in the same style as
+  `pi-local`. The Windows-box live profile is deferred to the windows-pending parity
+  pass.
 
 ## 6.3 Live E2E (`tests/e2e/`)
 
 - `tests/e2e/MATRIX.md`: add an `antigravity` backend column.
 - Drive the corpus (`tests/e2e/README.md`, `VERIFY.md`) with
   `PLAN_HARNESS=FIX_HARNESS=REVIEW_HARNESS=agy-live` on the GitHub **and** Azure test
-  projects. At a minimum, cover: plan → fix → review → PR happy path; `/retry` after an
-  induced failure; `/abort` mid-fix (kill path, no orphaned `agy` processes —
-  check with `Get-Process agy`); a mixed config (Claude plan → antigravity fix).
+  projects, driven from megibot (Linux). At a minimum, cover: plan → fix → review → PR
+  happy path; `/retry` after an induced failure; `/abort` mid-fix (kill path, no
+  orphaned `agy` processes — check with `pgrep -g <pgid>`); a mixed config (Claude
+  plan → antigravity fix). Windows-box matrix rows stay windows-pending.
 - Record findings per `REPORTING.md`. File any bug as an issue tagged `antigravity`,
   each with a `TRANSITIONS` row added when fixed.
 
