@@ -524,6 +524,30 @@ There is no price table analogous to `codex_pricing.py`.
 - **Large JSON line handling (issue #251).** The subprocess (and the MCP warm-up) is spawned with a StreamReader ``limit=_MAX_STREAM_BYTES + 1`` (16 MiB + 1) so that either pipe can hold a legitimately large single JSON line — the asyncio default is only 64 KiB. If a line still exceeds that limit, ``readline()`` raises ``ValueError``; the backend catches it, sets the run's error flag, and drains the rest of stdout, so the run surfaces as ``subtype="error"`` instead of the uncaught exception propagating out of the runner and crashing the poller.
 - Duration is tracked via ``time.monotonic()`` locally.
 
+#### `antigravity` (candidate — docs mirrored, backend not yet implemented)
+
+Google Antigravity offers two viable transports for a future backend:
+
+- **Python SDK** — `pip install google-antigravity`, `from google.antigravity import
+  Agent, LocalAgentConfig`, async `agent.chat()`. First-party Python, so unlike pi/codex
+  this could be an in-process backend (same shape as `claude_code`): MCP servers,
+  `BuiltinTools` allowlists (`enabled_tools`/`disabled_tools` in `CapabilitiesConfig`),
+  safety policies, and subagents are all first-class SDK config. Requires
+  `GEMINI_API_KEY` (or `LocalAgentConfig(vertex=True, ...)` for Vertex).
+- **Headless CLI** — `agy -p "prompt"` (print mode) with `--input-format` for
+  machine-readable streams, plus an ACP (Agent Client Protocol) server mode. This is the
+  pi/codex-style subprocess transport if the SDK surface turns out to be too opaque.
+
+Canonical reference: `docs/antigravity/` (mirror of antigravity.google docs, raw `.md`
+endpoints — see its README for the ToC and refresh commands). Start with
+`sdk-overview.md`, `sdk-tools.md`, `sdk-mcp.md`, `cli-headless.md`.
+
+**Open questions before implementation:** whether headless print mode emits a usable
+streaming event protocol (vs. final-only text), how credits/quota map to
+`cost_usd` (no per-run USD reported; likely report-not-estimate is impossible → null),
+whether the SDK supports session resume for `agent_session_id`, and the license/ToS
+posture for CI automation.
+
 ### Shared RunSpec → RunResult contract (backends/base.py)
 
 All backends implement the `CodingBackend` protocol and share two cross-cutting
