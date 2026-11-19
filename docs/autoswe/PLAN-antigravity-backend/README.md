@@ -1,6 +1,9 @@
 # Plan — add `antigravity` as a first-class coding backend
 
-**Status:** proposed (2026-11-18) · **Branch:** `antigravity` (PRs target `antigravity`
+**Status:** Phase 0 complete — spike verdict in
+[`spike-antigravity.md`](../spike-antigravity.md): transport = headless CLI (BYOK
+bridge auth), **GO** on stdin transport / `mode` via per-run `--settings` / MCP
+eager+env / `structured_output` (advisory — validate downstream) (2026-11-18/19) · **Branch:** `antigravity` (PRs target `antigravity`
 during the workstream, then one merge PR to `master`) · **Reference docs:**
 `docs/antigravity/` (49-page mirror) · **Prior art:** `PLAN-pi-backend.md` /
 `PLAN-pi-mcp.md` (git history, commits `583b0a2`, `ec28279`), `spike-pi-mcp.md`.
@@ -54,8 +57,8 @@ becomes a follow-up instead of blocking the core backend.
 |---|---|---|---|
 | `resume` | ✅ | `--conversation <conversation_id>` | 1 |
 | `progress_stream` | ✅ | `step_update` events (`tool`, `agent_response` `text_delta`) | 1 |
-| `structured_output` | ✅ (if the spike confirms it under tool use) | `--json-schema <file>` → `result.structured_output` | 1 |
-| `mode` | ✅ (if the spike confirms enforcement) | `--mode plan` + per-run deny rules, no `--dangerously-skip-permissions` on read-only phases | 4 |
+| `structured_output` | ✅ **confirmed (Phase 0, T6)** — but **advisory**: the model can violate the schema and still report SUCCESS; harness must validate downstream | `--json-schema <file>` → `result.structured_output`, populated after multi-step tool use | 1 |
+| `mode` | ✅ **confirmed (Phase 0, P1–P3)** — but **not** via `--mode plan` (advisory, writes succeeded): per-run `--settings` inline `permissions.deny` with **directory-prefix** rules (`write_file(<repo>/)`, glob `/*` doesn't match) + no `--dangerously-skip-permissions` on read-only phases; MCP stays allowed under the deny profile (P5) | per-run `--settings` override ("never saved"), global settings untouched → race-free under `MAX_CONCURRENT > 1` | 4 |
 | `mcp` | ✅ | stable `mcp_config.json` entry with `eager: true` tools; per-task env through the subprocess env | 5 |
 | `session_fork` | ❌ | no fork primitive documented. Do not advertise it; `/retry` resumes in place or starts fresh (Codex semantics) | — |
 | `can_use_tool` | ❌ (CLI) | SDK-only. See Phase 7 | 7 |
