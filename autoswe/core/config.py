@@ -330,7 +330,35 @@ def _validate_done_state(repo_key: str, entry: dict, cfg: dict) -> None:
 
 
 # Recognized backend names (populated as new backends are added).
-KNOWN_BACKENDS = {"claude_code", "codex", "pi"}
+KNOWN_BACKENDS = {"claude_code", "codex", "pi", "antigravity"}
+
+# Effort levels the antigravity validation accepts (issue #319).  Which values
+# a given model actually supports is enforced by the agy CLI at run time; this
+# set only catches typos at startup.
+_ANTIGRAVITY_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+
+
+def _coerce_bool(key: str, field: str, value: object) -> bool:
+    """Coerce a harness profile bool field, failing fast on garbage.
+
+    ``${VAR}`` expansion turns JSON booleans into strings ("true"/"false"),
+    and ``bool("false")`` is True — so the coercion must happen here, at load
+    time, before the value reaches a backend (issue #319).  Booleans pass
+    through; recognized truthy/falsy spellings map to True/False; anything
+    else raises — an invalid field must fail at startup, not mid-dispatch.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+    raise ValueError(
+        f"harnesses.json entry '{key}' has non-boolean '{field}' ({value!r}); "
+        "it must be a boolean (true/false)."
+    )
 
 # Module-level cache for harnesses config — avoids re-reading harnesses.json
 # on every handler invocation.  Clear with ``_harnesses_cache.clear()`` in tests.
@@ -387,6 +415,32 @@ def load_harnesses_config() -> dict:
                     f"harnesses.json entry '{key}' has max_turns={profile['max_turns']}, "
                     f"which must be >= 1."
                 )
+        # Antigravity-specific validation (issue #319): catch bad fields at
+        # startup instead of mid-dispatch.  Only runs for antigravity profiles.
+        if backend == "antigravity":
+            if "effort" in profile:
+                effort = str(profile["effort"])
+                if effort not in _ANTIGRAVITY_EFFORTS:
+                    raise ValueError(
+                        f"harnesses.json entry '{key}' has invalid 'effort' "
+                        f"({profile['effort']!r}); it must be one of: "
+                        f"{', '.join(sorted(_ANTIGRAVITY_EFFORTS))}. (Which "
+                        "efforts a model accepts is checked by the agy CLI at "
+                        "run time; this check only catches typos.)"
+                    )
+            for field in ("skip_permissions", "sandbox"):
+                if field in profile:
+                    # ${VAR} expansion yields strings; bool("false") is True,
+                    # so coerce here rather than letting the string reach the
+                    # backend's flag gate.
+                    profile[field] = _coerce_bool(key, field, profile[field])
+            for field in ("cli_path", "log_dir"):
+                value = profile.get(field)
+                # "~" only expands in a shell; here it reaches a subprocess
+                # argv unexpanded (the pi-local harnesses.json comment records
+                # the same bug class).  Expand at load time.
+                if isinstance(value, str) and "~" in value:
+                    profile[field] = os.path.expanduser(value)
         validated[key] = profile
 
     _harnesses_cache.update(validated)

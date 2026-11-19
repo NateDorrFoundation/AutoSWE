@@ -5,6 +5,7 @@ dispatch on the ``backend`` field in the harness profile dict.
 """
 from __future__ import annotations
 
+from autoswe.core.logging_utils import log
 from autoswe.harness.backends.base import CodingBackend
 from autoswe.harness.backends.claude_code import ClaudeCodeBackend
 
@@ -19,11 +20,13 @@ def get_backend(harness_cfg: dict) -> CodingBackend:
         {"backend": "claude_code", "model": "claude-sonnet-4-6"}
         {"backend": "codex", "model": "gpt-5.6-terra"}
         {"backend": "pi", "model": "claude-sonnet-4-5"}
+        {"backend": "antigravity", "model": "gemini-4-neon-high"}
 
-    Raises ``ValueError`` on unknown backend names, or when a ``codex`` or
-    ``pi`` profile omits the required ``model`` field (neither CLI has a
-    built-in default model — pi would silently pick a settings default,
-    unacceptable for reproducibility).
+    Raises ``ValueError`` on unknown backend names, or when a ``codex``,
+    ``pi`` or ``antigravity`` profile omits the required ``model`` field
+    (none of these CLIs has a reproducible built-in default model — pi
+    would silently pick a settings default and agy the account's
+    last-selected model, both unacceptable for reproducibility).
     """
     backend_name = harness_cfg.get("backend", "claude_code").lower()
     if backend_name == "claude_code":
@@ -57,8 +60,28 @@ def get_backend(harness_cfg: dict) -> CodingBackend:
         from autoswe.harness.backends.pi import PiBackend
 
         return PiBackend()
+    if backend_name == "antigravity":
+        # agy falls back to the account's last-selected model when --model is
+        # omitted — non-reproducible, so a profile must name one (codex/pi contract).
+        model = str(harness_cfg.get("model") or "").strip()
+        if not model:
+            raise ValueError(
+                "antigravity harness profile is missing required 'model'. "
+                "Set it to an `agy models` slug, e.g. 'gemini-4-neon-high', "
+                "'gemini-3.8-flash-medium', or 'Orchestrator (Neon)'."
+            )
+        if model.startswith("Orchestrator") and harness_cfg.get("effort"):
+            # docs/antigravity/models.md: effort does not apply to the
+            # Orchestrator pair; the CLI reports it as not adjustable.
+            log("[FACTORY] antigravity profile sets 'effort' with an "
+                f"Orchestrator model ({model!r}) — effort does not apply to "
+                "Orchestrator and will be ignored by the CLI.")
+        # Deferred import: only loads the antigravity submodule when such a profile is configured.
+        from autoswe.harness.backends.antigravity import AntigravityBackend
+
+        return AntigravityBackend()
 
     raise ValueError(
         f"Unknown coding backend: '{backend_name}'. "
-        "Supported backends: claude_code, codex, pi"
+        "Supported backends: claude_code, codex, pi, antigravity"
     )
