@@ -3,7 +3,8 @@
 **Status:** Phase 0 complete — spike verdict in
 [`spike-antigravity.md`](../spike-antigravity.md): transport = headless CLI (BYOK
 bridge auth), **GO** on stdin transport / `mode` via per-run `--settings` / MCP
-eager+env / `structured_output` (advisory — validate downstream) (2026-11-18/19) · **Branch:** `antigravity` (PRs target `antigravity`
+eager+env / `structured_output` (advisory — validate downstream) (run 2026-11-18,
+logged 2026-11-19 UTC) · **Branch:** `antigravity` (PRs target `antigravity`
 during the workstream, then one merge PR to `master`) · **Reference docs:**
 `docs/antigravity/` (49-page mirror) · **Prior art:** `PLAN-pi-backend.md` /
 `PLAN-pi-mcp.md` (git history, commits `583b0a2`, `ec28279`), `spike-pi-mcp.md`.
@@ -22,7 +23,7 @@ A harness profile like this one should drive a full plan → fix → review cycl
 from issue comments:
 
 ```json
-`"agy-neon": { "backend": "antigravity", "model": "gemini-4-neon-high" }`
+"agy-neon": { "backend": "antigravity", "model": "gemini-3.8-flash-high" }
 ```
 
 **Host decision (2026-11-18, Nate):** the workstream executes on the **Linux dev box

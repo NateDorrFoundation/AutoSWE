@@ -1,8 +1,8 @@
 # Spike — antigravity CLI (`agy`) headless transport (Phase 0)
 
 Decision record for `PLAN-antigravity-backend/phase-0-spike.md`, modelled on
-`spike-pi-mcp.md`. **Run: 2026-11-18 (authenticated round) + 2026-11-19
-(verification round, every outcome re-checked against the raw captures in
+`spike-pi-mcp.md`. **Run: 2026-11-18 (authenticated round, late UTC; logged
+2026-11-19 UTC, when every outcome was re-checked against the raw captures in
 `/tmp/agy-spike/raw/`). Status: ✅ PASS — transport = headless CLI
 (`agy --model <m> --settings <json> --print=…` / stdin, `--output-format
 stream-json`). Every table row in the Phase 0 plan has a recorded answer; fixtures
