@@ -15,14 +15,30 @@ runs a turn for each; closing stdin ends the run).  This keeps a 10-20 KB
 ``/fix`` prompt off the command line (Windows' ``cmd /c`` shim caps at ~8191
 chars) and avoids quoting hazards entirely.
 
-**Capabilities (Phase 1):** ``resume``, ``progress_stream``,
-``structured_output`` only — the minimal honest set.  ``mode`` and ``mcp``
-arrive in Phases 4/5; without ``mode``/``can_use_tool``,
-``has_read_only_enforcement`` is False so plan/review loudly degrade and rely
-on the worktree-rollback backstop.  There is **no fork primitive**: ``agy``
-resumes a conversation in place (``--conversation``), so ``fork_session`` is
-logged and treated as resume (the runner's capability gate keeps it from
-happening; the log line is a guard).
+**Capabilities (Phase 4):** ``resume``, ``progress_stream``,
+``structured_output``, ``mode`` — ``mcp`` arrives in Phase 5.  With ``mode``
+advertised, ``has_read_only_enforcement`` is True and the planner/reviewer
+loud-degrade warnings (issue #166) stop for this backend;
+``ensure_worktree_unchanged`` still runs as the unconditional backstop.
+There is **no fork primitive**: ``agy`` resumes a conversation in place
+(``--conversation``), so ``fork_session`` is logged and treated as resume
+(the runner's capability gate keeps it from happening; the log line is a
+guard).
+
+**Read-only enforcement (Phase 4, spike §0.3):** ``--mode plan`` is
+**advisory only** (P1: a plan-mode run wrote files anyway) — it is never a
+security boundary and is passed only as intent signalling.  The real lever
+is the live binary's per-run ``--settings <path>`` flag (P3 lever (c),
+"never saved"): each run stages a throwaway settings JSON in a private temp
+dir carrying the §4.3 ``permissions`` block, and ``--settings`` points at
+it.  Deny rules use **directory-prefix targets with a trailing slash** —
+glob forms silently do NOT match (P2).  The host-global
+``~/.gemini/antigravity-cli/settings.json`` is **never** mutated (it is
+shared: writing per-run rules there would race a concurrent ``/fix`` under
+``MAX_CONCURRENT > 1`` and leak a lockdown on crash).  A ``permission_mode``
+self-check after ``init`` (see ``_expected_permission_mode``) fails a
+read-only run whose posture does not match — a plan run that silently has
+write access is worse than a failed plan run (§4.4).
 
 ``--disable-slash-commands`` is **always** passed: prompts embed
 issue-comment text that routinely starts with ``/plan``, ``/fix``, etc.
@@ -49,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -57,6 +74,7 @@ import time
 import uuid
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from autoswe.core.logging_utils import get_debug_logger, log
 from autoswe.harness.backends.base import (
@@ -145,6 +163,58 @@ _FILE_TOOL_VERBS = {
 }
 
 
+# ---------- Read-only mode table (Phase 4, spike §0.3 / plan §4.3) ----------
+
+# RunSpec.mode values that must be ENFORCED read-only at the CLI level.
+# ``plan`` comes from the planner, ``read_only`` from the reviewer.
+_READ_ONLY_MODES = frozenset({"plan", "read_only"})
+
+# Mutating stream tool names (T3: ``permissions.deny`` rules are keyed off
+# the STREAM names — write_file/read_file — not the init.tools registry
+# names write_to_file/view_file).  Every mutating tool is denied against the
+# worktree on read-only phases: a single allow-list miss is a write.
+_MUTATING_TOOL_RULES = (
+    "write_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+    "sed_file",
+    "notebook_edit",
+)
+
+# T10: headless print mode can never answer an interactive prompt (the
+# question step completes with no selection), and the WAITING→error mapping
+# only catches the case the CLI bothers to stamp.  These three are denied in
+# EVERY mode (§4.3 "MUST be in the deny set on every profile") — Phase 7's
+# AskUserQuestion flow will replace the mechanism, not this rule.
+_NEVER_ALLOWED_TOOL_RULES = (
+    "ask_question",
+    "ask_permission",
+    "ask_custom_permission",
+)
+
+# ``spec.extra_tools`` / ``spec.disallowed_tools_override`` carry Claude-style
+# names today.  Map the ones with a clean agy rule equivalent (stream names);
+# everything else is log-and-ignore'd, same table convention as pi.py's
+# _MODE_TOOLS.  MCP-spellings (``mcp__server__tool``) are converted to
+# ``mcp(server/tool)`` rules directly.
+_CLAUDE_TO_AGY_TOOL_RULES = {
+    "AskUserQuestion": "ask_question",
+    "Bash": "command(*)",
+    "Edit": "replace_file_content",
+    "MultiEdit": "multi_replace_file_content",
+    "NotebookEdit": "notebook_edit",
+    "Write": "write_file",
+}
+
+# Review-prompt decision (§4.3 asks for it, recorded here): the review
+# template receives the diff PRE-RENDERED — the reviewer handler runs
+# ``git diff`` itself and injects the result into {{DIFF}}/{{DIFF_STAT}}
+# (autoswe/harness/prompts.py) — so the agy session never needs git
+# diff/log/show.  The read-only ``command(*)`` deny therefore STAYS at full
+# breadth; no narrower ``command(regex:git (diff|log|show|status)( .*)?)``
+# allowance is needed.
+
+
 # ---------- Streaming accumulator ----------
 
 
@@ -163,6 +233,11 @@ class _AgyAccumulator:
     # ``init`` payload bits kept for Phase 4/5 assertions and cwd checks.
     init_cwd: str | None = None
     init_tools: list = field(default_factory=list)
+    # Permission posture the CLI reported (``request-review`` /
+    # ``always-proceed``) — the Phase 4 §4.4 self-check compares it against
+    # _expected_permission_mode().  None until the stream starts (and forever
+    # for streams that die before ``init``, where the check cannot run).
+    init_permission_mode: str | None = None
     # Authoritative text: result.response, captured on the ``result`` event.
     final_response: str | None = None
     # Per-step_index accumulated text_delta chunks in stream order.  Fallback
@@ -246,7 +321,12 @@ def _resolve_agy_executable(cli_path: str | None) -> tuple[str, list[str]]:
 # ---------- Command construction ----------
 
 
-def _build_argv(spec: RunSpec, harness_cfg: dict, schema_path: str | None) -> list[str]:
+def _build_argv(
+    spec: RunSpec,
+    harness_cfg: dict,
+    schema_path: str | None,
+    settings_args: list[str] | None = None,
+) -> list[str]:
     """Build the agy flag argv (after the exe prefix) for one run.
 
     | Case | session flags |
@@ -258,7 +338,8 @@ def _build_argv(spec: RunSpec, harness_cfg: dict, schema_path: str | None) -> li
     ``schema_path`` is the caller-created temp file holding the JSON schema
     (only set when ``spec.output_format`` is present); the schema is never
     passed inline — it is too long for the Windows command line and has
-    quoting hazards.
+    quoting hazards.  ``settings_args`` is the ``_stage_run_config`` seam's
+    ``--settings`` fragment (the per-run permissions block, Phase 4).
     """
     # stream-json in AND out: stdin NDJSON one-event-per-line transport,
     # stdout NDJSON event stream.  --disable-slash-commands is unconditional
@@ -283,10 +364,18 @@ def _build_argv(spec: RunSpec, harness_cfg: dict, schema_path: str | None) -> li
     if agent:
         cmd.extend(["--agent", agent])
 
-    # Phase 1 posture: emit the skip flag whenever the profile's
-    # skip_permissions is true (the dedicated-machine default, same posture as
-    # Codex bypass_approvals).  Phase 4 narrows this to read_write runs only.
-    if bool(harness_cfg.get("skip_permissions", True)):
+    # Phase 4 posture split (§4.3): the skip flag is a read_write privilege —
+    # read-only phases never get it (that is the whole point of "mode").
+    # ``--sandbox`` is NOT emitted on read-only phases by default: spike P4
+    # proved OS-level blocking on Linux but Windows is windows-pending, so the
+    # profile ``sandbox`` field stays the only way to force it on (for all
+    # phases, as before).
+    if (spec.mode or "read_write") == "plan":
+        # Advisory intent only — P1 proved --mode plan never blocks anything
+        # headless; the staged permissions block is the actual enforcement.
+        cmd.extend(["--mode", "plan"])
+    if (spec.mode or "read_write") not in _READ_ONLY_MODES \
+            and bool(harness_cfg.get("skip_permissions", True)):
         cmd.append("--dangerously-skip-permissions")
     if bool(harness_cfg.get("sandbox")):
         cmd.append("--sandbox")
@@ -315,6 +404,10 @@ def _build_argv(spec: RunSpec, harness_cfg: dict, schema_path: str | None) -> li
     if spec.resume:
         cmd.extend(["--conversation", spec.resume])
 
+    # Per-run staged settings (--settings <path>, Phase 4 §4.2 Option C).
+    if settings_args:
+        cmd.extend(settings_args)
+
     return cmd
 
 
@@ -333,6 +426,221 @@ def _user_event(prompt: str) -> bytes:
         ).encode("utf-8")
         + b"\n"
     )
+
+
+# ---------- Per-run settings staging (Phase 4 §4.2, Option C) ----------
+
+
+def _rule_prefix(cwd: str) -> str:
+    """Absolute normalized prefix for permission-rule targets.
+
+    P2's hard lesson: deny targets are **directory prefixes with a trailing
+    slash** — a glob (``<repo>/*``) silently does NOT match, and a prefix
+    without the slash matches only the bare path.  Backslashes are normalized
+    to forward slashes so one rule shape works on both platforms (rule
+    semantics verified on Linux, spike §0.3; Windows path rules ride the
+    Phase 6 parity pass).
+    """
+    path = os.path.abspath(str(cwd or "")).replace("\\", "/").rstrip("/")
+    return path + "/"
+
+
+def _permissions_for_mode(mode: str, cwd_prefix: str) -> dict:
+    """The §4.3 mode → ``permissions`` block (the module's mode table).
+
+    | mode | deny | allow |
+    |---|---|---|
+    | ``plan`` / ``read_only`` | every mutating tool against the worktree,
+    |   ``write_file(<cwd>/.git/)``, ``command(*)``, the three ``ask_*`` |
+    |   reads against the worktree, ``mcp(autoswe_comment/*)`` (+ review's
+    |   ``mcp(autoswe_inline_comment/*)``) |
+    | ``read_write`` / unset | ``write_file(<cwd>/.git/)`` belt-and-braces,
+    |   the three ``ask_*`` | (none — default posture) |
+
+    Deny > Ask > Allow is the CLI's precedence, so the allow list only
+    rescues reads; it can never reopen a denied tool (P5 confirmed the
+    read-only deny profile and the MCP allow coexist in one run).
+    """
+    read_only = mode in _READ_ONLY_MODES
+    deny: list[str] = []
+    if read_only:
+        deny.extend(f"{tool}({cwd_prefix})" for tool in _MUTATING_TOOL_RULES)
+        # Explicit .git entry mirrors the §4.3 table: prefix semantics make it
+        # redundant with <cwd>/, but it stays a rule in its own right so a
+        # future narrowing of the worktree prefix can never reopen .git.
+        deny.append(f"write_file({cwd_prefix}.git/)")
+        deny.append("command(*)")
+    else:
+        deny.append(f"write_file({cwd_prefix}.git/)")
+    deny.extend(_NEVER_ALLOWED_TOOL_RULES)
+
+    allow: list[str] = []
+    if read_only:
+        allow = [
+            f"read_file({cwd_prefix})",
+            f"view_file({cwd_prefix})",
+            f"search({cwd_prefix})",
+            f"list_dir({cwd_prefix})",
+            "mcp(autoswe_comment/*)",
+        ]
+        if mode == "read_only":
+            allow.append("mcp(autoswe_inline_comment/*)")
+    return {"deny": deny, "allow": allow}
+
+
+def _mcp_rule(name: str) -> str | None:
+    """``mcp__server__tool`` (Claude spelling) → ``mcp(server/tool)`` agy rule.
+
+    Returns None when *name* is not MCP-spelled (single/double-underscore
+    boundary as in ``mcp__autoswe_comment__post_plan``).
+    """
+    parts = str(name).split("__")
+    if len(parts) >= 3 and parts[0] == "mcp":
+        return "mcp(" + "/".join(parts[1:]) + ")"
+    return None
+
+
+def _apply_tool_overrides(spec: RunSpec, deny: list[str], allow: list[str]) -> None:
+    """Map RunSpec tool overrides (Claude names) onto agy rules (§4.3).
+
+    Mapped names get the equivalent rule; everything else is logged and
+    ignored, pi-style: inventing a rule for a tool the CLI does not have is
+    worse than ignoring it.  File-mutating mappings grow a worktree-prefix
+    target (spike P2: a bare ``write_file``-style rule with no target does
+    not match); ``command`` already maps to the wildcard ``command(*)``, and
+    ``ask_*`` stay bare exactly as the spike's deny set spells them.
+    """
+    for tool in spec.disallowed_tools_override or []:
+        rule = _mcp_rule(tool) or _CLAUDE_TO_AGY_TOOL_RULES.get(str(tool))
+        if rule is None:
+            log(f"[ANTIGRAVITY] disallowed tool {tool!r} has no agy rule equivalent — ignored")
+            continue
+        if rule in _MUTATING_TOOL_RULES:
+            rule = f"{rule}({_rule_prefix(spec.cwd)})"
+        if rule not in deny:
+            deny.append(rule)
+    for tool in spec.extra_tools or []:
+        rule = _mcp_rule(tool)
+        if rule is None:
+            # Mapped names are already governed by the mode table (reads are
+            # allowed, mutations denied); unmapped names have no equivalent.
+            reason = (
+                "already governed by the mode table"
+                if str(tool) in _CLAUDE_TO_AGY_TOOL_RULES else "no agy rule equivalent"
+            )
+            _dbg.debug(f"[ANTIGRAVITY] extra tool {tool!r} ignored ({reason})")
+            continue
+        if rule not in allow:
+            allow.append(rule)
+
+
+def _resolve_config_home(harness_cfg: dict, model: str | None) -> os.PathLike:
+    """Base-settings home for this profile (profile ``config_home`` field).
+
+    Default ``<AUTOSWE_DIR>/agy-home/<sanitized model>`` — the profile NAME
+    is not threaded into the resolved harness dict, so the model stands in as
+    the stable per-profile key.  Only ``base-settings.json`` is ever read
+    from here; per-run staged files land in a private temp dir.
+    """
+    from autoswe.core.config import AUTOSWE_DIR  # lazy: config pulls in the factory
+
+    configured = str(harness_cfg.get("config_home") or "").strip()
+    root = Path(configured) if configured else Path(AUTOSWE_DIR) / "agy-home"
+    safe_model = re.sub(r"[^A-Za-z0-9._-]", "_", str(model or "default"))
+    return root / safe_model
+
+
+def _load_base_settings(harness_cfg: dict, model: str | None) -> dict:
+    """``<config_home>/base-settings.json`` (``{}`` when absent/unreadable).
+
+    Stable per-profile keys (useG1Credits, modelProvider/customModelsConfig,
+    and the Phase 5 MCP registration) live here and are copied into every
+    staged file so the staged run sees the same config the unsandboxed CLI
+    would, PLUS the mode block.
+    """
+    base_file = Path(_resolve_config_home(harness_cfg, model)) / "base-settings.json"
+    try:
+        raw = base_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        log(f"[WARN][ANTIGRAVITY] cannot read {base_file}: {e} — staging from {{}}")
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        log(f"[WARN][ANTIGRAVITY] {base_file} is not valid JSON ({e}) — staging from {{}}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _stage_run_config(spec: RunSpec, harness_cfg: dict) -> tuple[list[str], dict, object]:
+    """Stage one run's ``--settings`` JSON; return ``(settings_args, env_patch, cleanup)``.
+
+    The ONE seam §4.2 asks for: ``_run_async`` stays transport-agnostic and
+    the tests patch/assert one function.  Shape deviation from the plan's
+    ``(env_patch, cleanup)`` 2-tuple, documented deliberately: the Phase 0
+    winner is **Option C** (the live binary's per-run ``--settings`` flag —
+    spike §0.3 P3 lever (c)), which needs an ARGV channel, so the seam
+    returns ``(settings_args, env_patch, cleanup)``.  ``env_patch`` is empty
+    on Option C — P3(b) proved HOME-override isolation unnecessary (BYOK auth
+    is env-only) — the slot keeps Option A's channel one seam deep.
+
+    Mechanics: private temp dir (``mkdtemp`` — distinct per concurrent run,
+    so two parallel plan/fix sessions never share a settings file,
+    race-free under ``MAX_CONCURRENT > 1``) holding ``settings.json`` = the
+    profile's ``base-settings.json`` (or ``{}``) merged with the mode block
+    (§4.3) + mapped tool overrides.  ``cleanup`` deletes the run dir; the
+    caller runs it in a ``finally``, so success, failure, kill and cancel all
+    reclaim it.  The host-global settings file is NEVER opened for writing.
+    """
+    mode = str(spec.mode or "read_write")
+    permissions = _permissions_for_mode(mode, _rule_prefix(spec.cwd))
+    _apply_tool_overrides(spec, permissions["deny"], permissions["allow"])
+
+    run_dir = tempfile.mkdtemp(prefix="autoswe-agy-run-")
+    settings_path = os.path.join(run_dir, "settings.json")
+    try:
+        base = _load_base_settings(harness_cfg, spec.model)
+        settings = dict(base)
+        base_perm = base.get("permissions") if isinstance(base.get("permissions"), dict) else {}
+        merged_perm = dict(base_perm)
+        for key in ("deny", "allow"):
+            merged: list[str] = []
+            seen: set[str] = set()
+            for rule in list(base_perm.get(key) or []) + list(permissions[key]):
+                if isinstance(rule, str) and rule not in seen:
+                    seen.add(rule)
+                    merged.append(rule)
+            merged_perm[key] = merged
+        settings["permissions"] = merged_perm
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+    except OSError:
+        # Staging failure with the mode block unwritten = a run that would
+        # silently lose its enforcement.  Reclaim the dir and fail loudly.
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise
+
+    def cleanup() -> None:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+    return ["--settings", settings_path], {}, cleanup
+
+
+def _expected_permission_mode(mode: str | None, harness_cfg: dict) -> str | None:
+    """The ``init.permission_mode`` value the run should report (Phase 4 §4.4).
+
+    ``request-review`` for read-only phases, ``always-proceed`` for
+    read_write with the skip flag (the dedicated-machine default).  read_write
+    WITHOUT skip has no required posture (the CLI's interactive default is
+    fine headless), so None means "nothing to check".
+    """
+    if (mode or "read_write") in _READ_ONLY_MODES:
+        return "request-review"
+    if bool(harness_cfg.get("skip_permissions", True)):
+        return "always-proceed"
+    return None
 
 
 # ---------- Stream parsing ----------
@@ -408,6 +716,10 @@ def _parse_line(line: str, acc: _AgyAccumulator, callback) -> None:
         if not isinstance(init, dict):
             init = {}
         acc.init_cwd = init.get("cwd")
+        permission_mode = init.get("permission_mode")
+        acc.init_permission_mode = (
+            str(permission_mode) if permission_mode is not None else None
+        )
         tools = init.get("tools")
         if isinstance(tools, list):
             acc.init_tools = tools
@@ -693,14 +1005,20 @@ class AntigravityBackend:
     T8/T9).
     """
 
-    # Phase 1 minimal honest set (Phase 1 plan §1.8):
+    # Phase 1 honest set + Phase 4's ``mode``:
     #   resume           — --conversation <id> (T7 confirmed headless resume)
     #   progress_stream  — step_update events drive progress_callback
     #   structured_output— --json-schema + result.structured_output (T6,
     #                      advisory: handlers must validate downstream)
-    # NOT advertised: mode (Phase 4), mcp (Phase 5), session_fork (no
-    # primitive), can_use_tool, plan_file.
-    CAPABILITIES: set[str] = {"resume", "progress_stream", "structured_output"}
+    #   mode             — per-run --settings permissions block enforces
+    #                      read-only on plan/read_only phases (§4.2/§4.3);
+    #                      this is what flips has_read_only_enforcement to
+    #                      True and stops the issue #166 loud-degrade.
+    # NOT advertised: mcp (Phase 5), session_fork (no primitive),
+    # can_use_tool, plan_file.
+    CAPABILITIES: set[str] = {
+        "resume", "progress_stream", "structured_output", "mode",
+    }
     RETRYABLE_SUBTYPES: set[str] = {"error", "killed"}
 
     @classmethod
@@ -744,6 +1062,13 @@ class AntigravityBackend:
         """
         harness_cfg = (spec.state or {}).get("_harness_cfg") or {}
 
+        # Phase 4: stage the per-run --settings permissions block (the ONE
+        # seam, _stage_run_config).  The staged dir is reclaimed in the
+        # _wrapped finally below alongside the schema temp file — covering
+        # success, failure, kill and cancel — and nothing is ever written to
+        # the host-global settings file.
+        settings_args, env_patch, cleanup = _stage_run_config(spec, harness_cfg)
+
         # Structured output: write the schema to a private temp file up front
         # (mkstemp — unique, user-controlled path, mode 600) so the file's
         # lifetime spans the whole run and is always reclaimed in the finally
@@ -768,8 +1093,11 @@ class AntigravityBackend:
 
         async def _wrapped() -> RunResult:
             try:
-                return await self._run_async(spec, harness_cfg, schema_path)
+                return await self._run_async(
+                    spec, harness_cfg, schema_path, settings_args, env_patch
+                )
             finally:
+                cleanup()
                 if schema_path:
                     try:
                         os.unlink(schema_path)
@@ -782,7 +1110,12 @@ class AntigravityBackend:
         return _wrapped()
 
     async def _run_async(
-        self, spec: RunSpec, harness_cfg: dict, schema_path: str | None
+        self,
+        spec: RunSpec,
+        harness_cfg: dict,
+        schema_path: str | None,
+        settings_args: list[str] | None = None,
+        env_patch: dict | None = None,
     ) -> RunResult:
         """Run the agy CLI subprocess with streaming JSON.  Returns RunResult."""
         # The factory enforces model presence for reproducibility; this guard
@@ -800,7 +1133,10 @@ class AntigravityBackend:
         exe, prefix_argv = _resolve_agy_executable(
             str(spec.cli_path or harness_cfg.get("cli_path") or "").strip()
         )
-        argv = [exe, *prefix_argv, *_build_argv(spec, harness_cfg, schema_path)]
+        argv = [
+            exe, *prefix_argv,
+            *_build_argv(spec, harness_cfg, schema_path, settings_args),
+        ]
 
         # Environment.  Precedence lowest -> highest, matching the other
         # backends (docs/autoswe/harnesses.md "Per-profile env"):
@@ -815,9 +1151,25 @@ class AntigravityBackend:
         env.update(harness_cfg.get("env") or {})
         if spec.env_overrides:
             env.update(spec.env_overrides)
+        # Backend-managed patch from _stage_run_config (empty on Option C —
+        # the per-run lever is --settings, not HOME isolation).  Applied last
+        # on purpose: a profile env dict must not be able to undo the
+        # backend's own isolation.  Never written back to os.environ.
+        if env_patch:
+            env.update(env_patch)
+
+        run_mode = str(spec.mode or "read_write")
+        read_only = run_mode in _READ_ONLY_MODES
+        if read_only:
+            enforcement = "settings-deny"
+        elif run_mode == "read_write" and bool(harness_cfg.get("skip_permissions", True)):
+            enforcement = "skip-flag"
+        else:
+            enforcement = "none(expected)"
 
         log(
-            f"[ANTIGRAVITY] running model={model} "
+            f"[ANTIGRAVITY] running model={model} mode={run_mode} "
+            f"enforcement={enforcement} "
             f"conversation={'NEW' if not spec.resume else spec.resume[:8]} "
             f"fork=ignored(no primitive) schema={'yes' if schema_path else 'no'}"
         )
@@ -889,9 +1241,11 @@ class AntigravityBackend:
             """Collect stderr, keeping a bounded TAIL (_STDERR_TAIL_BYTES).
 
             The tail is what a nonzero exit gets logged with.  Lines matching
-            the headless soft-deny notice (spike P3b) are surfaced as
-            [WARN][ANTIGRAVITY] soft-denied as soon as they are seen — they
-            are the first sign of a permission misconfiguration.
+            the headless soft-deny notice (spike P3b) are surfaced as soon as
+            they are seen — at info level on a read-only run (a denied
+            write/command there is the enforcement WORKING, §4.4) and at
+            [WARN] elsewhere (during a read_write run a soft-deny means the
+            skip flag is not in effect — the Phase 1 reading).
             """
             if not process.stderr:
                 return b""
@@ -917,7 +1271,13 @@ class AntigravityBackend:
                 for raw_line in chunk.split(b"\n"):
                     lowered = raw_line.lower()
                     if any(marker.encode() in lowered for marker in _SOFT_DENY_MARKERS):
-                        log(f"[WARN][ANTIGRAVITY] soft-denied: {raw_line.decode('utf-8', errors='replace').strip()[:200]}")
+                        text = raw_line.decode("utf-8", errors="replace").strip()[:200]
+                        if read_only:
+                            # Expected: the staged deny rules biting (a denied
+                            # write/command).  Not a misconfiguration.
+                            log(f"[ANTIGRAVITY] soft-denied (expected, read-only): {text}")
+                        else:
+                            log(f"[WARN][ANTIGRAVITY] soft-denied: {text}")
             return b"".join(chunks)[-(_STDERR_TAIL_BYTES):]
 
         async def read_stdout_jsonl() -> None:
@@ -1041,6 +1401,46 @@ class AntigravityBackend:
                     )
             except OSError:
                 pass
+
+        # Phase 4 §4.4 enforcement self-check: init.permission_mode is the
+        # CLI's own attestation of what it let the run do.  A read-only phase
+        # that reports a non-read-only posture means the staged --settings
+        # deny rules were NOT honored — and a plan run that silently has
+        # write access is worse than a failed plan run, so this fails hard.
+        # Deviation from the plan's letter ("set error_flag" only), documented
+        # deliberately: with error_flag alone the run still RETURNS, and the
+        # planner/reviewer never inspect the subtype (agy_plan_waiting_status
+        # transition proves it), so a silently-degraded plan would park the
+        # task in `waiting` as if the run were legitimate — the opposite of
+        # §4.6's mandated mismatch→failed outcome.  Raising routes through
+        # the handler's exception boundary → FAILED.  error_flag is still set
+        # for any path that swallows the raise, and the raise happens after
+        # the process is reaped + the staged dir is reclaimed by the caller's
+        # finally.  read_write posture drift gets a WARN, never a failure.
+        expected_posture = _expected_permission_mode(spec.mode, harness_cfg)
+        if (
+            expected_posture is not None
+            and acc.init_permission_mode is not None
+            and acc.init_permission_mode != expected_posture
+        ):
+            if read_only:
+                acc.error_flag = True
+                staged = (
+                    settings_args[1]
+                    if settings_args and len(settings_args) > 1 else "absent"
+                )
+                detail = (
+                    f"read-only not in effect: init.permission_mode="
+                    f"{acc.init_permission_mode!r}, expected {expected_posture!r} — "
+                    f"the per-run --settings deny rules were not honored "
+                    f"(settings={staged!r})"
+                )
+                log(f"[ERROR][ANTIGRAVITY] {detail}")
+                raise RuntimeError(f"[ANTIGRAVITY] {detail}")
+            log(
+                f"[WARN][ANTIGRAVITY] init.permission_mode={acc.init_permission_mode!r} "
+                f"but {expected_posture!r} expected — the skip flag may not be in effect"
+            )
 
         return _finalize(
             acc, returncode, killed=killed, duration_seconds=duration, stderr_tail=stderr_tail

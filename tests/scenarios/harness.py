@@ -418,6 +418,9 @@ def patched_world(
         #   error             - the CLI's own error text (error/config_error kinds)
         #   status            - result-status override, e.g. "WAITING" for a
         #                       session that ended waiting on interactive input
+        #   permission_mode   - pin the init attestation (skip the spawn-time
+        #                       derivation from the flags) — scripts the §4.4
+        #                       read-only self-check mismatch row
         for resp in claude_responses:
             ag_fake.script_response(
                 resp["text"],
@@ -426,6 +429,7 @@ def patched_world(
                 structured_output=resp.get("structured_output"),
                 error=resp.get("error"),
                 status=resp.get("status"),
+                permission_mode=resp.get("permission_mode"),
             )
     elif backend == "pi":
         cx_fake = None

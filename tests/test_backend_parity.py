@@ -595,16 +595,18 @@ class TestCapabilityHonesty:
     def test_antigravity_lacks_claude_exclusives(self):
         """Antigravity must NOT advertise capabilities it doesn't support.
 
-        Phase 1: resume + progress_stream + structured_output only.  No
-        "mode" (no read-only enforcement until Phase 4), no "mcp" (Phase 5),
-        no "session_fork" (agy resumes in place — no fork primitive), no
-        "plan_file" or "can_use_tool"/"plan_permission".
+        Phase 1 gained resume + progress_stream + structured_output; Phase 4
+        added "mode" (per-run ``--settings`` deny enforcement, so the planner
+        no longer loudly degrades for agy).  Still out: "mcp" (Phase 5),
+        "session_fork" (agy resumes in place — no fork primitive), "plan_file",
+        and the Claude-only SDK levers "can_use_tool"/"plan_permission".
         """
         from autoswe.harness.backends.antigravity import AntigravityBackend
 
         caps = AntigravityBackend.capabilities()
+        assert "mode" in caps, "Phase 4: agy must advertise mode read-only enforcement"
         unsupported = {
-            "mode", "mcp", "can_use_tool", "plan_permission",
+            "mcp", "can_use_tool", "plan_permission",
             "plan_file", "session_fork",
         }
         overlap = caps & unsupported
@@ -831,9 +833,10 @@ class TestRunnerDispatcherParity:
     def test_runner_backend_has_capability_antigravity(self):
         """backend_has_capability returns correct values for an agy profile.
 
-        Phase 1: resume + progress_stream + structured_output.  No mode
-        (plan/review must loudly degrade), no mcp (Phase 5), no session_fork
-        (/retry degrades to a fresh run), no can_use_tool/plan_file.
+        Phase 1: resume + progress_stream + structured_output; Phase 4 added
+        mode (plan/review are now ENFORCED via the staged --settings deny
+        block, no loud-degrade).  Still out: mcp (Phase 5), session_fork
+        (/retry degrades to a fresh run), can_use_tool/plan_file.
         """
         from autoswe.harness.runner import backend_has_capability
 
@@ -841,7 +844,7 @@ class TestRunnerDispatcherParity:
         assert backend_has_capability(harness, "resume")
         assert backend_has_capability(harness, "progress_stream")
         assert backend_has_capability(harness, "structured_output")
-        assert not backend_has_capability(harness, "mode")
+        assert backend_has_capability(harness, "mode")
         assert not backend_has_capability(harness, "mcp")
         assert not backend_has_capability(harness, "session_fork")
         assert not backend_has_capability(harness, "can_use_tool")

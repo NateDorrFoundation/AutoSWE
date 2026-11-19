@@ -1403,21 +1403,26 @@ class TestCatchup:
 # ------------------------------------------------------------------
 
 
-class TestAntigravityReadOnlyBackstop:
-    """K1: an agy plan run that edits the worktree is rolled back.
+class TestAntigravityReadOnlyEnforcement:
+    """K1 (Phase 4 rewrite): an agy plan run's write attempt is BLOCKED, not rolled back.
 
-    AntigravityBackend advertises neither "mode" nor "can_use_tool", so a
-    plan-phase RunSpec's mode="plan" is advisory for it — the loud-degrade the
-    planner logs is the heads-up, and ``ensure_worktree_unchanged`` is the
-    real guarantee (issue #166). This is the real-git counterpart of the
-    loud-degrade assertions in ``test_transition_antigravity``: the REAL
-    AntigravityBackend + AntigravityFake run against a real worktree, and the
-    fake "edits" the tree mid-run the way an unconfined agent session would.
+    Before Phase 4, antigravity advertised neither "mode" nor "can_use_tool"
+    and the ONLY guarantee was the planner's ``ensure_worktree_unchanged``
+    backstop (issue #166).  It now enforces read-only per-run through the
+    staged ``--settings`` deny block, so the violation this scenario used to
+    stage is **expected blocked**: the fake replays the real
+    ``permission_denied.jsonl`` capture — a write_file attempt ending
+    ``state:"ERROR"`` with a "Matches user-configured deny rule" tool_error
+    while the run itself stays SUCCESS — and the tree is never touched.
+    ``ensure_worktree_unchanged`` finding NOTHING to roll back (False) is the
+    proof the enforcement, not the backstop, did the work.
     """
 
-    def test_K1_agy_plan_edit_rolled_back(self, git_world: GitWorld):
+    def test_K1_agy_plan_write_blocked_tree_stays_clean(self, git_world: GitWorld):
         import asyncio
+        from unittest.mock import patch
 
+        import autoswe.harness.backends.antigravity as agy_mod
         from autoswe.harness.backends.antigravity import AntigravityBackend
         from autoswe.harness.backends.base import RunSpec
         from autoswe.vcs.worktree import ensure_worktree_unchanged, is_dirty
@@ -1433,47 +1438,61 @@ class TestAntigravityReadOnlyBackstop:
             capture_output=True, text=True, check=True,
         ).stdout.strip()
 
-        class _EditingAntigravityFake(AntigravityFake):
-            """AntigravityFake whose agent session edits the worktree mid-run.
-
-            ``_next_stream`` runs inside the fake's spawn — the moment the
-            agent session starts — so the edit lands in the tree exactly while
-            the (faked) agent is running, then the success stream returns.
-            """
-
-            def _next_stream(self):
-                result = super()._next_stream()
-                (wt / "agent_edit.py").write_text("# smuggled in by the agent\n", encoding="utf-8")
-                return result
-
-        fake = _EditingAntigravityFake()
-        fake.script_plan("1. Do the thing", session_id="s-agy-plan-42")
+        fake = AntigravityFake()
+        # The P2b real-CLI capture verbatim: denied write/command steps + a
+        # SUCCESS result (denied tools ≠ failed run).  _add is the scripted-
+        # stream append point; the fake re-stamps init.permission_mode from
+        # the argv at spawn (plan → no skip flag → request-review, matching
+        # the §4.4 self-check's expectation — no refusal fires).
+        fixture = (
+            Path(__file__).parent / "fixtures" / "antigravity" / "permission_denied.jsonl"
+        )
+        fake._add(
+            fixture.read_text(encoding="utf-8").splitlines(),
+            stderr=(
+                b"Warning: tool write_file requires approval; headless mode "
+                b"cannot prompt for it, so it was auto-denied.\n"
+            ),
+        )
 
         spec = RunSpec(
             prompt="Plan the fix.",
             cwd=str(wt),
             model="gemini-test",
-            mode="plan",          # advisory: agy has no read-only enforcement
+            mode="plan",          # enforced: read-only deny block is staged
             timeout=30,
         )
 
-        with fake:
-            result = asyncio.run(AntigravityBackend().run(spec))
+        with patch.object(agy_mod, "log") as log_spy:
+            with fake:
+                result = asyncio.run(AntigravityBackend().run(spec))
 
-        # The run itself succeeded and the backend happily ran a "plan" spec
-        # while making zero attempt to confine edits — that's the degrade case.
+        # The run succeeded — the agent tried to write, the deny block said
+        # no, and auto-denial is not a run failure.
         assert result.subtype == "success"
-        assert fake.calls[0]["cwd"] == str(wt)
-        assert (wt / "agent_edit.py").exists(), "agent edit missing mid-phase"
+        call = fake.calls[0]
+        assert call["cwd"] == str(wt)
+        assert call["skip_permissions"] is False, "read-only phase must carry no skip flag"
+        assert call.get("settings_path"), "the deny block rides the per-run --settings file"
 
-        # The planner's post-run backstop is what actually protects the tree.
-        rolled_back = ensure_worktree_unchanged(wt, head_before)
+        # The violation was blocked, not buffered for the backstop: the tree
+        # stayed clean the whole time.
+        assert not any(p.name == "agent_edit.py" for p in wt.iterdir())
+        assert is_dirty(wt) is False, "enforcement alone must leave the tree clean"
+        assert ensure_worktree_unchanged(wt, head_before) is False, (
+            "nothing to roll back — the backstop must be idle when enforcement works"
+        )
 
-        assert rolled_back is True, "ensure_worktree_unchanged must detect + revert the edit"
-        assert not (wt / "agent_edit.py").exists(), "agent edit survived the rollback"
-        assert is_dirty(wt) is False, "worktree must be clean after rollback"
+        # §4.4: on a read-only run the soft-deny notice is the deny block
+        # WORKING — logged at info level, never as a [WARN].
+        msgs = [str(c.args[0]) for c in log_spy.call_args_list if c.args]
+        soft = [m for m in msgs if "soft-denied" in m]
+        assert soft, "the scripted denial should surface once"
+        assert all(not m.startswith("[WARN]") for m in soft), soft
+        assert all("expected, read-only" in m for m in soft)
+
         head_after = subprocess.run(
             ["git", "-C", str(wt), "rev-parse", "HEAD"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        assert head_after == head_before, "rollback must target head_before"
+        assert head_after == head_before

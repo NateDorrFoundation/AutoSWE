@@ -112,6 +112,10 @@ def test_transition(
     skip_providers = row.get("skip_providers", [])
     if provider in skip_providers:
         pytest.skip(f"{transition_name} skipped for {provider}: known limitation")
+    # Backend-axis sibling of skip_providers: rows whose scripted failure has
+    # no meaning on the default claude_code axis (the §4.4 agy self-check).
+    if "claude_code" in row.get("skip_backends", []):
+        pytest.skip(f"{transition_name} is antigravity-only: no claude_code behavior")
     expect = row.get("expect", {})
 
     state = build_github_state(row) if provider == "github" else build_azure_state(row)
@@ -525,7 +529,10 @@ def test_transition_antigravity(
     Asserts the Phase 1/2 agy-specific divergences per row:
     * the argv contract every agy run carries (--disable-slash-commands,
       harness model, --print-timeout);
-    * loud-degrade on plan/review (agy advertises no mode/can_use_tool);
+    * read-only ENFORCEMENT on plan/review via the staged per-run --settings
+      block (Phase 4: 'mode' advertised → no loud-degrade, no skip flag);
+    * the §4.4 permission_mode self-check failing a read-only run whose init
+      attests the wrong posture (agy_plan_permission_mode_mismatch → failed);
     * --json-schema requested on every plan and review run (the
       structured_output capability);
     * --conversation as the ONLY session channel: fix-from-planned resumes,
@@ -632,15 +639,24 @@ def test_transition_antigravity(
     assert call["print_timeout"] == "7200s", "agy must pin --print-timeout from AGENT_TIMEOUT"
 
     if transition_name == "fresh_plan_command":
-        # agy advertises neither mode nor can_use_tool → the planner must
-        # loudly degrade (unlike pi, which enforces read-only via --tools);
-        # ensure_worktree_unchanged is the backstop (real-git rollback: §3.6).
+        # Phase 4 §4.5: agy advertises 'mode' → the planner must NOT degrade.
+        # Enforcement is the staged per-run --settings deny block (§4.3);
+        # ensure_worktree_unchanged stays only as the backstop.
         assert call["is_fresh"] is True
         assert call.get("json_schema_path") is not None, (
             "agy has structured_output → every plan run requests --json-schema"
         )
-        assert any("no read-only enforcement" in ln for ln in logged), (
-            "plan on agy must loudly degrade (no mode/can_use_tool capability)"
+        assert not any("no read-only enforcement" in ln for ln in logged), (
+            "plan on agy must NOT degrade now that 'mode' is advertised (§4.5)"
+        )
+        assert call["skip_permissions"] is False, (
+            "a read-only phase must never receive --dangerously-skip-permissions"
+        )
+        assert call.get("settings_path"), (
+            "plan must stage a per-run --settings permissions block (§4.3)"
+        )
+        assert call.get("mode") == "plan", (
+            "plan phase signals intent with the advisory --mode plan flag"
         )
     elif transition_name == "agy_plan_structured_output":
         # The PLAN_SCHEMA payload path: schema requested, structured body
@@ -657,6 +673,10 @@ def test_transition_antigravity(
         assert call["skip_permissions"] is True, (
             "fix defaults to --dangerously-skip-permissions (full-permission agent by design)"
         )
+        assert call.get("settings_path"), (
+            "fix still stages the belt-and-braces .git deny block (§4.3)"
+        )
+        assert call.get("mode") is None, "read_write runs at the CLI default mode"
     elif transition_name == "plan_ready_then_fix":
         # Fix from planned resumes the plan checkpoint IN PLACE via
         # --conversation (agy's only session channel; no fork semantics).
@@ -701,8 +721,27 @@ def test_transition_antigravity(
             "agy has structured_output → every review run requests --json-schema"
         )
         assert call["is_fresh"] is True, "review is always a one-off session"
-        # Review is the second read-only phase: loud-degrade + rollback backstop.
-        assert any("no read-only enforcement" in ln for ln in logged)
+        # Review is the second read-only phase: enforced via the staged
+        # --settings block (Phase 4), NOT degraded — and read_only uses the
+        # CLI default mode (no --mode flag), unlike plan.
+        assert not any("no read-only enforcement" in ln for ln in logged), (
+            "review on agy must NOT degrade now that 'mode' is advertised (§4.5)"
+        )
+        assert call["skip_permissions"] is False, (
+            "a read-only phase must never receive --dangerously-skip-permissions"
+        )
+        assert call.get("settings_path"), (
+            "review must stage a per-run --settings permissions block (§4.3)"
+        )
+        assert call.get("mode") is None, "read_only runs at the CLI default mode"
+    elif transition_name == "agy_plan_permission_mode_mismatch":
+        # §4.4 self-check: the run's init attests always-proceed on a
+        # read-only phase (scripted override) — the staged deny rules were
+        # not honored, so the backend refuses the run instead of letting a
+        # plan with write access pass for a clean one.
+        assert call["is_fresh"] is True
+        assert call["skip_permissions"] is False, "the attempt was still read-only-flagged"
+        assert call.get("settings_path"), "the check compares against staged rules"
 
     # Git call assertions
     if git_calls:

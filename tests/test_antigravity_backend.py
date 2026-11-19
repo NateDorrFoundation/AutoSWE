@@ -169,6 +169,12 @@ def _schema_path_from(argv: list[str]) -> str | None:
     return None
 
 
+def _settings_path_from(argv: list[str]) -> str | None:
+    if "--settings" in argv:
+        return argv[argv.index("--settings") + 1]
+    return None
+
+
 # ---------- argv / command construction ----------
 
 
@@ -875,8 +881,11 @@ def test_kill_tree_falls_back_when_group_gone(monkeypatch):
 def test_backend_contract():
     backend = AntigravityBackend()
     assert isinstance(backend, CodingBackend)
-    # Phase 1 minimal honest set (mode/mcp/session_fork arrive later).
-    assert backend.capabilities() == {"resume", "progress_stream", "structured_output"}
+    # Phase 1 honest set + Phase 4's mode (mcp/session_fork stay unadvertised:
+    # Phase 5 / no fork primitive respectively).
+    assert backend.capabilities() == {
+        "resume", "progress_stream", "structured_output", "mode",
+    }
     # Fresh dict each call, Claude defaults until Phase 5.
     assert backend.comment_tool_names() == CLAUDE_COMMENT_TOOL_NAMES
     backend.comment_tool_names()["post_plan"] = "mutated"
@@ -899,3 +908,324 @@ def test_run_result_unpacks_as_three_tuple():
 def test_missing_model_raises_value_error():
     with pytest.raises(ValueError, match="model"):
         asyncio.run(AntigravityBackend().run(_spec(model=None)))
+
+
+# ---------- Phase 4 §4.3: mode → permissions table ----------
+
+
+def test_rule_prefix_absolute_trailing_slash_and_normalized():
+    # P2's hard lesson encoded: absolute, forward-slash, trailing slash —
+    # globs and slash-less prefixes silently do NOT match.
+    assert agy_mod._rule_prefix("/tmp/repo") == "/tmp/repo/"
+    assert agy_mod._rule_prefix("/tmp/repo/") == "/tmp/repo/"
+    assert agy_mod._rule_prefix("C:\\work\\wt") == os.path.abspath(
+        "C:\\work\\wt"
+    ).replace("\\", "/").rstrip("/") + "/"
+    # A relative cwd is absolutized, never leaked into a rule as-is.
+    assert os.path.isabs(agy_mod._rule_prefix("relative/wt"))
+
+
+def test_permissions_plan_and_read_only_share_the_read_only_profile():
+    for mode in ("plan", "read_only"):
+        perm = agy_mod._permissions_for_mode(mode, "/w/")
+        deny = perm["deny"]
+        # Every mutating tool denied against the worktree (prefix target).
+        for tool in agy_mod._MUTATING_TOOL_RULES:
+            assert f"{tool}(/w/)" in deny
+        assert "write_file(/w/.git/)" in deny
+        assert "command(*)" in deny
+        # ask_* are denied in EVERY mode (§4.3: headless cannot answer them).
+        for tool in agy_mod._NEVER_ALLOWED_TOOL_RULES:
+            assert tool in deny
+        # Reads stay allowed alongside the deny block (P5 coexistence).
+        for tool in ("read_file", "view_file", "search", "list_dir"):
+            assert f"{tool}(/w/)" in perm["allow"]
+        assert "mcp(autoswe_comment/*)" in perm["allow"]
+
+
+def test_permissions_read_only_adds_inline_comment_allow_plan_does_not():
+    assert "mcp(autoswe_inline_comment/*)" in agy_mod._permissions_for_mode(
+        "read_only", "/w/")["allow"]
+    assert "mcp(autoswe_inline_comment/*)" not in agy_mod._permissions_for_mode(
+        "plan", "/w/")["allow"]
+
+
+def test_permissions_read_write_is_belt_and_braces_only():
+    for mode in ("read_write", "anything-unset-ish"):
+        perm = agy_mod._permissions_for_mode(mode, "/w/")
+        assert perm["deny"] == ["write_file(/w/.git/)",
+                                *agy_mod._NEVER_ALLOWED_TOOL_RULES]
+        assert perm["allow"] == []
+
+
+def test_ask_tools_denied_even_in_read_write():
+    # The §4.3 "EVERY mode" row: headless print mode cannot answer a prompt,
+    # and an interactive default would hang the run.
+    deny = agy_mod._permissions_for_mode("read_write", "/w/")["deny"]
+    assert set(agy_mod._NEVER_ALLOWED_TOOL_RULES) <= set(deny)
+
+
+# ---------- Phase 4 §4.3: tool override mapping ----------
+
+
+def test_disallowed_override_mapped_to_rule_or_logged_and_ignored():
+    deny: list[str] = []
+    allow: list[str] = []
+    spec = _spec(disallowed_tools_override=[
+        "Bash",                       # mapped: wildcard command deny
+        "Write",                      # mapped: grows the worktree prefix target
+        "mcp__github__create_pr",     # mapped: mcp rule spelling
+        "TotallyMadeUpTool",          # unmapped: log + ignore
+    ])
+    with patch.object(agy_mod, "log") as mock_log:
+        agy_mod._apply_tool_overrides(spec, deny, allow)
+    assert "command(*)" in deny
+    assert "write_file(/tmp/repo/)" in deny  # P2: a bare rule matches nothing
+    assert "mcp(github/create_pr)" in deny
+    assert "TotallyMadeUpTool" not in deny and "TotallyMadeUpTool" not in allow
+    assert any("no agy rule equivalent" in str(c.args[0]) for c in mock_log.call_args_list)
+
+
+def test_extra_override_adds_mcp_allow_only():
+    allow: list[str] = []
+    spec = _spec(extra_tools=["mcp__autoswe_comment__post_plan", "Read"])
+    agy_mod._apply_tool_overrides(spec, [], allow)
+    # Already-mode-governed / unmapped names add no allow; the MCP name does.
+    assert allow == ["mcp(autoswe_comment/post_plan)"]
+
+
+# ---------- Phase 4 §4.2: per-run settings staging (ONE seam) ----------
+
+
+def test_stage_run_config_returns_argv_channel_and_cleans_up():
+    args, env_patch, cleanup = agy_mod._stage_run_config(_spec(mode="plan"), {})
+    assert args[0] == "--settings"
+    path = args[1]
+    assert os.path.exists(path)
+    assert env_patch == {}  # Option C: no env channel needed (P3(b))
+    cleanup()
+    assert not os.path.exists(path)
+
+
+def test_two_concurrent_runs_get_distinct_settings_dirs():
+    a_args, _, a_cleanup = agy_mod._stage_run_config(_spec(mode="plan"), {})
+    b_args, _, b_cleanup = agy_mod._stage_run_config(_spec(mode="read_write"), {})
+    try:
+        assert a_args[1] != b_args[1]
+        # Same filename, different private dir → MAX_CONCURRENT>1 safe.
+        assert os.path.dirname(a_args[1]) != os.path.dirname(b_args[1])
+        assert os.path.basename(a_args[1]) == os.path.basename(b_args[1]) == "settings.json"
+    finally:
+        a_cleanup()
+        b_cleanup()
+
+
+def test_staged_settings_content_pins_worktree_prefix():
+    args, _, cleanup = agy_mod._stage_run_config(
+        _spec(mode="plan", cwd="/home/me/wt/issue-1"), {})
+    try:
+        data = json.loads(Path(args[1]).read_text(encoding="utf-8"))
+    finally:
+        cleanup()
+    deny = data["permissions"]["deny"]
+    assert "write_file(/home/me/wt/issue-1/)" in deny
+    assert "command(*)" in deny
+    assert "/home/me/wt/issue-1/.git/" in " ".join(deny)
+    assert "read_file(/home/me/wt/issue-1/)" in data["permissions"]["allow"]
+
+
+def test_base_settings_merge_preserves_unrelated_keys_and_order(tmp_path):
+    # Profile base (Phase 5 will park MCP registration + useG1Credits here)
+    # is copied into every staged file; the mode block rides alongside it.
+    home = tmp_path / "cfg-home" / MODEL
+    home.mkdir(parents=True)
+    (home / "base-settings.json").write_text(json.dumps({
+        "useG1Credits": True,
+        "modelProvider": "byok",
+        "permissions": {"deny": ["command(ls)"], "allow": ["grep(/base/)"]},
+    }), encoding="utf-8")
+    args, _, cleanup = agy_mod._stage_run_config(
+        _spec(mode="plan"), {"config_home": str(tmp_path / "cfg-home")})
+    try:
+        data = json.loads(Path(args[1]).read_text(encoding="utf-8"))
+    finally:
+        cleanup()
+    assert data["useG1Credits"] is True
+    assert data["modelProvider"] == "byok"
+    # Base rules kept, ours appended after them, deduped.
+    deny = data["permissions"]["deny"]
+    assert deny[0] == "command(ls)"
+    assert "command(*)" in deny
+    assert "grep(/base/)" in data["permissions"]["allow"]
+
+
+def test_bad_base_settings_degrades_to_empty_not_crash(tmp_path):
+    home = tmp_path / "cfg-home" / MODEL
+    home.mkdir(parents=True)
+    (home / "base-settings.json").write_text("{ not json", encoding="utf-8")
+    with patch.object(agy_mod, "log") as mock_log:
+        args, _, cleanup = agy_mod._stage_run_config(
+            _spec(mode="plan"), {"config_home": str(tmp_path / "cfg-home")})
+    try:
+        data = json.loads(Path(args[1]).read_text(encoding="utf-8"))
+    finally:
+        cleanup()
+    # Enforcement is never lost to a broken base file.
+    assert "command(*)" in data["permissions"]["deny"]
+    assert any("not valid JSON" in str(c.args[0]) for c in mock_log.call_args_list)
+
+
+def test_run_stages_settings_in_argv_and_reclaims_on_success():
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    result, captured = _full_run(_spec(mode="plan"), proc)
+    assert result.subtype == "success"
+    path = _settings_path_from(captured["argv"])
+    assert path and path.endswith("settings.json")
+    # finally-reclaimed even on the happy path.
+    assert not os.path.exists(path)
+    assert not os.path.exists(os.path.dirname(path))
+
+
+def test_run_reclaims_staged_dir_on_failure_and_kill():
+    # Failure path: error result (non-zero rc) still goes through finally.
+    proc = _MockProcess(stdout=b"", stderr=b"renderer crashed", returncode=1)
+    result, captured = _full_run(_spec(mode="plan"), proc)
+    assert result.subtype == "error"
+    path = _settings_path_from(captured["argv"])
+    assert path and not os.path.exists(os.path.dirname(path))
+
+    # Kill path: hard-timeout teardown (same harness as the schema temp test).
+    monkey_slack = patch.object(agy_mod, "_HARD_TIMEOUT_SLACK", 0)
+    hang = asyncio.Event()
+    proc2 = _MockProcess(hang=hang)
+    with monkey_slack, patch.object(agy_mod, "_kill_tree", lambda p: None):
+        result2, captured2 = _full_run(_spec(timeout=0, mode="read_write"), proc2)
+    assert result2.subtype == "killed"
+    path2 = _settings_path_from(captured2["argv"])
+    assert path2 and not os.path.exists(os.path.dirname(path2))
+
+
+def test_read_only_run_gets_mode_flag_and_no_skip_flag():
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    _, captured = _full_run(_spec(mode="plan"), proc)
+    argv = captured["argv"]
+    assert argv[argv.index("--mode") + 1] == "plan"
+    assert "--dangerously-skip-permissions" not in argv
+    assert "--settings" in argv
+
+
+def test_read_write_run_keeps_skip_flag_and_default_mode():
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    _, captured = _full_run(_spec(mode="read_write"), proc)
+    argv = captured["argv"]
+    assert "--mode" not in argv
+    assert "--dangerously-skip-permissions" in argv
+
+
+def test_settings_dir_never_leaks_into_os_environ():
+    # The whole point of Option C over Option A: no env indirection that
+    # could race a concurrent run or outlive the process.
+    before = dict(os.environ)
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    _full_run(_spec(mode="plan"), proc)
+    assert os.environ == before
+
+
+# ---------- Phase 4 §4.4: permission_mode self-check ----------
+
+
+def _stream_with_mode(permission_mode: str) -> bytes:
+    return ("\n".join([
+        json.dumps({"event": "init", "conversation_id": "c1",
+                    "init": {"cwd": "/tmp/repo", "model": MODEL,
+                             "permission_mode": permission_mode, "tools": []}}),
+        json.dumps({"event": "result",
+                    "result": {"conversation_id": "c1", "status": "SUCCESS",
+                               "response": "ok"}}),
+    ]) + "\n").encode()
+
+
+def test_read_only_mismatch_raises_not_silently_succeeds():
+    # The §4.4 core refusal: a plan run whose init attests always-proceed had
+    # NO write guard — failing loudly beats shipping an unguarded plan.
+    # (Raise rather than error-flag only: the planner never inspects subtype,
+    # so a flagged-but-returned error result would park the task in waiting.)
+    proc = _MockProcess(stdout=_stream_with_mode("always-proceed"))
+    with patch.object(agy_mod, "log") as mock_log:
+        with pytest.raises(RuntimeError, match="read-only not in effect"):
+            _full_run(_spec(mode="plan"), proc)
+    assert any(
+        c.args and "[ERROR][ANTIGRAVITY] read-only not in effect" in str(c.args[0])
+        for c in mock_log.call_args_list
+    )
+
+
+def test_read_only_mismatch_still_reclaims_staged_dir():
+    # The raise must happen AFTER the finally that reclaims the temp settings
+    # dir — a mismatch leak would strand a file per failed plan.
+    proc = _MockProcess(stdout=_stream_with_mode("always-proceed"))
+    captured_settings: list[str] = []
+
+    async def fake_exec(*argv, **kwargs):
+        captured_settings.append(_settings_path_from(list(argv)))
+        return proc
+
+    with patch("asyncio.create_subprocess_exec", new=fake_exec):
+        with pytest.raises(RuntimeError):
+            asyncio.run(AntigravityBackend().run(_spec(mode="plan")))
+    path = captured_settings[0]
+    assert path and not os.path.exists(os.path.dirname(path))
+
+
+def test_read_only_matching_posture_does_not_raise():
+    proc = _MockProcess(stdout=_stream_with_mode("request-review"))
+    result, _ = _full_run(_spec(mode="plan"), proc)
+    assert result.subtype == "success"
+
+
+def test_read_write_posture_drift_only_warns():
+    # Skip flag requested but init says request-review: degraded convenience,
+    # not a security failure → WARN, run proceeds (§4.4 asymmetry).
+    proc = _MockProcess(stdout=_stream_with_mode("request-review"))
+    with patch.object(agy_mod, "log") as mock_log:
+        result, _ = _full_run(_spec(mode="read_write"), proc)
+    assert result.subtype == "success"
+    assert any(
+        c.args and "[WARN][ANTIGRAVITY] init.permission_mode=" in str(c.args[0])
+        for c in mock_log.call_args_list
+    )
+    assert not any(
+        c.args and "[ERROR][ANTIGRAVITY]" in str(c.args[0])
+        for c in mock_log.call_args_list
+    )
+
+
+def test_expected_permission_mode_table():
+    assert agy_mod._expected_permission_mode("plan", {}) == "request-review"
+    assert agy_mod._expected_permission_mode("read_only", {}) == "request-review"
+    assert agy_mod._expected_permission_mode(None, {}) == "always-proceed"
+    assert agy_mod._expected_permission_mode(
+        "read_write", {"skip_permissions": True}) == "always-proceed"
+    # read_write WITHOUT skip: interactive default is fine headless → no check.
+    assert agy_mod._expected_permission_mode(
+        "read_write", {"skip_permissions": False}) is None
+
+
+def test_soft_deny_on_read_only_run_is_info_not_warn():
+    # §4.4: on an enforced read-only run a soft-deny line is the deny block
+    # WORKING — it must not shout WARN the way it does on a run where it
+    # signals misconfiguration.
+    deny_line = (
+        b"Warning: tool write_file requires approval; headless mode cannot "
+        b"prompt for it, so it was auto-denied.\n"
+    )
+    proc = _MockProcess(
+        stdout=_fixture_text("basic_success").encode(), stderr=deny_line
+    )
+    with patch.object(agy_mod, "log") as mock_log:
+        result, _ = _full_run(_spec(mode="plan"), proc)
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    soft = [m for m in msgs if "soft-denied" in m]
+    assert soft == ["[ANTIGRAVITY] soft-denied (expected, read-only): " + deny_line.decode().rstrip()]
+    assert all(not m.startswith("[WARN]") for m in soft)
+    assert result.subtype == "success"

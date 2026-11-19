@@ -351,13 +351,13 @@ def test_pi_backend_fresh_run_mints_session_id():
 
 
 def test_antigravity_backend_capabilities_exact():
-    """AntigravityBackend advertises exactly resume + progress_stream +
-    structured_output (Phase 1 §1.8).  mode (Phase 4), mcp (Phase 5),
+    """AntigravityBackend advertises resume + progress_stream +
+    structured_output (Phase 1 §1.8) + mode (Phase 4 §4.5).  mcp (Phase 5),
     session_fork (no primitive), can_use_tool and plan_file are absent."""
     from autoswe.harness.backends.antigravity import AntigravityBackend
 
     caps = AntigravityBackend.capabilities()
-    assert caps == {"resume", "progress_stream", "structured_output"}
+    assert caps == {"resume", "progress_stream", "structured_output", "mode"}
 
 
 def test_antigravity_backend_no_session_fork_capability():
@@ -656,18 +656,18 @@ def test_has_read_only_enforcement_pi_is_true():
     ) is True
 
 
-def test_has_read_only_enforcement_antigravity_is_false():
-    """agy has neither 'mode' nor 'can_use_tool' (Phase 1) → read-only NOT enforced.
+def test_has_read_only_enforcement_antigravity_is_true():
+    """agy advertises 'mode' (Phase 4 §4.5: per-run --settings permissions
+    block enforces read-only) → read-only enforced.
 
-    Same issue #166 condition as Codex: a plan/review phase on an antigravity
-    profile must loudly degrade and rely on the ensure_worktree_unchanged
-    backstop (until Phase 4 adds mode enforcement).
+    The issue #166 loud-degrade stops for this backend;
+    ensure_worktree_unchanged remains only as the unconditional backstop.
     """
     from autoswe.harness.runner import has_read_only_enforcement
 
     assert has_read_only_enforcement(
         {"backend": "antigravity", "model": "gemini-test"}
-    ) is False
+    ) is True
 
 
 def test_has_read_only_enforcement_default_is_claude():

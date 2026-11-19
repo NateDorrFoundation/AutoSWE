@@ -280,6 +280,32 @@ _DEFAULT_CONFIG_ERROR = (
 )
 
 
+def _restamp_init_mode(lines: list[bytes], permission_mode: str) -> list[bytes]:
+    """Rewrite every ``init`` line's ``init.permission_mode`` to *permission_mode*.
+
+    The real CLI attests its posture itself (request-review vs
+    always-proceed — fixture-confirmed); a fake that baked one posture into
+    the scripted lines would contradict whatever flags the backend actually
+    passed (and the Phase 4 self-check would fail every legitimate run).
+    Non-JSON lines and every non-init event pass through byte-identical.
+    """
+    out: list[bytes] = []
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped.startswith(b"{"):
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, dict) and obj.get("event") == "init":
+                init = obj.get("init")
+                if isinstance(init, dict):
+                    init["permission_mode"] = permission_mode
+                    raw = (json.dumps(obj) + "\n").encode("utf-8")
+        out.append(raw)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Fake async subprocess plumbing
 
@@ -387,6 +413,8 @@ _VALUE_FLAGS = {
     "--print-timeout": "print_timeout",
     "--log-file": "log_file",
     "--conversation": "conversation",
+    "--settings": "settings_path",
+    "--mode": "mode",
 }
 _BOOL_FLAGS = {
     "--disable-slash-commands": "disable_slash_commands",
@@ -476,6 +504,15 @@ class AntigravityFake:
         # Scripted streams: (lines, returncode, stderr_bytes) triples built
         # ahead of time by the builders below.
         self._scripts: list[tuple[list[str], int, bytes]] = []
+        # Per-script init.permission_mode overrides (call_index -> value),
+        # set via script_response(permission_mode=...).  Without an override
+        # the init line is re-stamped at SPAWN from the parsed argv:
+        # skip flag → "always-proceed", no skip flag → "request-review" —
+        # so the Phase 4 self-check sees the posture the flags actually ask
+        # for, exactly like the real CLI attests (fixture-confirmed:
+        # permission_denied.jsonl runs with no skip flag carry
+        # "request-review").
+        self._permission_overrides: dict[int, str] = {}
         self._call_index = 0
         self.calls: list[dict[str, Any]] = []
         self._patch_tuple = None  # (module, original) stored by patch()
@@ -495,7 +532,9 @@ class AntigravityFake:
     # -- Script append helper --
 
     def _add(self, lines: list[str], returncode: int = 0,
-             stderr: bytes = b"") -> None:
+             stderr: bytes = b"", permission_mode: str | None = None) -> None:
+        if permission_mode is not None:
+            self._permission_overrides[len(self._scripts)] = permission_mode
         self._scripts.append((lines, returncode, stderr))
 
     # -- Builders (mirror ClaudeFake / CodexFake / PiFake signatures) --
@@ -505,7 +544,8 @@ class AntigravityFake:
                         structured_output: dict | None = None,
                         error: str | None = None,
                         json_schema: dict | None = None,
-                        status: str | None = None) -> None:
+                        status: str | None = None,
+                        permission_mode: str | None = None) -> None:
         """Add a response to the script.  Order matters — each agy run consumes the next.
 
         *subtype* selects the stream shape: ``success`` (rc 0 SUCCESS),
@@ -513,34 +553,44 @@ class AntigravityFake:
         ``killed_rc`` (truncated stream + rc -9), ``config_error`` (bare ERROR
         result naming a config-level failure).  *status* overrides the result
         status (e.g. ``"WAITING"`` for the headless question flow).
+        *permission_mode* pins the init line's attested posture (bypassing the
+        spawn-time derivation) — used to script a §4.4 self-check mismatch.
         """
         self.script_kind(text, session_id, subtype,
                          structured_output=structured_output, error=error,
-                         json_schema=json_schema, status=status)
+                         json_schema=json_schema, status=status,
+                         permission_mode=permission_mode)
 
     def script_kind(self, text: str, session_id: str, kind: str, *,
                     structured_output: dict | None = None,
                     error: str | None = None,
                     json_schema: dict | None = None,
                     status: str | None = None,
-                    tool_steps: list[dict] | None = None) -> None:
+                    tool_steps: list[dict] | None = None,
+                    permission_mode: str | None = None) -> None:
         """Route one scripted response to its stream builder."""
         if kind == "success":
             if status == "WAITING":
-                self._add(_waiting_stream(session_id, text))
+                self._add(_waiting_stream(session_id, text),
+                          permission_mode=permission_mode)
             else:
                 self._add(_success_stream(
                     session_id, text, structured=structured_output,
-                    json_schema=json_schema, tool_steps=tool_steps))
+                    json_schema=json_schema, tool_steps=tool_steps),
+                    permission_mode=permission_mode)
         elif kind == "error":
-            self._add(_error_stream(session_id, error or text or "error"))
+            self._add(_error_stream(session_id, error or text or "error"),
+                      permission_mode=permission_mode)
         elif kind == "killed":
-            self._add(_killed_stream(session_id, text))
+            self._add(_killed_stream(session_id, text),
+                      permission_mode=permission_mode)
         elif kind == "killed_rc":
-            self._add(_killed_rc_stream(session_id, text), returncode=-9)
+            self._add(_killed_rc_stream(session_id, text), returncode=-9,
+                      permission_mode=permission_mode)
         elif kind == "config_error":
             self._add(_config_error_stream(
-                session_id, error or _DEFAULT_CONFIG_ERROR))
+                session_id, error or _DEFAULT_CONFIG_ERROR),
+                permission_mode=permission_mode)
         else:
             raise ValueError(f"unknown scripted stream kind: {kind!r}")
 
@@ -690,9 +740,18 @@ class AntigravityFake:
 
             stdout_lines, returncode, stderr_bytes, raise_oserror = \
                 self._next_stream()
+            script_index = self._call_index
             self._call_index += 1
             if raise_oserror:
                 raise OSError("fake spawn failure")
+
+            # Attest the posture the flags actually ask for unless the script
+            # pinned one (a scripted mismatch is how §4.4 gets exercised).
+            posture = self._permission_overrides.get(script_index) or (
+                _PERMISSION_ALWAYS_PROCEED if call.get("skip_permissions")
+                else _PERMISSION_REQUEST_REVIEW
+            )
+            stdout_lines = _restamp_init_mode(stdout_lines, posture)
 
             # The prompt rides stdin, not argv: record the parsed stdin
             # events on the call dict so tests can assert the transport
