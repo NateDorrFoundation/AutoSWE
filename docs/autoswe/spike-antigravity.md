@@ -63,6 +63,11 @@ the same LiteLLM gateway the claude-code/codex backends use. Verified end-to-end
      `Restart=always`, linger on → survives reboots). The upstream key lives only in
      a local `proxy.env` (`EnvironmentFile`) — it is not and must never be committed. Streaming tool calls required argument accumulation in the
      bridge (OpenAI deltas → one complete Gemini `functionCall` at `finish_reason`).
+   - Hardening item (before the bridge becomes permanent Phase-1+ infrastructure):
+     the bridge does **not** check the inbound `GEMINI_API_KEY`, so anything on the
+     machine that can reach the port spends the LiteLLM key. The loopback-only bind
+     (`127.0.0.1`) keeps this acceptable for the spike; revisit (inbound key check
+     or socket permissions) if it outlives Phase 1.
 2. **Settings** (can be passed per-run via `--settings`, no global mutation):
    ```json
    {"modelProvider":"gemini","customModelsConfig":{"customModels":{"qwen3.8-flash-next":{"modelName":"gemini-api://127.0.0.1:4001/models/qwen3.8-flash-next"}}}}

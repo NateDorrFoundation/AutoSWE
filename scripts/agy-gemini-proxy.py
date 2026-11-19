@@ -15,9 +15,9 @@ EnvironmentFile) — never hardcode it here; keep the real key in a local
 proxy.env outside the repo. The `agy` side needs only GEMINI_API_KEY=<any
 non-empty string> + GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4001.
 
-Install: copy next to a local proxy.env and run via
-scripts/agy-gemini-proxy.service (systemd user unit; see spike-antigravity.md
-§0.1.2 for the full BYOK recipe).
+Install: copy as ~/.litellm-agy/gemini-openai-proxy.py next to a local proxy.env
+and run via scripts/agy-gemini-proxy.service (systemd user unit; the ExecStart
+path must match; see spike-antigravity.md §0.1.2 for the full BYOK recipe).
 """
 
 """Gemini generateContent wire -> OpenAI chat.completions proxy.
@@ -36,8 +36,6 @@ functionResponse, tools -> OpenAI tools, usageMetadata, finishReason.
 import json
 import os
 import sys
-import time
-import uuid
 
 import httpx
 import uvicorn
@@ -73,6 +71,14 @@ FINISH_MAP = {
 
 
 def gemini_to_openai(body: dict, model: str) -> dict:
+    # Gemini functionResponse parts carry no id, so tool_call ids are assigned
+    # deterministically per (tool name, occurrence): the n-th functionCall for a
+    # name and the n-th functionResponse for that name get the same id (history
+    # replays calls and responses in strict interleaved order). A random id per
+    # call would leave every tool result pointing at a nonexistent tool call,
+    # which strict OpenAI-compatible upstreams reject with 400.
+    call_seq: dict = {}
+    resp_seq: dict = {}
     msgs = []
     sysinst = body.get("systemInstruction")
     if sysinst:
@@ -88,20 +94,26 @@ def gemini_to_openai(body: dict, model: str) -> dict:
                 texts.append(p["text"])
             elif "functionCall" in p:
                 fc = p["functionCall"]
+                fname = fc.get("name", "")
+                seq = call_seq.get(fname, 0)
+                call_seq[fname] = seq + 1
                 tool_calls.append({
-                    "id": "call_" + uuid.uuid4().hex[:12],
+                    "id": f"call_{fname}_{seq}",
                     "type": "function",
                     "function": {
-                        "name": fc.get("name", ""),
+                        "name": fname,
                         "arguments": json.dumps(fc.get("args", {})),
                     },
                 })
             elif "functionResponse" in p:
                 fr = p["functionResponse"]
+                fname = fr.get("name", "")
+                seq = resp_seq.get(fname, 0)
+                resp_seq[fname] = seq + 1
                 msgs.append({
                     "role": "tool",
-                    "tool_call_id": fr.get("id") or fr.get("name", ""),
-                    "name": fr.get("name", ""),
+                    "tool_call_id": f"call_{fname}_{seq}",
+                    "name": fname,
                     "content": json.dumps(fr.get("response", {})),
                 })
         if tool_calls:
@@ -143,7 +155,7 @@ def gemini_to_openai(body: dict, model: str) -> dict:
     return cfg
 
 
-def openai_to_gemini(resp: dict, start: float) -> dict:
+def openai_to_gemini(resp: dict) -> dict:
     choice = (resp.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     parts = []
@@ -175,6 +187,24 @@ def openai_to_gemini(resp: dict, start: float) -> dict:
     return out
 
 
+def gemini_usage(usage: dict) -> dict:
+    return {"promptTokenCount": usage.get("prompt_tokens", 0),
+            "candidatesTokenCount": usage.get("completion_tokens", 0),
+            "totalTokenCount": usage.get("total_tokens", 0)}
+
+
+def flushed_calls(tool_acc: dict) -> list:
+    """Turn accumulated tool-call fragments into complete functionCall parts."""
+    parts = []
+    for tacc in tool_acc.values():
+        try:
+            args = json.loads(tacc["args"] or "{}")
+        except json.JSONDecodeError:
+            args = {"_raw": tacc["args"]}
+        parts.append({"functionCall": {"name": tacc["name"], "args": args}})
+    return parts
+
+
 def sse_gemini_chunk(parts=None, finish=None, usage=None, model="") -> str:
     cand = {"content": {"parts": parts or [], "role": "model"}, "index": 0}
     if finish:
@@ -203,7 +233,7 @@ async def generate(model: str, request: Request):
     if r.status_code != 200:
         return JSONResponse({"error": {"message": r.text[:2000], "status": "UPSTREAM_ERROR"}},
                             status_code=r.status_code)
-    return JSONResponse(openai_to_gemini(r.json(), time.time()))
+    return JSONResponse(openai_to_gemini(r.json()))
 
 
 @app.post("/v1beta/models/{model:path}:streamGenerateContent")
@@ -263,21 +293,18 @@ async def stream(model: str, request: Request):
                             finish = FINISH_MAP.get(ch.get("finish_reason")) \
                                 if ch.get("finish_reason") else None
                             if finish and tool_acc:
-                                for acc in tool_acc.values():
-                                    try:
-                                        args = json.loads(acc["args"] or "{}")
-                                    except json.JSONDecodeError:
-                                        args = {"_raw": acc["args"]}
-                                    parts.append({"functionCall": {
-                                        "name": acc["name"], "args": args}})
+                                parts.extend(flushed_calls(tool_acc))
                                 tool_acc = {}
-                            u = None
-                            if usage and finish:
-                                u = {"promptTokenCount": usage.get("prompt_tokens", 0),
-                                     "candidatesTokenCount": usage.get("completion_tokens", 0),
-                                     "totalTokenCount": usage.get("total_tokens", 0)}
+                            u = gemini_usage(usage) if (usage and finish) else None
                             if parts or finish:
                                 yield sse_gemini_chunk(parts or None, finish, u, model_out)
+                    if tool_acc:
+                        # Upstream ended with [DONE] but never sent a finish_reason:
+                        # flush the accumulated tool calls so they are not dropped.
+                        yield sse_gemini_chunk(
+                            flushed_calls(tool_acc), "STOP",
+                            gemini_usage(usage) if usage else None, model_out)
+                        tool_acc = {}
         except Exception as e:  # noqa: BLE001
             yield sse_gemini_chunk([{"text": f"proxy error: {e}"}], "STOP", None, model)
 
