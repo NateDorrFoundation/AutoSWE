@@ -641,6 +641,8 @@ def _finalize(
 # ---------- Process-tree kill ----------
 
 
+# The same tree-kill gap still exists in pi.py (bare process.kill()); tracked
+# in #327 — do not copy that pattern.
 def _kill_tree(process) -> None:
     """Kill the agy process AND its descendants.
 
