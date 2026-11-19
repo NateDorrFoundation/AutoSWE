@@ -294,16 +294,34 @@ def test_resolve_ps1_shim():
 
 
 def test_resolve_nothing_found_raises(monkeypatch):
+    # RuntimeError, NOT FileNotFoundError: FileNotFoundError is an OSError
+    # subclass and the runner's retryable tuple contains OSError with no
+    # FileNotFoundError carve-out — a broken config would burn every attempt.
     monkeypatch.setattr(agy_mod.shutil, "which", lambda name: None)
-    with pytest.raises(FileNotFoundError) as exc:
+    with pytest.raises(RuntimeError) as exc:
         _resolve_agy_executable("")
     assert "cli_path" in str(exc.value)
+    retryable = AntigravityBackend.retryable_exceptions()
+    assert not issubclass(RuntimeError, retryable)
+    assert issubclass(FileNotFoundError, retryable)  # why the conversion matters
 
 
 def test_resolve_named_missing_path_raises():
-    with pytest.raises(FileNotFoundError) as exc:
+    with pytest.raises(RuntimeError) as exc:
         _resolve_agy_executable("/definitely/not/here/agy")
     assert "/definitely/not/here/agy" in str(exc.value)
+
+
+def test_spawn_file_not_found_becomes_runtime_error():
+    # Exec resolved but vanished before spawn (or the shim is missing):
+    # pi.py precedent converts to RuntimeError — outside retryable_exceptions.
+    async def boom(*argv, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "agy")
+
+    with patch("asyncio.create_subprocess_exec", new=boom):
+        with pytest.raises(RuntimeError) as exc:
+            asyncio.run(AntigravityBackend().run(_spec()))
+    assert "could not be spawned" in str(exc.value)
 
 
 def test_resolve_cli_path_wins_over_path(monkeypatch, tmp_path):
@@ -508,6 +526,40 @@ def test_unknown_event_is_skipped():
     _parse_line('{"event":"brand_new_thing"}', acc, None)
     _parse_line("not json at all", acc, None)
     assert not acc.saw_result and not acc.error_flag
+
+
+# ---------- no-result finalization (pre-result config deaths, spike §0.1.3) ----------
+
+
+def test_no_result_auth_failure_on_stderr_is_config_error():
+    # agy dies before emitting any result event with auth text on stderr:
+    # config error (outside retryable_subtypes), CLI text surfaced for the
+    # FAILED comment — not a retryable "error" that burns every attempt.
+    acc = _AgyAccumulator()
+    stderr = (
+        b"Error: authentication required for the configured project.\n"
+        b"Run `agy auth login` to set up credentials.\n"
+    )
+    res = _finalize(acc, 1, stderr_tail=stderr)
+    assert res.subtype == "config_error"
+    assert res.ok is False
+    assert res.subtype not in AntigravityBackend.RETRYABLE_SUBTYPES
+    assert "authentication required" in res.text
+
+
+def test_no_result_unrelated_stderr_stays_retryable_error():
+    acc = _AgyAccumulator()
+    res = _finalize(acc, 1, stderr_tail=b"renderer crashed: segmentation fault")
+    assert res.subtype == "error"
+    assert res.subtype in AntigravityBackend.RETRYABLE_SUBTYPES
+
+
+def test_no_result_zero_exit_stderr_never_config_error():
+    # returncode 0 with no result stays "error": the config-error scan is
+    # only for non-zero exits.
+    acc = _AgyAccumulator()
+    res = _finalize(acc, 0, stderr_tail=b"authentication required")
+    assert res.subtype == "error"
 
 
 def test_tool_label_rendering():

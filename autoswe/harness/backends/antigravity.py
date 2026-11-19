@@ -58,12 +58,16 @@ import uuid
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 
-from autoswe.core.logging_utils import log
+from autoswe.core.logging_utils import get_debug_logger, log
 from autoswe.harness.backends.base import (
     CLAUDE_COMMENT_TOOL_NAMES,
     RunResult,
     RunSpec,
 )
+
+# Internal diagnostics (forward-compat skips) go to the debug logger only —
+# plan §1.5 asks for debug level, and log() also prints to stdout.
+_dbg = get_debug_logger()
 
 # Max bytes allowed on stdout/stderr pipes before we truncate and flag the
 # turn as failed.  Prevents pipe-buffer deadlock (~64KB on Linux) and
@@ -199,9 +203,12 @@ def _resolve_agy_executable(cli_path: str | None) -> tuple[str, list[str]]:
     Unlike pi, a bare fallback name is NOT accepted: agy is not on the default
     non-login shell PATH on the host (spike "PATH caveat"), so a
     non-resolving lookup is a *config error* and raises
-    ``FileNotFoundError`` naming the attempted path.  The runner's retry
-    policy treats FileNotFoundError as non-retryable, so this surfaces once
-    instead of burning a retry.
+    ``RuntimeError`` naming the attempted path.  RuntimeError is outside
+    ``retryable_exceptions()`` (unlike FileNotFoundError, which is an OSError
+    subclass the runner *does* retry), so a wrong config surfaces once
+    instead of burning every attempt — same precedent as
+    ``pi.py`` (``_run_async``'s spawn-time FileNotFoundError → RuntimeError
+    conversion).
 
     Windows shims (Phase 0 windows-pending, implemented per plan): an npm-style
     ``.cmd``/``.bat`` shim cannot be exec'd directly (CreateProcess), so we
@@ -217,7 +224,7 @@ def _resolve_agy_executable(cli_path: str | None) -> tuple[str, list[str]]:
     if not path:
         path = shutil.which("agy") or ""
     if not path:
-        raise FileNotFoundError(
+        raise RuntimeError(
             "agy executable not found: neither the harness profile's "
             "'cli_path' nor shutil.which('agy') resolved. Set 'cli_path' to "
             "the absolute agy path (e.g. ~/.local/bin/agy) — agy is not on "
@@ -232,7 +239,7 @@ def _resolve_agy_executable(cli_path: str | None) -> tuple[str, list[str]]:
         # A PATH lookup result is trusted (which() already verified it); an
         # explicitly configured path that does not exist is a config error we
         # name here so the message points at the profile, not at exec().
-        raise FileNotFoundError(f"agy cli_path does not exist: {path!r}")
+        raise RuntimeError(f"agy cli_path does not exist: {path!r}")
     return path, []
 
 
@@ -385,8 +392,8 @@ def _parse_line(line: str, acc: _AgyAccumulator, callback) -> None:
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
-        # Non-JSON line (stderr leak, progress banner) — skip.
-        log(f"[ANTIGRAVITY] non-JSON stream line skipped: {line[:120]}")
+        # Non-JSON line (stderr leak, progress banner) — skip at debug level.
+        _dbg.debug(f"[ANTIGRAVITY] non-JSON stream line skipped: {line[:120]}")
         return
     if not isinstance(event, dict):
         return
@@ -504,7 +511,7 @@ def _parse_line(line: str, acc: _AgyAccumulator, callback) -> None:
 
     else:
         # Forward compatibility: unknown events are debug-logged and skipped.
-        log(f"[ANTIGRAVITY] unknown stream event '{etype}' skipped")
+        _dbg.debug(f"[ANTIGRAVITY] unknown stream event '{etype}' skipped")
 
 
 # ---------- Finalize ----------
@@ -528,6 +535,7 @@ def _finalize(
     *,
     killed: bool = False,
     duration_seconds: float = 0.0,
+    stderr_tail: bytes = b"",
 ) -> RunResult:
     """Turn the accumulator + exit code into a RunResult (Phase 1 table).
 
@@ -536,17 +544,33 @@ def _finalize(
     final result — T8 — but the process still dies on the signal).
     ``duration_seconds`` is the harness's own wall-clock (T8/T9:
     result.duration_seconds is CLI accounting, NEVER wall-clock).
+    ``stderr_tail`` is the bounded stderr tail: auth/config deaths (spike
+    §0.1.3) can exit non-zero *before* any result event, so it is scanned for
+    the config-error patterns before defaulting to retryable "error".
     """
     status = acc.status
+    config_text = ""
     if status is not None and status not in _TERMINAL_STATUSES:
         log(f"[WARN][ANTIGRAVITY] unexpected result.status {status!r}")
 
     # First match wins.
     if killed or (returncode is not None and returncode < 0):
         subtype = "killed"
-    elif acc.error_flag or not acc.saw_result:
-        # Stream overflow, or the stream never produced a terminal result.
+    elif acc.error_flag:
+        # Stream overflow.
         subtype = "error"
+    elif not acc.saw_result:
+        # The stream never produced a terminal result.  A non-zero exit whose
+        # stderr carries auth/config text is the pre-result death of spike
+        # §0.1.3 (e.g. "authentication required"): a config error, not a
+        # retryable run failure — otherwise the retry policy burns every
+        # attempt on a wrong profile.
+        stderr_text = stderr_tail.decode("utf-8", errors="replace") if stderr_tail else ""
+        if returncode != 0 and _is_config_error(stderr_text):
+            subtype = "config_error"
+            config_text = stderr_text.strip()
+        else:
+            subtype = "error"
     elif status == "SUCCESS" and returncode == 0:
         subtype = "success"
     elif status == "WAITING":
@@ -579,8 +603,10 @@ def _finalize(
             parts.append("".join(acc._text_by_index[index]))
         text = "".join(parts)
         source = "text_delta fallback"
-    if subtype == "config_error" and acc.error:
-        text = acc.error
+    if subtype == "config_error":
+        # The FAILED comment tells the operator what to fix: the CLI's own
+        # message — from the result event when there was one, else stderr.
+        text = acc.error or config_text or text
 
     if acc.usage:
         usage = acc.usage
@@ -697,12 +723,13 @@ class AntigravityBackend:
     def retryable_exceptions(cls) -> tuple:
         # agy has no SDK; its failure surface is the subprocess boundary, same
         # as Codex/pi.  asyncio.TimeoutError is the wall-clock backstop
-        # (wait_for); OSError covers spawn-time failures from
-        # create_subprocess_exec (PermissionError, a missing/incompatible
-        # executable, etc.).  NOTE: _resolve_agy_executable raises
-        # FileNotFoundError (an OSError subclass) for a *missing config* —
-        # that one is meant to surface, and the runner's non-retryable
-        # FileNotFoundError handling applies before this generic catch.
+        # (wait_for); OSError covers *transient* spawn-time failures from
+        # create_subprocess_exec (PermissionError, resource exhaustion, etc.).
+        # NOTE: a missing/misconfigured executable is NOT retried: both
+        # _resolve_agy_executable and the spawn-time FileNotFoundError catch
+        # raise RuntimeError, which is outside this tuple — the runner has no
+        # FileNotFoundError carve-out, so letting the OSError subclass through
+        # would burn every attempt on a broken config (pi.py precedent).
         return (asyncio.TimeoutError, OSError)
 
     def run(self, spec: RunSpec) -> Awaitable[RunResult]:
@@ -766,7 +793,7 @@ class AntigravityBackend:
                 "included; see docs/autoswe/spike-antigravity.md §0.1.2)."
             )
 
-        # _resolve_agy_executable raises FileNotFoundError (non-retryable) when
+        # _resolve_agy_executable raises RuntimeError (non-retryable) when
         # nothing resolves — a config error that surfaces once.
         exe, prefix_argv = _resolve_agy_executable(
             str(spec.cli_path or harness_cfg.get("cli_path") or "").strip()
@@ -819,9 +846,11 @@ class AntigravityBackend:
             )
         except FileNotFoundError as e:
             # Exec vanished between resolution and spawn, or the resolved
-            # shim (cmd/powershell) is missing.  Surface as FileNotFoundError
-            # (OSError subclass) naming the config source.
-            raise FileNotFoundError(
+            # shim (cmd/powershell) is missing.  Convert to RuntimeError
+            # (outside retryable_exceptions, pi.py precedent): FileNotFoundError
+            # is an OSError subclass and the runner would otherwise retry a
+            # broken config until the attempts run out.
+            raise RuntimeError(
                 f"agy executable '{exe}' could not be spawned "
                 f"(cli_path={spec.cli_path or harness_cfg.get('cli_path') or 'agy on PATH'!r}): {e}"
             ) from e
@@ -990,4 +1019,6 @@ class AntigravityBackend:
             except OSError:
                 pass
 
-        return _finalize(acc, returncode, killed=killed, duration_seconds=duration)
+        return _finalize(
+            acc, returncode, killed=killed, duration_seconds=duration, stderr_tail=stderr_tail
+        )
