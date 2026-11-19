@@ -996,6 +996,20 @@ class AntigravityBackend:
                 "— killed process tree (the CLI's own --print-timeout did not fire)"
             )
 
+        # Redact the RESOLVED GEMINI_API_KEY — whichever source won the
+        # precedence merge above (os.environ / named field / profile env /
+        # env_overrides), not just the profile field — from the stderr tail
+        # once, here.  The tail feeds BOTH the failure log below AND the
+        # stderr_tail _finalize turns into RunResult.text on the config_error
+        # path, which is posted to a public GitHub FAILED comment;
+        # mask_sensitive() has no Gemini-style pattern, so nothing downstream
+        # would catch it.
+        resolved_api_key = str(env.get("GEMINI_API_KEY") or "")
+        if resolved_api_key:
+            stderr_tail = stderr_tail.replace(
+                resolved_api_key.encode("utf-8", "replace"), b"***"
+            )
+
         # Reap the process so `returncode` is set.  On the timeout path the
         # tree-kill just finished it; on the happy path wait() already
         # completed inside the gather and this is a no-op (and on the Windows
@@ -1007,13 +1021,10 @@ class AntigravityBackend:
         if returncode != 0:
             log(f"[ANTIGRAVITY] exit={returncode}")
             # The NDJSON stream carries no diagnostic for startup crashes —
-            # the real error text is on stderr.  Log the tail (redact the
-            # profile's API key if set).
+            # the real error text is on stderr.  Log the tail (already
+            # key-redacted above, regardless of which source set the key).
             stderr_text = stderr_tail.decode("utf-8", errors="replace").strip()
             if stderr_text:
-                api_key = str(harness_cfg.get("gemini_api_key") or "")
-                if api_key:
-                    stderr_text = stderr_text.replace(api_key, "***")
                 log(f"[ANTIGRAVITY] stderr (exit={returncode}): {stderr_text[:2000]}")
         if returncode != 0 and not acc.saw_result:
             log(f"[ANTIGRAVITY] stream did not reach result (exit={returncode})")

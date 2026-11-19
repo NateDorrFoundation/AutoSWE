@@ -563,6 +563,91 @@ def test_no_result_zero_exit_stderr_never_config_error():
     assert res.subtype == "error"
 
 
+def test_env_sourced_api_key_masked_in_config_error_text_and_logs():
+    # Review round-4: the stderr tail becomes RunResult.text on the
+    # config_error path (posted to a public FAILED comment).  The key must be
+    # masked regardless of which source won the env precedence merge — here
+    # env_overrides, the highest tier, NOT the named profile field the old
+    # redaction covered.
+    secret = "AIzaSECRET-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    stderr = (
+        f"Error: authentication required for the configured project "
+        f"(key {secret} rejected)\n".encode()
+    )
+    proc = _MockProcess(stdout=b"", stderr=stderr, returncode=1)
+    with patch.object(agy_mod, "log") as mock_log:
+        result, captured = _full_run(
+            _spec(env_overrides={"GEMINI_API_KEY": secret}), proc
+        )
+    # The key is still delivered to the CLI — masking is display-only.
+    assert captured["env"]["GEMINI_API_KEY"] == secret
+    assert result.subtype == "config_error"
+    assert "authentication required" in result.text
+    assert secret not in result.text
+    assert secret not in "".join(
+        str(c.args[0]) for c in mock_log.call_args_list if c.args
+    )
+
+
+def test_profile_sourced_api_key_still_masked():
+    # Regression guard for the original (profile-field) redaction path, now
+    # covered by the single resolved-key masking in _run_async.
+    secret = "AIzaBBBBbbbbBBBBbbbbBBBBbbbbBBBBbbbb"
+    stderr = (
+        f"Error: authentication required (credential {secret} invalid)\n".encode()
+    )
+    proc = _MockProcess(stdout=b"", stderr=stderr, returncode=1)
+    result, _ = _full_run(
+        _spec(state={"_harness_cfg": {"backend": "antigravity", "model": MODEL,
+                                      "gemini_api_key": secret}}),
+        proc,
+    )
+    assert result.subtype == "config_error"
+    assert secret not in result.text
+
+
+def test_init_cwd_mismatch_warns():
+    # Plan §1.3: subprocess cwd is the only workspace lever; warn loudly when
+    # the CLI's init.cwd disagrees with spec.cwd.
+    events = "\n".join([
+        json.dumps({"event": "init", "conversation_id": "c1",
+                    "init": {"cwd": "/an/entirely/different/dir", "model": MODEL,
+                             "permission_mode": "default", "tools": []}}),
+        json.dumps({"event": "result",
+                    "result": {"conversation_id": "c1", "status": "SUCCESS",
+                               "response": "ok"}}),
+    ]) + "\n"
+    proc = _MockProcess(stdout=events.encode())
+    with patch.object(agy_mod, "log") as mock_log:
+        result, _ = _full_run(_spec(cwd="/tmp/repo"), proc)
+    assert result.subtype == "success"
+    assert any(
+        c.args
+        and "[WARN][ANTIGRAVITY] init.cwd" in str(c.args[0])
+        and "/an/entirely/different/dir" in str(c.args[0])
+        and "/tmp/repo" in str(c.args[0])
+        for c in mock_log.call_args_list
+    )
+
+
+def test_init_cwd_match_does_not_warn():
+    events = "\n".join([
+        json.dumps({"event": "init", "conversation_id": "c1",
+                    "init": {"cwd": "/tmp/repo", "model": MODEL,
+                             "permission_mode": "default", "tools": []}}),
+        json.dumps({"event": "result",
+                    "result": {"conversation_id": "c1", "status": "SUCCESS",
+                               "response": "ok"}}),
+    ]) + "\n"
+    proc = _MockProcess(stdout=events.encode())
+    with patch.object(agy_mod, "log") as mock_log:
+        result, _ = _full_run(_spec(cwd="/tmp/repo"), proc)
+    assert result.subtype == "success"
+    assert not any(
+        c.args and "init.cwd" in str(c.args[0]) for c in mock_log.call_args_list
+    )
+
+
 def test_tool_label_rendering():
     assert _tool_label({
         "tool_name": "run_command",
