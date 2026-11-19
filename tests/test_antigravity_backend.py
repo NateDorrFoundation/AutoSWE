@@ -1134,11 +1134,12 @@ def test_settings_dir_never_leaks_into_os_environ():
 # ---------- Phase 4 §4.4: permission_mode self-check ----------
 
 
-def _stream_with_mode(permission_mode: str) -> bytes:
+def _stream_with_mode(permission_mode: str | None) -> bytes:
+    init: dict = {"cwd": "/tmp/repo", "model": MODEL, "tools": []}
+    if permission_mode is not None:
+        init["permission_mode"] = permission_mode
     return ("\n".join([
-        json.dumps({"event": "init", "conversation_id": "c1",
-                    "init": {"cwd": "/tmp/repo", "model": MODEL,
-                             "permission_mode": permission_mode, "tools": []}}),
+        json.dumps({"event": "init", "conversation_id": "c1", "init": init}),
         json.dumps({"event": "result",
                     "result": {"conversation_id": "c1", "status": "SUCCESS",
                                "response": "ok"}}),
@@ -1180,6 +1181,41 @@ def test_read_only_mismatch_still_reclaims_staged_dir():
 def test_read_only_matching_posture_does_not_raise():
     proc = _MockProcess(stdout=_stream_with_mode("request-review"))
     result, _ = _full_run(_spec(mode="plan"), proc)
+    assert result.subtype == "success"
+
+
+def test_read_only_unattested_init_fails_closed():
+    # Review round-2 MEDIUM: init parsed but WITHOUT permission_mode is not
+    # "no attestation to check" — under staged --settings the CLI always
+    # attests, so silence means the guard is unverifiable → fail closed,
+    # same ERROR + raise path as a mismatch (never inherit fail-open).
+    proc = _MockProcess(stdout=_stream_with_mode(None))
+    with patch.object(agy_mod, "log") as mock_log:
+        with pytest.raises(RuntimeError, match="did not attest permission_mode"):
+            _full_run(_spec(mode="plan"), proc)
+    assert any(
+        c.args
+        and "[ERROR][ANTIGRAVITY] read-only phase: CLI did not attest"
+        in str(c.args[0])
+        for c in mock_log.call_args_list
+    )
+
+
+def test_pre_init_death_keeps_normal_error_outcome():
+    # The fail-open carve-out that REMAINS: a stream that dies before the init
+    # line never reached attestation, so it maps to its ordinary outcome
+    # (error/killed) rather than the posture RuntimeError.
+    proc = _MockProcess(stdout=b"", stderr=b"boom", returncode=1)
+    result, _ = _full_run(_spec(mode="plan"), proc)
+    assert result.subtype == "error"
+    assert "permission_mode" not in (result.text or "")
+
+
+def test_unattested_init_on_read_write_run_still_warns_or_passes():
+    # Fail-closed is read-only-only: a read_write run has no guard to verify,
+    # so a missing attestation must not raise (worst case the WARN path).
+    proc = _MockProcess(stdout=_stream_with_mode(None))
+    result, _ = _full_run(_spec(mode="read_write"), proc)
     assert result.subtype == "success"
 
 

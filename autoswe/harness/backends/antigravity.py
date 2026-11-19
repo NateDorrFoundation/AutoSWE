@@ -233,10 +233,18 @@ class _AgyAccumulator:
     # ``init`` payload bits kept for Phase 4/5 assertions and cwd checks.
     init_cwd: str | None = None
     init_tools: list = field(default_factory=list)
+    # ``init`` event was parsed.  The §4.4 self-check distinguishes "the CLI
+    # never got far enough to attest anything" (pre-init death — nothing to
+    # check) from "init parsed but carried no permission_mode" — a CLI that
+    # ignored the staged --settings AND omitted the attestation, which for a
+    # read-only phase must fail CLOSED, not pass (review round-2 MEDIUM).
+    init_seen: bool = False
     # Permission posture the CLI reported (``request-review`` /
     # ``always-proceed``) — the Phase 4 §4.4 self-check compares it against
     # _expected_permission_mode().  None until the stream starts (and forever
-    # for streams that die before ``init``, where the check cannot run).
+    # for streams that die before ``init``, where the check cannot run; a
+    # parsed init WITHOUT the field stays None too — init_seen tells the two
+    # apart).
     init_permission_mode: str | None = None
     # Authoritative text: result.response, captured on the ``result`` event.
     final_response: str | None = None
@@ -715,6 +723,7 @@ def _parse_line(line: str, acc: _AgyAccumulator, callback) -> None:
         init = event.get("init")
         if not isinstance(init, dict):
             init = {}
+        acc.init_seen = True
         acc.init_cwd = init.get("cwd")
         permission_mode = init.get("permission_mode")
         acc.init_permission_mode = (
@@ -1417,7 +1426,27 @@ class AntigravityBackend:
         # for any path that swallows the raise, and the raise happens after
         # the process is reaped + the staged dir is reclaimed by the caller's
         # finally.  read_write posture drift gets a WARN, never a failure.
+        # Fail CLOSED on a missing attestation too (review round-2 MEDIUM):
+        # init_seen marks "the CLI got far enough to attest", so an init
+        # without permission_mode is a CLI ignoring the staged --settings AND
+        # hiding its posture — the same silent-write-access case, not a
+        # pre-init death (init_seen False: nothing attested anything; the
+        # stream's own error/killed mapping decides).  The posture error also
+        # supersedes subtype="killed" by design: a misattested read-only run
+        # that then got hard-timeout-killed must not slip through on the
+        # retryable killed path.  Error details carry only mode/expected/
+        # actual — the staged temp file is already deleted by the finally and
+        # this message reaches the public FAILED comment via the planner.
         expected_posture = _expected_permission_mode(spec.mode, harness_cfg)
+        if read_only and acc.init_seen and acc.init_permission_mode is None:
+            acc.error_flag = True
+            detail = (
+                "read-only phase: CLI did not attest permission_mode under "
+                f"staged --settings (mode={spec.mode!r}, expected "
+                f"{expected_posture!r}, actual <missing>)"
+            )
+            log(f"[ERROR][ANTIGRAVITY] {detail}")
+            raise RuntimeError(f"[ANTIGRAVITY] {detail}")
         if (
             expected_posture is not None
             and acc.init_permission_mode is not None
@@ -1425,15 +1454,11 @@ class AntigravityBackend:
         ):
             if read_only:
                 acc.error_flag = True
-                staged = (
-                    settings_args[1]
-                    if settings_args and len(settings_args) > 1 else "absent"
-                )
                 detail = (
                     f"read-only not in effect: init.permission_mode="
-                    f"{acc.init_permission_mode!r}, expected {expected_posture!r} — "
-                    f"the per-run --settings deny rules were not honored "
-                    f"(settings={staged!r})"
+                    f"{acc.init_permission_mode!r}, expected {expected_posture!r} "
+                    f"(mode={spec.mode!r}) — the per-run --settings deny rules "
+                    f"were not honored"
                 )
                 log(f"[ERROR][ANTIGRAVITY] {detail}")
                 raise RuntimeError(f"[ANTIGRAVITY] {detail}")

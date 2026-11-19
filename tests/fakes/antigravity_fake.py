@@ -280,13 +280,16 @@ _DEFAULT_CONFIG_ERROR = (
 )
 
 
-def _restamp_init_mode(lines: list[bytes], permission_mode: str) -> list[bytes]:
+def _restamp_init_mode(lines: list[bytes], permission_mode: str | None) -> list[bytes]:
     """Rewrite every ``init`` line's ``init.permission_mode`` to *permission_mode*.
 
     The real CLI attests its posture itself (request-review vs
     always-proceed — fixture-confirmed); a fake that baked one posture into
     the scripted lines would contradict whatever flags the backend actually
     passed (and the Phase 4 self-check would fail every legitimate run).
+    ``permission_mode=None`` instead DROPS the field entirely — the scripted
+    "CLI attests nothing" posture, which the §4.4 self-check must treat as
+    fail-closed on a read-only phase (review round-2 MEDIUM).
     Non-JSON lines and every non-init event pass through byte-identical.
     """
     out: list[bytes] = []
@@ -300,10 +303,18 @@ def _restamp_init_mode(lines: list[bytes], permission_mode: str) -> list[bytes]:
             if isinstance(obj, dict) and obj.get("event") == "init":
                 init = obj.get("init")
                 if isinstance(init, dict):
-                    init["permission_mode"] = permission_mode
+                    if permission_mode is None:
+                        init.pop("permission_mode", None)
+                    else:
+                        init["permission_mode"] = permission_mode
                     raw = (json.dumps(obj) + "\n").encode("utf-8")
         out.append(raw)
     return out
+
+
+# Sentinel distinguishing "attestation param not passed" from an explicit
+# attestation=None (which MEANS "omit the init permission_mode field").
+_ATTEST_DEFAULT: Any = object()
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +524,10 @@ class AntigravityFake:
         # permission_denied.jsonl runs with no skip flag carry
         # "request-review").
         self._permission_overrides: dict[int, str] = {}
+        # Scripts whose init carries NO permission_mode at all (scripted via
+        # script_response(attestation=None)) — the "CLI attests nothing"
+        # posture the §4.4 check must fail closed on for read-only phases.
+        self._attestation_omitted: set[int] = set()
         self._call_index = 0
         self.calls: list[dict[str, Any]] = []
         self._patch_tuple = None  # (module, original) stored by patch()
@@ -532,9 +547,18 @@ class AntigravityFake:
     # -- Script append helper --
 
     def _add(self, lines: list[str], returncode: int = 0,
-             stderr: bytes = b"", permission_mode: str | None = None) -> None:
+             stderr: bytes = b"", permission_mode: str | None = None,
+             attestation: Any = _ATTEST_DEFAULT) -> None:
+        index = len(self._scripts)
         if permission_mode is not None:
-            self._permission_overrides[len(self._scripts)] = permission_mode
+            self._permission_overrides[index] = permission_mode
+        if attestation is not _ATTEST_DEFAULT:
+            # attestation=None → drop the init attestation entirely;
+            # attestation=<str> → same pin as permission_mode=.
+            if attestation is None:
+                self._attestation_omitted.add(index)
+            else:
+                self._permission_overrides[index] = str(attestation)
         self._scripts.append((lines, returncode, stderr))
 
     # -- Builders (mirror ClaudeFake / CodexFake / PiFake signatures) --
@@ -545,7 +569,8 @@ class AntigravityFake:
                         error: str | None = None,
                         json_schema: dict | None = None,
                         status: str | None = None,
-                        permission_mode: str | None = None) -> None:
+                        permission_mode: str | None = None,
+                        attestation: Any = _ATTEST_DEFAULT) -> None:
         """Add a response to the script.  Order matters — each agy run consumes the next.
 
         *subtype* selects the stream shape: ``success`` (rc 0 SUCCESS),
@@ -555,11 +580,14 @@ class AntigravityFake:
         status (e.g. ``"WAITING"`` for the headless question flow).
         *permission_mode* pins the init line's attested posture (bypassing the
         spawn-time derivation) — used to script a §4.4 self-check mismatch.
+        *attestation=None* instead DROPS the init ``permission_mode`` field
+        entirely — the scripted "CLI attests nothing" posture, which the §4.4
+        check fails closed on for read-only phases.
         """
         self.script_kind(text, session_id, subtype,
                          structured_output=structured_output, error=error,
                          json_schema=json_schema, status=status,
-                         permission_mode=permission_mode)
+                         permission_mode=permission_mode, attestation=attestation)
 
     def script_kind(self, text: str, session_id: str, kind: str, *,
                     structured_output: dict | None = None,
@@ -567,30 +595,32 @@ class AntigravityFake:
                     json_schema: dict | None = None,
                     status: str | None = None,
                     tool_steps: list[dict] | None = None,
-                    permission_mode: str | None = None) -> None:
+                    permission_mode: str | None = None,
+                    attestation: Any = _ATTEST_DEFAULT) -> None:
         """Route one scripted response to its stream builder."""
         if kind == "success":
             if status == "WAITING":
                 self._add(_waiting_stream(session_id, text),
-                          permission_mode=permission_mode)
+                          permission_mode=permission_mode,
+                          attestation=attestation)
             else:
                 self._add(_success_stream(
                     session_id, text, structured=structured_output,
                     json_schema=json_schema, tool_steps=tool_steps),
-                    permission_mode=permission_mode)
+                    permission_mode=permission_mode, attestation=attestation)
         elif kind == "error":
             self._add(_error_stream(session_id, error or text or "error"),
-                      permission_mode=permission_mode)
+                      permission_mode=permission_mode, attestation=attestation)
         elif kind == "killed":
             self._add(_killed_stream(session_id, text),
-                      permission_mode=permission_mode)
+                      permission_mode=permission_mode, attestation=attestation)
         elif kind == "killed_rc":
             self._add(_killed_rc_stream(session_id, text), returncode=-9,
-                      permission_mode=permission_mode)
+                      permission_mode=permission_mode, attestation=attestation)
         elif kind == "config_error":
             self._add(_config_error_stream(
                 session_id, error or _DEFAULT_CONFIG_ERROR),
-                permission_mode=permission_mode)
+                permission_mode=permission_mode, attestation=attestation)
         else:
             raise ValueError(f"unknown scripted stream kind: {kind!r}")
 
@@ -746,12 +776,16 @@ class AntigravityFake:
                 raise OSError("fake spawn failure")
 
             # Attest the posture the flags actually ask for unless the script
-            # pinned one (a scripted mismatch is how §4.4 gets exercised).
-            posture = self._permission_overrides.get(script_index) or (
-                _PERMISSION_ALWAYS_PROCEED if call.get("skip_permissions")
-                else _PERMISSION_REQUEST_REVIEW
-            )
-            stdout_lines = _restamp_init_mode(stdout_lines, posture)
+            # pinned one (a scripted mismatch is how §4.4 gets exercised), or
+            # asked for no attestation at all (the unattested-init case).
+            if script_index in self._attestation_omitted:
+                stdout_lines = _restamp_init_mode(stdout_lines, None)
+            else:
+                posture = self._permission_overrides.get(script_index) or (
+                    _PERMISSION_ALWAYS_PROCEED if call.get("skip_permissions")
+                    else _PERMISSION_REQUEST_REVIEW
+                )
+                stdout_lines = _restamp_init_mode(stdout_lines, posture)
 
             # The prompt rides stdin, not argv: record the parsed stdin
             # events on the call dict so tests can assert the transport

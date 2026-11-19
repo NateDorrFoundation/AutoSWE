@@ -608,7 +608,12 @@ with the skip flag). A **read-only** run attesting anything else means the
 staged deny rules were not honored — a plan run that silently has write
 access is worse than a failed plan run, so the backend logs
 `[ERROR][ANTIGRAVITY] read-only not in effect…` and **raises**
-(`RuntimeError`, outside `retryable_exceptions()` → one attempt). The raise,
+(`RuntimeError`, outside `retryable_exceptions()` → one attempt). Failing
+**without** attestation fails closed too: under staged `--settings` the CLI
+always stamps `init.permission_mode`, so a parsed init that carries none is
+treated as an unverified guard (`…CLI did not attest permission_mode…`, same
+ERROR + raise path). Only streams that die *before* `init` keep their normal
+error/killed mapping — there was never an attestation to check. The raise,
 not just an error-flagged result, is load-bearing: the planner never inspects
 `RunResult.subtype`, so a returned-but-flagged run would park the task in
 `waiting` as if legitimate; the raise flows through the handler's exception
