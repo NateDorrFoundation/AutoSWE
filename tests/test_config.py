@@ -319,26 +319,18 @@ def test_load_config_bad_int_falls_back_to_default_with_warning(
 ):
     """MAX_ATTEMPTS=thre must fall back to the default (3) and log a warning.
 
-    The ``autoswe.debug`` logger is deliberately set to ``propagate=False``
-    (init_debug_logger avoids double-emitting through root handlers), so
-    caplog's root-level handler never sees its records. Re-enable
-    propagation for the duration of the capture and restore it after.
+    caplog_autoswe handles the ``autoswe.debug`` propagate=False dance
+    (init_debug_logger disables propagation to avoid double-emitting through
+    root handlers, which blinds caplog's root-level handler).
     """
-    import logging
-
     autoswe_env = isolated_autoswe_dir / "config" / "autoswe.env"
     autoswe_env.write_text("MAX_ATTEMPTS=thre\n", encoding="utf-8")
 
     from autoswe.core.config import load_config
+    from tests.conftest import caplog_autoswe
 
-    dbg = logging.getLogger("autoswe.debug")
-    prev_propagate = dbg.propagate
-    dbg.propagate = True
-    try:
-        with caplog.at_level("WARNING"):
-            cfg = load_config()
-    finally:
-        dbg.propagate = prev_propagate
+    with caplog_autoswe(caplog):
+        cfg = load_config()
 
     assert cfg["MAX_ATTEMPTS"] == 3
     assert isinstance(cfg["MAX_ATTEMPTS"], int)
@@ -514,28 +506,16 @@ def test_pr_ci_error_policy_unknown_value_falls_back_to_block(
     """A typo (e.g. 'BLOCKED') is not a valid policy; fall back to the
     fail-safe 'block' rather than silently opening the gate.
 
-    Same ``autoswe.debug`` propagate dance as the MAX_ATTEMPTS test above:
-    init_debug_logger sets propagate=False (so records don't double-emit
-    through root), which blinds caplog's root handler. Initialize the logger
-    first so get_debug_logger() inside load_config is a pure early-return
-    that cannot re-disable propagation, then capture with it re-enabled.
+    Same ``autoswe.debug`` propagate dance as the MAX_ATTEMPTS test above,
+    now centralized in caplog_autoswe.
     """
     monkeypatch.setenv("PR_CI_ERROR_POLICY", "BLOCKED")
 
-    import logging
-
     from autoswe.core.config import load_config
-    from autoswe.core.logging_utils import get_debug_logger
+    from tests.conftest import caplog_autoswe
 
-    get_debug_logger()  # idempotent: guarantees handlers exist before we flip propagate
-    dbg = logging.getLogger("autoswe.debug")
-    prev_propagate = dbg.propagate
-    dbg.propagate = True
-    try:
-        with caplog.at_level("WARNING"):
-            cfg = load_config()
-    finally:
-        dbg.propagate = prev_propagate
+    with caplog_autoswe(caplog):
+        cfg = load_config()
 
     assert cfg["PR_CI_ERROR_POLICY"] == "block"
     assert "PR_CI_ERROR_POLICY" in caplog.text

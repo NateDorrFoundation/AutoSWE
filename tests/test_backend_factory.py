@@ -164,17 +164,24 @@ def test_get_backend_antigravity_import_is_deferred():
 
 def test_get_backend_antigravity_orchestrator_effort_warns(caplog):
     """Orchestrator + effort logs a warning (effort does not apply there) —
-    without failing the resolution."""
+    without failing the resolution.
+
+    caplog_autoswe re-enables autoswe.debug propagation during the capture:
+    importing the antigravity backend runs a module-level get_debug_logger()
+    which sets propagate=False, blinding caplog's root handler (import-order
+    dependent otherwise).
+    """
     import logging
 
     from autoswe.harness.backends.antigravity import AntigravityBackend
+    from tests.conftest import caplog_autoswe
 
-    caplog.set_level(logging.INFO, logger="autoswe.debug")
-    backend = get_backend({
-        "backend": "antigravity",
-        "model": "Orchestrator (Neon)",
-        "effort": "high",
-    })
+    with caplog_autoswe(caplog, logging.INFO):
+        backend = get_backend({
+            "backend": "antigravity",
+            "model": "Orchestrator (Neon)",
+            "effort": "high",
+        })
     assert isinstance(backend, AntigravityBackend)  # warn, not fail
     warnings = [r.getMessage() for r in caplog.records
                 if "effort" in r.getMessage() and "Orchestrator" in r.getMessage()]
@@ -186,13 +193,14 @@ def test_get_backend_antigravity_non_orchestrator_effort_does_not_warn(caplog):
     import logging
 
     from autoswe.harness.backends.antigravity import AntigravityBackend
+    from tests.conftest import caplog_autoswe
 
-    caplog.set_level(logging.INFO, logger="autoswe.debug")
-    backend = get_backend({
-        "backend": "antigravity",
-        "model": "gemini-4-neon-high",
-        "effort": "high",
-    })
+    with caplog_autoswe(caplog, logging.INFO):
+        backend = get_backend({
+            "backend": "antigravity",
+            "model": "gemini-4-neon-high",
+            "effort": "high",
+        })
     assert isinstance(backend, AntigravityBackend)
     assert not [r.getMessage() for r in caplog.records
                 if "effort" in r.getMessage() and "Orchestrator" in r.getMessage()]
