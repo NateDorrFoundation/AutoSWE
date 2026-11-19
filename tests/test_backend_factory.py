@@ -162,6 +162,42 @@ def test_get_backend_antigravity_import_is_deferred():
             sys.modules["autoswe.harness.backends.antigravity"] = saved
 
 
+def test_get_backend_antigravity_orchestrator_effort_warns(caplog):
+    """Orchestrator + effort logs a warning (effort does not apply there) —
+    without failing the resolution."""
+    import logging
+
+    from autoswe.harness.backends.antigravity import AntigravityBackend
+
+    caplog.set_level(logging.INFO, logger="autoswe.debug")
+    backend = get_backend({
+        "backend": "antigravity",
+        "model": "Orchestrator (Neon)",
+        "effort": "high",
+    })
+    assert isinstance(backend, AntigravityBackend)  # warn, not fail
+    warnings = [r.getMessage() for r in caplog.records
+                if "effort" in r.getMessage() and "Orchestrator" in r.getMessage()]
+    assert warnings, f"expected an effort/Orchestrator warning, got {caplog.records}"
+
+
+def test_get_backend_antigravity_non_orchestrator_effort_does_not_warn(caplog):
+    """A regular model slug with effort set logs no Orchestrator warning."""
+    import logging
+
+    from autoswe.harness.backends.antigravity import AntigravityBackend
+
+    caplog.set_level(logging.INFO, logger="autoswe.debug")
+    backend = get_backend({
+        "backend": "antigravity",
+        "model": "gemini-4-neon-high",
+        "effort": "high",
+    })
+    assert isinstance(backend, AntigravityBackend)
+    assert not [r.getMessage() for r in caplog.records
+                if "effort" in r.getMessage() and "Orchestrator" in r.getMessage()]
+
+
 def test_get_backend_unknown_message_lists_antigravity():
     """The unknown-backend error lists antigravity among the supported names."""
     with pytest.raises(ValueError, match="Supported backends") as exc:

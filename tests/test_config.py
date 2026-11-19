@@ -1,6 +1,8 @@
 """Tests for autoswe.core.config — load_config defaults and override parsing."""
 import json
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # pi mcp.json builder (autoswe.harness.mcp_config) — Phase 1 of PLAN-pi-mcp.md
 # ---------------------------------------------------------------------------
@@ -957,11 +959,9 @@ def test_load_harnesses_config_unknown_backend_message_lists_antigravity(isolate
 
     from autoswe.core.config import load_harnesses_config
 
-    try:
+    with pytest.raises(ValueError) as e:
         load_harnesses_config()
-        assert False, "should have raised ValueError"
-    except ValueError as e:
-        assert "antigravity" in str(e)
+    assert "antigravity" in str(e.value)
 
 
 def test_load_harnesses_config_antigravity_bad_effort_raises(isolated_autoswe_dir):
@@ -974,12 +974,10 @@ def test_load_harnesses_config_antigravity_bad_effort_raises(isolated_autoswe_di
 
     from autoswe.core.config import load_harnesses_config
 
-    try:
+    with pytest.raises(ValueError) as e:
         load_harnesses_config()
-        assert False, "should have raised ValueError"
-    except ValueError as e:
-        assert "agy" in str(e)  # names the entry
-        assert "effort" in str(e).lower()
+    assert "agy" in str(e.value)  # names the entry
+    assert "effort" in str(e.value).lower()
 
 
 def test_load_harnesses_config_antigravity_effort_enum_accepted(isolated_autoswe_dir):
@@ -1028,12 +1026,10 @@ def test_load_harnesses_config_antigravity_non_bool_flag_raises(isolated_autoswe
 
     from autoswe.core.config import load_harnesses_config
 
-    try:
+    with pytest.raises(ValueError) as e:
         load_harnesses_config()
-        assert False, "should have raised ValueError"
-    except ValueError as e:
-        assert "agy" in str(e)
-        assert "sandbox" in str(e)
+    assert "agy" in str(e.value)
+    assert "sandbox" in str(e.value)
 
 
 def test_load_harnesses_config_antigravity_tilde_expanded(isolated_autoswe_dir):

@@ -357,7 +357,8 @@ def _coerce_bool(key: str, field: str, value: object) -> bool:
             return False
     raise ValueError(
         f"harnesses.json entry '{key}' has non-boolean '{field}' ({value!r}); "
-        "it must be a boolean (true/false)."
+        "it must be a boolean, or a string spelling one of: true/false, "
+        "1/0, yes/no, on/off (case-insensitive)."
     )
 
 # Module-level cache for harnesses config — avoids re-reading harnesses.json
