@@ -1,5 +1,7 @@
 """Tests for autoswe.core.config — load_config defaults and override parsing."""
+import json
 
+import pytest
 
 # ---------------------------------------------------------------------------
 # pi mcp.json builder (autoswe.harness.mcp_config) — Phase 1 of PLAN-pi-mcp.md
@@ -906,13 +908,164 @@ def test_load_harnesses_config_backend_case_insensitive(isolated_autoswe_dir):
     assert result["upper"]["backend"] == "claude_code"
 
 
-def test_known_backends_pins_three_backends():
-    """KNOWN_BACKENDS is exactly {claude_code, codex, pi} — the enumeration
-    axis every backend-aware test must agree on.  Adding a fourth backend
-    must update this pin (and the factory, and the test axes)."""
+def test_known_backends_pins_four_backends():
+    """KNOWN_BACKENDS is exactly {claude_code, codex, pi, antigravity} — the
+    enumeration axis every backend-aware test must agree on.  Adding another
+    backend must update this pin (and the factory, and the test axes)."""
     from autoswe.core.config import KNOWN_BACKENDS
 
-    assert {"claude_code", "codex", "pi"} == KNOWN_BACKENDS
+    assert {"claude_code", "codex", "pi", "antigravity"} == KNOWN_BACKENDS
+
+
+# ---------------------------------------------------------------------------
+# load_harnesses_config — antigravity validation (issue #319)
+# ---------------------------------------------------------------------------
+
+def test_load_harnesses_config_accepts_antigravity_backend(isolated_autoswe_dir):
+    """antigravity is a known backend and its profile fields load through validation."""
+    harnesses_json = isolated_autoswe_dir / "config" / "harnesses.json"
+    harnesses_json.write_text(
+        '{"agy-neon": {"backend": "antigravity", "model": "gemini-4-neon-high", '
+        '"effort": "high", "agent": "default", "timeout": 3600, '
+        '"skip_permissions": true, "sandbox": false, '
+        '"log_dir": "~/agy-logs", "config_home": "~/.agy-home", '
+        '"max_turns": 100, "env": {"FOO": "bar"}}}',
+        encoding="utf-8",
+    )
+
+    from autoswe.core.config import load_harnesses_config
+
+    result = load_harnesses_config()
+    assert "agy-neon" in result
+    profile = result["agy-neon"]
+    assert profile["backend"] == "antigravity"
+    assert profile["model"] == "gemini-4-neon-high"
+    assert profile["effort"] == "high"
+    assert profile["agent"] == "default"
+    assert profile["timeout"] == 3600
+    assert profile["skip_permissions"] is True
+    assert profile["sandbox"] is False
+    assert profile["max_turns"] == 100
+    assert profile["env"] == {"FOO": "bar"}
+
+
+def test_load_harnesses_config_unknown_backend_message_lists_antigravity(isolated_autoswe_dir):
+    """The unknown-backend error lists antigravity among the valid choices."""
+    harnesses_json = isolated_autoswe_dir / "config" / "harnesses.json"
+    harnesses_json.write_text(
+        '{"bad": {"backend": "unknown_backend"}}',
+        encoding="utf-8",
+    )
+
+    from autoswe.core.config import load_harnesses_config
+
+    with pytest.raises(ValueError) as e:
+        load_harnesses_config()
+    assert "antigravity" in str(e.value)
+
+
+def test_load_harnesses_config_antigravity_bad_effort_raises(isolated_autoswe_dir):
+    """A typo'd effort fails at startup, and the message names the entry."""
+    harnesses_json = isolated_autoswe_dir / "config" / "harnesses.json"
+    harnesses_json.write_text(
+        '{"agy": {"backend": "antigravity", "model": "gemini-4-neon-high", "effort": "turbo"}}',
+        encoding="utf-8",
+    )
+
+    from autoswe.core.config import load_harnesses_config
+
+    with pytest.raises(ValueError) as e:
+        load_harnesses_config()
+    assert "agy" in str(e.value)  # names the entry
+    assert "effort" in str(e.value).lower()
+
+
+def test_load_harnesses_config_antigravity_effort_enum_accepted(isolated_autoswe_dir):
+    """Every documented effort level passes validation."""
+    harnesses_json = isolated_autoswe_dir / "config" / "harnesses.json"
+    profiles = {
+        f"agy-{level}": {"backend": "antigravity", "model": "m", "effort": level}
+        for level in ("low", "medium", "high", "xhigh", "max")
+    }
+    harnesses_json.write_text(json.dumps(profiles), encoding="utf-8")
+
+    from autoswe.core.config import load_harnesses_config
+
+    result = load_harnesses_config()
+    for level in ("low", "medium", "high", "xhigh", "max"):
+        assert result[f"agy-{level}"]["effort"] == level
+
+
+def test_load_harnesses_config_antigravity_string_bools_coerced(isolated_autoswe_dir):
+    """skip_permissions/sandbox arriving as ${VAR}-expanded strings coerce to real bools.
+
+    bool("false") is True — if the string reached the backend its flag gate
+    would invert.  The load-time coercion prevents that (issue #319).
+    """
+    harnesses_json = isolated_autoswe_dir / "config" / "harnesses.json"
+    harnesses_json.write_text(
+        '{"agy": {"backend": "antigravity", "model": "m", '
+        '"skip_permissions": "false", "sandbox": "true"}}',
+        encoding="utf-8",
+    )
+
+    from autoswe.core.config import load_harnesses_config
+
+    result = load_harnesses_config()
+    assert result["agy"]["skip_permissions"] is False
+    assert result["agy"]["sandbox"] is True
+
+
+def test_load_harnesses_config_antigravity_non_bool_flag_raises(isolated_autoswe_dir):
+    """A nonsense value for a boolean flag fails at startup."""
+    harnesses_json = isolated_autoswe_dir / "config" / "harnesses.json"
+    harnesses_json.write_text(
+        '{"agy": {"backend": "antigravity", "model": "m", "sandbox": "yes-please"}}',
+        encoding="utf-8",
+    )
+
+    from autoswe.core.config import load_harnesses_config
+
+    with pytest.raises(ValueError) as e:
+        load_harnesses_config()
+    assert "agy" in str(e.value)
+    assert "sandbox" in str(e.value)
+
+
+def test_load_harnesses_config_antigravity_tilde_expanded(isolated_autoswe_dir):
+    """'~' in cli_path/log_dir is expanded at load time — a subprocess never
+    sees a literal tilde (the pi-local bug class, harnesses.json.example)."""
+    import os
+
+    harnesses_json = isolated_autoswe_dir / "config" / "harnesses.json"
+    harnesses_json.write_text(
+        '{"agy": {"backend": "antigravity", "model": "m", '
+        '"cli_path": "~/.local/bin/agy", "log_dir": "~/agy-logs"}}',
+        encoding="utf-8",
+    )
+
+    from autoswe.core.config import load_harnesses_config
+
+    result = load_harnesses_config()
+    assert result["agy"]["cli_path"] == os.path.expanduser("~/.local/bin/agy")
+    assert result["agy"]["log_dir"] == os.path.expanduser("~/agy-logs")
+    assert "~" not in result["agy"]["cli_path"]
+
+
+def test_load_harnesses_config_antigravity_gemini_key_interpolated(isolated_autoswe_dir, monkeypatch):
+    """${GEMINI_API_KEY} interpolates from the environment."""
+    monkeypatch.setenv("GEMINI_API_KEY", "gk-test-123")
+    harnesses_json = isolated_autoswe_dir / "config" / "harnesses.json"
+    harnesses_json.write_text(
+        '{"agy": {"backend": "antigravity", "model": "gemini-3.8-flash-medium", '
+        '"gemini_api_key": "${GEMINI_API_KEY}"}}',
+        encoding="utf-8",
+    )
+
+    from autoswe.core.config import load_harnesses_config
+
+    result = load_harnesses_config()
+    assert result["agy"]["gemini_api_key"] == "gk-test-123"
 
 
 # ---------------------------------------------------------------------------

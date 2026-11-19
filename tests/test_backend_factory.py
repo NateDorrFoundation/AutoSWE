@@ -34,21 +34,29 @@ def test_unknown_backend_raises_value_error():
         get_backend({"backend": "unknown_backend"})
 
 
-def test_get_backend_resolves_all_three_backends():
+def test_get_backend_resolves_all_known_backends():
     """Every KNOWN_BACKENDS profile resolves to its CodingBackend.
 
-    Enumeration axis: all three backends (claude_code, codex, pi) must
-    resolve through the factory to a CodingBackend instance.  codex/pi are
-    CLI backends that require a model; claude_code is SDK-based.
+    Enumeration axis: all backends (claude_code, codex, pi, antigravity)
+    must resolve through the factory to a CodingBackend instance.
+    codex/pi/antigravity are CLI backends that require a model;
+    claude_code is SDK-based.
     """
     from autoswe.core.config import KNOWN_BACKENDS
+    from autoswe.harness.backends.antigravity import AntigravityBackend
 
     profiles = {
         "claude_code": {"backend": "claude_code"},
         "codex": {"backend": "codex", "model": "gpt-5.6-terra"},
         "pi": {"backend": "pi", "model": "claude-sonnet-4-5"},
+        "antigravity": {"backend": "antigravity", "model": "gemini-4-neon-high"},
     }
-    expected = {"claude_code": ClaudeCodeBackend, "codex": CodexBackend, "pi": PiBackend}
+    expected = {
+        "claude_code": ClaudeCodeBackend,
+        "codex": CodexBackend,
+        "pi": PiBackend,
+        "antigravity": AntigravityBackend,
+    }
     for name in KNOWN_BACKENDS:
         backend = get_backend(profiles[name])
         assert isinstance(backend, expected[name]), f"{name} resolved to {type(backend)}"
@@ -109,6 +117,92 @@ def test_get_backend_pi_with_provider_and_key():
         "approve_project": True,
     })
     assert isinstance(backend, PiBackend)
+
+
+def test_get_backend_antigravity_with_model():
+    """An antigravity profile with a model returns an AntigravityBackend."""
+    from autoswe.harness.backends.antigravity import AntigravityBackend
+
+    backend = get_backend({"backend": "antigravity", "model": "m"})
+    assert isinstance(backend, AntigravityBackend)
+    assert isinstance(backend, CodingBackend)
+
+
+def test_get_backend_antigravity_without_model_raises():
+    """An antigravity profile with no model fails fast — agy would otherwise
+    fall back to the account's last-selected model, which is unacceptable for
+    reproducibility.  The message must point at `agy models`."""
+    for cfg in ({"backend": "antigravity"},
+                {"backend": "antigravity", "model": ""},
+                {"backend": "antigravity", "model": "   "}):
+        with pytest.raises(ValueError, match="missing required 'model'") as exc:
+            get_backend(cfg)
+        assert "agy models" in str(exc.value)
+
+
+def test_get_backend_antigravity_case_insensitive():
+    """backend field is case-insensitive for antigravity too."""
+    from autoswe.harness.backends.antigravity import AntigravityBackend
+
+    for val in ("antigravity", "ANTIGRAVITY", "Antigravity"):
+        backend = get_backend({"backend": val, "model": "gemini-4-neon-high"})
+        assert isinstance(backend, AntigravityBackend)
+
+
+def test_get_backend_antigravity_import_is_deferred():
+    """Resolving a claude_code profile must not import the antigravity module."""
+    import sys
+
+    saved = sys.modules.pop("autoswe.harness.backends.antigravity", None)
+    try:
+        get_backend({"backend": "claude_code", "model": "x"})
+        assert "autoswe.harness.backends.antigravity" not in sys.modules
+    finally:
+        if saved is not None:
+            sys.modules["autoswe.harness.backends.antigravity"] = saved
+
+
+def test_get_backend_antigravity_orchestrator_effort_warns(caplog):
+    """Orchestrator + effort logs a warning (effort does not apply there) —
+    without failing the resolution."""
+    import logging
+
+    from autoswe.harness.backends.antigravity import AntigravityBackend
+
+    caplog.set_level(logging.INFO, logger="autoswe.debug")
+    backend = get_backend({
+        "backend": "antigravity",
+        "model": "Orchestrator (Neon)",
+        "effort": "high",
+    })
+    assert isinstance(backend, AntigravityBackend)  # warn, not fail
+    warnings = [r.getMessage() for r in caplog.records
+                if "effort" in r.getMessage() and "Orchestrator" in r.getMessage()]
+    assert warnings, f"expected an effort/Orchestrator warning, got {caplog.records}"
+
+
+def test_get_backend_antigravity_non_orchestrator_effort_does_not_warn(caplog):
+    """A regular model slug with effort set logs no Orchestrator warning."""
+    import logging
+
+    from autoswe.harness.backends.antigravity import AntigravityBackend
+
+    caplog.set_level(logging.INFO, logger="autoswe.debug")
+    backend = get_backend({
+        "backend": "antigravity",
+        "model": "gemini-4-neon-high",
+        "effort": "high",
+    })
+    assert isinstance(backend, AntigravityBackend)
+    assert not [r.getMessage() for r in caplog.records
+                if "effort" in r.getMessage() and "Orchestrator" in r.getMessage()]
+
+
+def test_get_backend_unknown_message_lists_antigravity():
+    """The unknown-backend error lists antigravity among the supported names."""
+    with pytest.raises(ValueError, match="Supported backends") as exc:
+        get_backend({"backend": "nope"})
+    assert "antigravity" in str(exc.value)
 
 
 def test_get_backend_passes_with_extra_fields():

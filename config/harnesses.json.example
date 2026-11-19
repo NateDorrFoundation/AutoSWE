@@ -96,5 +96,24 @@
     "agent_dir": "~/.pi/agent",
     "session_dir": "~/.pi/sessions",
     "timeout": 3600
+  },
+
+  "agy-neon": {
+    "_comment": "Antigravity CLI headless (agy). Auth: run `agy` once interactively on this host (keyring), or set gemini_api_key. Set useG1Credits=false in ~/.gemini/antigravity-cli/settings.json to avoid overage billing.",
+    "backend": "antigravity",
+    "model": "gemini-4-neon-high",
+    "timeout": 3600
+  },
+
+  "agy-flash": {
+    "backend": "antigravity",
+    "model": "gemini-3.8-flash-medium",
+    "gemini_api_key": "${GEMINI_API_KEY}"
+  },
+
+  "agy-orchestrator": {
+    "_comment": "Planner+Hydrogen pair in one run; --effort does not apply.",
+    "backend": "antigravity",
+    "model": "Orchestrator (Neon)"
   }
 }
