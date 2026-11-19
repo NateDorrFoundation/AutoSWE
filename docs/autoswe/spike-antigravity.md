@@ -61,13 +61,17 @@ the same LiteLLM gateway the claude-code/codex backends use. Verified end-to-end
    - systemd user service: **vendored at `scripts/agy-gemini-proxy.service`**
      (installed as `~/.config/systemd/user/agy-gemini-proxy.service`; enabled,
      `Restart=always`, linger on → survives reboots). The upstream key lives only in
-     a local `proxy.env` (`EnvironmentFile`) — it is not and must never be committed. Streaming tool calls required argument accumulation in the
+     a local `proxy.env` (`EnvironmentFile`) — it is not and must never be committed,
+     and `proxy.env` must be `chmod 600`-ed (the default umask leaves it
+     world-readable). Streaming tool calls required argument accumulation in the
      bridge (OpenAI deltas → one complete Gemini `functionCall` at `finish_reason`).
-   - Hardening item (before the bridge becomes permanent Phase-1+ infrastructure):
-     the bridge does **not** check the inbound `GEMINI_API_KEY`, so anything on the
-     machine that can reach the port spends the LiteLLM key. The loopback-only bind
-     (`127.0.0.1`) keeps this acceptable for the spike; revisit (inbound key check
-     or socket permissions) if it outlives Phase 1.
+   - Inbound access control (opt-in, implemented in the vendored copy): add
+     `AGY_BRIDGE_TOKEN=<random>` to `proxy.env`; every endpoint then 401s requests
+     whose `x-goog-api-key` header or `?key=` query param doesn't match — `agy`
+     sends whatever `GEMINI_API_KEY` holds in exactly those places, so invoke it
+     with `GEMINI_API_KEY=<the same value>`. Unset = allow all (the host
+     deployment stays unset until ship re-enables the service with the token);
+     the loopback-only bind (`127.0.0.1`) limits exposure either way.
 2. **Settings** (can be passed per-run via `--settings`, no global mutation):
    ```json
    {"modelProvider":"gemini","customModelsConfig":{"customModels":{"qwen3.8-flash-next":{"modelName":"gemini-api://127.0.0.1:4001/models/qwen3.8-flash-next"}}}}

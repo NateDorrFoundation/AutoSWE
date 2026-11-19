@@ -12,8 +12,13 @@ Upstream: OpenAI-compatible LiteLLM (default http://linux-server1:4000/v1,
 override with AGY_PROXY_UPSTREAM).
 Auth: the upstream key is read ONLY from AGY_PROXY_UPSTREAM_KEY (env /
 EnvironmentFile) — never hardcode it here; keep the real key in a local
-proxy.env outside the repo. The `agy` side needs only GEMINI_API_KEY=<any
-non-empty string> + GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4001.
+proxy.env outside the repo (chmod 600 it). The `agy` side needs only
+GEMINI_API_KEY=<any non-empty string> + GOOGLE_GEMINI_BASE_URL=...:4001.
+Inbound (opt-in): if AGY_BRIDGE_TOKEN is set, every endpoint requires the
+same token as the x-goog-api-key header or the ?key= query param — `agy`
+sends whatever GEMINI_API_KEY holds in exactly those places, so the
+deployment sets AGY_BRIDGE_TOKEN=<random> in proxy.env and invokes `agy`
+with GEMINI_API_KEY=<the same token>. Unset = allow all (spike default).
 
 Error contract: upstream failures and internal errors are never masqueraded
 as a normal reply. The stream yields ONE final chunk with finishReason "ERROR"
@@ -36,6 +41,7 @@ Install: copy as ~/.litellm-agy/gemini-openai-proxy.py next to a local proxy.env
 and run via scripts/agy-gemini-proxy.service (systemd user unit; the ExecStart
 path must match; see spike-antigravity.md §0.1.2 for the full BYOK recipe).
 """
+import hmac
 import json
 import os
 import sys
@@ -48,8 +54,26 @@ from fastapi.responses import JSONResponse, StreamingResponse
 UPSTREAM = os.environ.get("AGY_PROXY_UPSTREAM", "http://linux-server1:4000/v1")
 UPSTREAM_KEY = os.environ.get("AGY_PROXY_UPSTREAM_KEY", "")
 PORT = int(os.environ.get("AGY_PROXY_PORT", "4001"))
+BRIDGE_TOKEN = os.environ.get("AGY_BRIDGE_TOKEN", "")
 
 app = FastAPI()
+
+
+def inbound_denied(request: Request):
+    """Opt-in inbound shared-secret check (see module header, "Inbound").
+
+    When AGY_BRIDGE_TOKEN is unset (spike default) every request is allowed.
+    When set, the request must present the same token via the x-goog-api-key
+    header or the ?key= query param — Gemini clients (incl. `agy` via
+    GEMINI_API_KEY) send their key in exactly those places.
+    """
+    if not BRIDGE_TOKEN:
+        return None
+    supplied = request.headers.get("x-goog-api-key") or request.query_params.get("key") or ""
+    if hmac.compare_digest(supplied, BRIDGE_TOKEN):
+        return None
+    return JSONResponse({"error": {"message": "invalid or missing API key",
+                                   "status": "UNAUTHENTICATED"}}, status_code=401)
 
 import re
 
@@ -81,6 +105,10 @@ def gemini_to_openai(body: dict, model: str) -> dict:
     # replays calls and responses in strict interleaved order). A random id per
     # call would leave every tool result pointing at a nonexistent tool call,
     # which strict OpenAI-compatible upstreams reject with 400.
+    # Known spike limitation: the pairing assumes every functionResponse's
+    # functionCall was replayed in the same history; a response whose call was
+    # never replayed (e.g. cancelled) gets an id matching nothing, which those
+    # strict upstreams then 400 on.
     call_seq: dict = {}
     resp_seq: dict = {}
     msgs = []
@@ -222,7 +250,10 @@ def sse_gemini_chunk(parts=None, finish=None, usage=None, model="") -> str:
 # default are deployment values; parameterize (AGY_PROXY_UPSTREAM already
 # overrides UPSTREAM; a AGY_BRIDGE_MODELS env would cover this list).
 @app.get("/v1beta/models")
-async def list_models():
+async def list_models(request: Request):
+    denied = inbound_denied(request)
+    if denied:
+        return denied
     return {"models": [{"name": "models/qwen3.8-flash-next",
                         "displayName": "qwen3.8-flash-next (local)",
                         "supportedGenerationMethods": ["generateContent"]}]}
@@ -230,6 +261,9 @@ async def list_models():
 
 @app.post("/v1beta/models/{model:path}:generateContent")
 async def generate(model: str, request: Request):
+    denied = inbound_denied(request)
+    if denied:
+        return denied
     body = await request.json()
     model = normalize_model(model)
     cfg = gemini_to_openai(body, model)
@@ -244,6 +278,9 @@ async def generate(model: str, request: Request):
 
 @app.post("/v1beta/models/{model:path}:streamGenerateContent")
 async def stream(model: str, request: Request):
+    denied = inbound_denied(request)
+    if denied:
+        return denied
     body = await request.json()
     model = normalize_model(model)
     cfg = gemini_to_openai(body, model)
