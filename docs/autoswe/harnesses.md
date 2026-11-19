@@ -526,31 +526,39 @@ There is no price table analogous to `codex_pricing.py`.
 
 #### `antigravity` (candidate — docs mirrored, backend not yet implemented)
 
-Google Antigravity offers two viable transports for a future backend:
+Two transports exist; the Phase 0 spike picked the headless CLI as the core, with the
+Python SDK deferred to Phase 7:
 
-- **Python SDK** — `pip install google-antigravity`, `from google.antigravity import
-  Agent, LocalAgentConfig`, async `agent.chat()`. First-party Python, so unlike pi/codex
-  this could be an in-process backend (same shape as `claude_code`): MCP servers,
-  `BuiltinTools` allowlists (`enabled_tools`/`disabled_tools` in `CapabilitiesConfig`),
-  safety policies, and subagents are all first-class SDK config. Requires
-  `GEMINI_API_KEY` (or `LocalAgentConfig(vertex=True, ...)` for Vertex).
-- **Headless CLI** — `agy -p "prompt"` (print mode) with `--input-format` for
-  machine-readable streams, plus an ACP (Agent Client Protocol) server mode. This is the
-  pi/codex-style subprocess transport if the SDK surface turns out to be too opaque.
+- **Headless CLI (chosen core transport)** — `agy --print=…` (print mode) with
+  `--input-format stream-json` / `--output-format stream-json` for machine-readable
+  streams: the same pi/codex-style subprocess shape. Verified end-to-end in
+  `spike-antigravity.md` (T1–T14, P1–P5, M1–M5) against committed fixtures in
+  `tests/fixtures/antigravity/`; BYOK auth (no Google login) via the vendored bridge
+  `scripts/agy-gemini-proxy.py`.
+- **Python SDK (deferred, Phase 7)** — `pip install google-antigravity`,
+  `from google.antigravity import Agent, LocalOpenAIAgentConfig`, async `agent.chat()`.
+  The unique reason to go here: `pre_tool_call_decide` is the only non-Claude
+  `can_use_tool` analogue (AskUserQuestion → `autoswe:waiting`). It also offers
+  `BuiltinTools` allowlists and first-class MCP config, and `LocalOpenAIAgentConfig`
+  talks the OpenAI wire directly (no bridge), but it spawns its own harness binary
+  underneath, so it buys no process-model advantage.
 
 Canonical reference: `docs/antigravity/` (mirror of antigravity.google docs, raw `.md`
 endpoints — see its README for the ToC and refresh commands). Start with
-`sdk-overview.md`, `sdk-tools.md`, `sdk-mcp.md`, `cli-headless.md`.
+`cli-headless.md`, `cli-reference.md`, then `sdk-overview.md`, `sdk-tools.md`, `sdk-mcp.md`.
 
 **Implementation plan:** `docs/autoswe/PLAN-antigravity-backend/` (README + Phases 0–7,
-proposed 2026-11-18). Headless CLI (`agy`, `stream-json`) is the chosen core
-transport; the Python SDK transport is deferred to Phase 7.
+proposed 2026-11-18; Phase 0 complete).
 
-**Open questions before implementation:** whether headless print mode emits a usable
-streaming event protocol (vs. final-only text), how credits/quota map to
-`cost_usd` (no per-run USD reported; likely report-not-estimate is impossible → null),
-whether the SDK supports session resume for `agent_session_id`, and the license/ToS
-posture for CI automation.
+**Resolved by the Phase 0 spike** (go/no-go table in `spike-antigravity.md`):
+headless print mode **does** emit a usable streaming protocol — `init →
+step_update* → result` NDJSON, confirmed in every committed fixture
+(`tests/fixtures/antigravity/`); CLI resume **works** headless (`--conversation`,
+same `conversation_id` across runs — T7; SDK resume deferred to Phase 7);
+`cost_usd` is **`None`** on the BYOK bridge path (the bridge reports no usage, and
+there are no Google credits to map — never estimate, same rule as pi); stdin
+single-turn transport, per-run `--settings` read-only isolation, and MCP
+eager-tool naming + env inheritance are all **GO**.
 
 ### Shared RunSpec → RunResult contract (backends/base.py)
 

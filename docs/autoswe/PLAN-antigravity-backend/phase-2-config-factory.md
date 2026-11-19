@@ -66,6 +66,11 @@ it as not adjustable.
 | `max_turns` | no | — | accepted, no-op |
 | `env` | no | — | merged into the subprocess env |
 
+**PATH caveat (Phase 0 §Environment):** on megibot `agy` is **not** on the default
+non-login shell PATH (`command -v agy` → not found; only `~/.local/bin/agy` works), so
+`shutil.which("agy")` fails under cron/systemd. Live profiles must pin `cli_path` to
+the absolute resolved path — same rule as pi's pinned `cli_path`.
+
 Do **not** add `system_prompt`. The CLI has no documented system-prompt flag. Steering
 goes through prompt templates, as with Codex. `docs/antigravity/rules.md` (AGENTS.md-style
 rules) loads from the target repo by design. Note this in `safeguards.md` in Phase 6.
