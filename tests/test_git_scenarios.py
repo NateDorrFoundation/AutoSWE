@@ -1396,3 +1396,84 @@ class TestCatchup:
 
         assert result.done_content.startswith("DONE_SUMMARY\tAlready up to date")
         assert not git_world.worktree_path_for(1).exists()
+
+
+# ------------------------------------------------------------------
+# Group K: antigravity read-only rollback backstop (issue #320 Phase 3)
+# ------------------------------------------------------------------
+
+
+class TestAntigravityReadOnlyBackstop:
+    """K1: an agy plan run that edits the worktree is rolled back.
+
+    AntigravityBackend advertises neither "mode" nor "can_use_tool", so a
+    plan-phase RunSpec's mode="plan" is advisory for it — the loud-degrade the
+    planner logs is the heads-up, and ``ensure_worktree_unchanged`` is the
+    real guarantee (issue #166). This is the real-git counterpart of the
+    loud-degrade assertions in ``test_transition_antigravity``: the REAL
+    AntigravityBackend + AntigravityFake run against a real worktree, and the
+    fake "edits" the tree mid-run the way an unconfined agent session would.
+    """
+
+    def test_K1_agy_plan_edit_rolled_back(self, git_world: GitWorld):
+        import asyncio
+
+        from autoswe.harness.backends.antigravity import AntigravityBackend
+        from autoswe.harness.backends.base import RunSpec
+        from autoswe.vcs.worktree import ensure_worktree_unchanged, is_dirty
+        from tests.fakes.antigravity_fake import AntigravityFake
+
+        world = git_world
+        world.init_remote(initial_files={"src/app.py": "x = 1\n"})
+        world.make_main_clone()
+        wt = world.make_worktree(1)
+
+        head_before = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+        class _EditingAntigravityFake(AntigravityFake):
+            """AntigravityFake whose agent session edits the worktree mid-run.
+
+            ``_next_stream`` runs inside the fake's spawn — the moment the
+            agent session starts — so the edit lands in the tree exactly while
+            the (faked) agent is running, then the success stream returns.
+            """
+
+            def _next_stream(self):
+                result = super()._next_stream()
+                (wt / "agent_edit.py").write_text("# smuggled in by the agent\n", encoding="utf-8")
+                return result
+
+        fake = _EditingAntigravityFake()
+        fake.script_plan("1. Do the thing", session_id="s-agy-plan-42")
+
+        spec = RunSpec(
+            prompt="Plan the fix.",
+            cwd=str(wt),
+            model="gemini-test",
+            mode="plan",          # advisory: agy has no read-only enforcement
+            timeout=30,
+        )
+
+        with fake:
+            result = asyncio.run(AntigravityBackend().run(spec))
+
+        # The run itself succeeded and the backend happily ran a "plan" spec
+        # while making zero attempt to confine edits — that's the degrade case.
+        assert result.subtype == "success"
+        assert fake.calls[0]["cwd"] == str(wt)
+        assert (wt / "agent_edit.py").exists(), "agent edit missing mid-phase"
+
+        # The planner's post-run backstop is what actually protects the tree.
+        rolled_back = ensure_worktree_unchanged(wt, head_before)
+
+        assert rolled_back is True, "ensure_worktree_unchanged must detect + revert the edit"
+        assert not (wt / "agent_edit.py").exists(), "agent edit survived the rollback"
+        assert is_dirty(wt) is False, "worktree must be clean after rollback"
+        head_after = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert head_after == head_before, "rollback must target head_before"

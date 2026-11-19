@@ -6,14 +6,25 @@ Batch 14 — Fake parity audit:
 - Comment ID auto-increment uniqueness
 - Scripted-failure mode for both fakes
 - Protocol method existence assertions
+
+Phase 3 (§3.3) extends the audit to the subprocess-level backend fakes
+(CodexFake / PiFake / AntigravityFake): they patch the same seam and must
+expose the same contract, so scenario-harness wiring (patched_world, the
+transition axes) can treat any of them interchangeably.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 
+import pytest
+
 from autoswe.providers.base import IssueTracker, VCSProvider
+from tests.fakes.antigravity_fake import AntigravityFake
 from tests.fakes.azure_fake import AzureFake
+from tests.fakes.codex_fake import CodexFake
 from tests.fakes.github_fake import GitHubFake
+from tests.fakes.pi_fake import PiFake
 
 # ---------------------------------------------------------------------------
 # Protocol method existence audit
@@ -686,3 +697,81 @@ class TestClearStatusImplementation:
         tracker.clear_status(42)
 
         assert patch_calls == [], "no PATCH should be issued when no autoswe:* tag is present"
+
+
+# ---------------------------------------------------------------------------
+# Backend fake protocol coverage (Phase 3 §3.3)
+# ---------------------------------------------------------------------------
+
+# The three subprocess-level backend fakes: each patches
+# ``asyncio.create_subprocess_exec`` so the real factory → backend → parser →
+# RunResult path runs unmodified, and each must expose the same contract so
+# the scenario harness (patched_world backend axis) drives them alike.
+CLI_BACKEND_FAKES = (CodexFake, PiFake, AntigravityFake)
+_CLI_FAKE_IDS = ["codex", "pi", "antigravity"]
+
+# Builder names every backend fake must implement so a transition row's
+# claude_responses dicts can be fed to any of them verbatim.
+_SHARED_BUILDERS = (
+    "script_response", "script_plan", "script_questions",
+    "script_fix", "script_fail", "script_killed",
+)
+
+
+class TestBackendFakeProtocol:
+    """CodexFake / PiFake / AntigravityFake honor one fake protocol."""
+
+    @pytest.mark.parametrize("fake_cls", CLI_BACKEND_FAKES, ids=_CLI_FAKE_IDS)
+    def test_patch_returns_tuple_and_swaps_seam(self, fake_cls):
+        """patch() returns (module, original) and swaps the real seam out."""
+        fake = fake_cls()
+        real = fake_cls._get_real_create()
+        module, original = fake.patch()
+        try:
+            assert module is asyncio
+            assert hasattr(module, "create_subprocess_exec")
+            assert original is real
+            assert asyncio.create_subprocess_exec is not real
+        finally:
+            fake.unpatch(module, original)
+        assert asyncio.create_subprocess_exec is real
+
+    @pytest.mark.parametrize("fake_cls", CLI_BACKEND_FAKES, ids=_CLI_FAKE_IDS)
+    def test_unpatch_no_args_restores(self, fake_cls):
+        """unpatch() with no args restores from the stored patch tuple."""
+        fake = fake_cls()
+        real = fake_cls._get_real_create()
+        fake.patch()
+        fake.unpatch()
+        assert asyncio.create_subprocess_exec is real
+
+    @pytest.mark.parametrize("fake_cls", CLI_BACKEND_FAKES, ids=_CLI_FAKE_IDS)
+    def test_context_manager_parity(self, fake_cls):
+        """All CLI fakes work as context managers with auto patch/unpatch."""
+        real = fake_cls._get_real_create()
+        with fake_cls():
+            assert asyncio.create_subprocess_exec is not real
+        assert asyncio.create_subprocess_exec is real
+
+    @pytest.mark.parametrize("fake_cls", CLI_BACKEND_FAKES, ids=_CLI_FAKE_IDS)
+    def test_shared_builders_present(self, fake_cls):
+        """Every fake implements the shared script_* builder surface."""
+        for name in _SHARED_BUILDERS:
+            assert callable(getattr(fake_cls, name, None)), (
+                f"{fake_cls.__name__} missing shared builder {name}()"
+            )
+
+    @pytest.mark.parametrize("fake_cls", CLI_BACKEND_FAKES, ids=_CLI_FAKE_IDS)
+    def test_calls_list_and_context_manager_shape(self, fake_cls):
+        """Fresh fake starts with an empty ``calls`` list (call records)."""
+        assert fake_cls().calls == []
+
+    def test_antigravity_fake_restores_agy_resolver(self):
+        """AntigravityFake additionally pins _resolve_agy_executable and must
+        restore it (unlike the bare subprocess patch the other fakes do)."""
+        import autoswe.harness.backends.antigravity as agy_mod
+
+        original = agy_mod._resolve_agy_executable
+        with AntigravityFake():
+            assert agy_mod._resolve_agy_executable is not original
+        assert agy_mod._resolve_agy_executable is original
