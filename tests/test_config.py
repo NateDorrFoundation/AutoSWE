@@ -510,12 +510,30 @@ def test_pr_ci_error_policy_unknown_value_falls_back_to_block(
     isolated_autoswe_dir, monkeypatch, caplog,
 ):
     """A typo (e.g. 'BLOCKED') is not a valid policy; fall back to the
-    fail-safe 'block' rather than silently opening the gate."""
+    fail-safe 'block' rather than silently opening the gate.
+
+    Same ``autoswe.debug`` propagate dance as the MAX_ATTEMPTS test above:
+    init_debug_logger sets propagate=False (so records don't double-emit
+    through root), which blinds caplog's root handler. Initialize the logger
+    first so get_debug_logger() inside load_config is a pure early-return
+    that cannot re-disable propagation, then capture with it re-enabled.
+    """
     monkeypatch.setenv("PR_CI_ERROR_POLICY", "BLOCKED")
 
-    from autoswe.core.config import load_config
+    import logging
 
-    cfg = load_config()
+    from autoswe.core.config import load_config
+    from autoswe.core.logging_utils import get_debug_logger
+
+    get_debug_logger()  # idempotent: guarantees handlers exist before we flip propagate
+    dbg = logging.getLogger("autoswe.debug")
+    prev_propagate = dbg.propagate
+    dbg.propagate = True
+    try:
+        with caplog.at_level("WARNING"):
+            cfg = load_config()
+    finally:
+        dbg.propagate = prev_propagate
 
     assert cfg["PR_CI_ERROR_POLICY"] == "block"
     assert "PR_CI_ERROR_POLICY" in caplog.text

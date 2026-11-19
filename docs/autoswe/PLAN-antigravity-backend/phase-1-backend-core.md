@@ -30,6 +30,8 @@ antigravity.py
 
 `_resolve_agy_executable(cli_path)`: order of preference is `spec.cli_path` → `harness_cfg["cli_path"]` → `shutil.which("agy")`. If the result ends in `.cmd`/`.bat`, return `("cmd", ["/c", path])`, as in `pi.py:_resolve_pi_executable`. If it is a `.ps1` shim (record this in Phase 0 §0.1), return `("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path])`. Raise a clear `FileNotFoundError` naming `cli_path` when nothing resolves. The runner's retry policy treats this as non-retryable, so it is a config error that surfaces once.
 
+> **Implementation note (Phase 1, do not regress):** the implementation raises `RuntimeError`, not `FileNotFoundError`. The sentence above was written on a false premise: `FileNotFoundError ⊂ OSError` and `retryable_exceptions()` contains `OSError` with no carve-out (`runner.py` binds `except` to that tuple), so a `FileNotFoundError` *would* burn every attempt. `RuntimeError` is outside the tuple and surfaces once. Pinned by `test_resolve_nothing_found_raises` / `test_spawn_file_not_found_becomes_runtime_error` in `tests/test_antigravity_backend.py`.
+
 ## 1.3 Command mapping
 
 | Case | argv (after the exe prefix) |
@@ -174,7 +176,8 @@ Phase 0 fixtures.
 - **stdin:** exactly one line, valid JSON, `event == "user"`, content round-trips a
   20 KB prompt containing quotes, newlines and non-ASCII characters; stdin is closed.
 - **exe resolution:** `.exe` direct; `.cmd`/`.bat` → `cmd /c`; `.ps1` → powershell;
-  nothing resolves → `FileNotFoundError`; `cli_path` wins over PATH.
+  nothing resolves → `RuntimeError` (see the §1.2 implementation note, not `FileNotFoundError`);
+  `cli_path` wins over PATH.
 - **env precedence:** os.environ < `gemini_api_key` < profile `env` < `env_overrides`.
 - **parsing** (one test per fixture): `basic_success`, `stdin_single_turn`, `tool_steps`
   (progress labels), `tool_error_recovered` (→ `success`), `unknown_model` (→ `config_error`),
