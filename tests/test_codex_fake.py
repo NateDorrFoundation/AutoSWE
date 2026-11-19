@@ -331,3 +331,27 @@ class TestCodexFakeFidelity:
         assert r1.session_id == "s1"
         assert r2.text == "second"
         assert r2.session_id == "s2"
+
+
+class TestCodexFakeSpawnKwargs:
+    """The fake records the spawn kwargs so transport-level invariants are
+    assertable from ``fake.calls``."""
+
+    def test_spawn_records_session_flag(self):
+        """Issue #327: codex must spawn in its own process group so the
+        timeout kill reaches the whole tree, and the fake must capture that
+        kwarg."""
+        import os
+
+        from autoswe.harness.backends.codex import CodexBackend
+
+        fake = CodexFake()
+        fake.script_response("done", session_id="thread-spawn", subtype="success")
+
+        async def _run():
+            with fake:
+                return await CodexBackend().run(_make_spec())
+
+        _run_async(_run())
+        kwargs = fake.calls[0]["spawn_kwargs"]
+        assert kwargs["start_new_session"] is (os.name != "nt")

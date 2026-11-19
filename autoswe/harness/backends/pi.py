@@ -51,6 +51,8 @@ import asyncio
 import json
 import os
 import shutil
+import signal
+import subprocess
 import time
 import uuid
 from collections.abc import Awaitable
@@ -70,6 +72,77 @@ from autoswe.harness.mcp_config import (
 # unbounded memory growth when the child produces pathological output.
 # Mirrors codex.py's bound.
 _MAX_STREAM_BYTES = 16 * 1024 * 1024  # 16 MB
+
+# Grace between the SIGTERM and the SIGKILL on the process-group kill path
+# (``_kill_tree``): give pi a moment to tear down its own children before the
+# whole group is force-killed.
+_KILL_GRACE_S = 5.0
+
+
+# ---------- Process-tree kill ----------
+
+
+def _kill_direct(process) -> None:
+    """Best-effort kill of just the direct child; never raises."""
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+
+
+async def _kill_tree(process, grace: float = _KILL_GRACE_S) -> None:
+    """Kill the pi process AND its whole process tree (issue #327).
+
+    pi spawns children (tool shells; and on Windows the npm install runs the
+    real node process under a ``cmd /c`` shim), so a bare
+    ``process.kill()`` on the timeout path leaves orphans — the ``cmd`` shim
+    dies and node keeps running.  This mirrors the proven ``_kill_tree``
+    from ``antigravity.py``.
+
+    POSIX: the subprocess is spawned with ``start_new_session=True`` so it
+    leads its own process group and ``os.killpg`` reaches the whole tree —
+    SIGTERM first, then SIGKILL after *grace* seconds if it is still alive.
+    The group kill is guarded on the child actually being the group leader
+    (``pgid == pid``), so a spawn that forgot the flag can never signal our
+    own group.  Windows: ``taskkill /T /F /PID`` walks the child tree from
+    the shim (same shape as antigravity.py).  Best-effort: falls back to
+    ``process.kill()`` when the group/pid is already gone; never raises
+    (callers are on the timeout path and re-raise the TimeoutError after).
+    """
+    pid = process.pid
+    if os.name == "nt":
+        # /T walks the child tree (the shim's node child); /F forces.
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(pid)],
+            capture_output=True,
+            check=False,
+        )
+        return
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        _kill_direct(process)  # pid already gone
+        return
+    if pgid != pid:
+        # Not our session leader (spawn without start_new_session, or a
+        # test double): a group kill would hit the wrong group — kill just
+        # the direct child instead.
+        _kill_direct(process)
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return  # group already exited; the caller's wait() just reaps
+    except PermissionError:
+        _kill_direct(process)
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=grace)
+    except asyncio.TimeoutError:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 # The built-in tool allowlist per mode.  ``read_only``/``plan`` get the
 # documented read-only recipe (``docs/pi/usage.md``); ``read_write`` gets the
@@ -385,6 +458,10 @@ async def warm_up_mcp_cache(harness_cfg: dict, *, timeout: float = 60.0) -> bool
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=autoswe_repo_root(),
+            # Own process group so a warm-up timeout can kill the whole tree
+            # (issue #327) — a bare kill would orphan the node child under the
+            # cmd /c shim on Windows.
+            start_new_session=(os.name != "nt"),
             # Same StreamReader limit as a real run: the warm-up drains both
             # pipes (chunked read() only, no readline), but keeping the
             # "every pipe we read from has an oversized limit" invariant means
@@ -441,7 +518,7 @@ async def warm_up_mcp_cache(harness_cfg: dict, *, timeout: float = 60.0) -> bool
         # well before a long LLM turn would finish; a hang on the turn is not a
         # warm-up failure. Kill and check the cache anyway.
         log(f"[PI-WARMUP] pi did not finish within {timeout:.0f}s; killing (MCP connect may already be complete)")
-        process.kill()
+        await _kill_tree(process)
         await process.wait()
 
     warm = _pi_mcp_cache_warm(agent_dir)
@@ -1119,6 +1196,11 @@ class PiBackend:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=spec.cwd,
+                # Own the process group so _kill_tree can reach the whole
+                # tree on the timeout path (issue #327): pi spawns children,
+                # and on Windows the real node process sits under the
+                # cmd /c shim, which a bare process.kill() would orphan.
+                start_new_session=(os.name != "nt"),
                 # StreamReader limit threads to BOTH stdout and stderr pipes.
                 # Default is 64 KiB: a single JSON event larger than that makes
                 # readline() raise ValueError, which is not a retryable
@@ -1266,9 +1348,9 @@ class PiBackend:
             # coroutines both return None).
             stderr_bytes = _gather_results[1] if len(_gather_results) > 1 else b""
         except asyncio.TimeoutError:
-            process.kill()
+            await _kill_tree(process)
             await process.wait()
-            log(f"[PI] timeout after {spec.timeout}s — killed process")
+            log(f"[PI] timeout after {spec.timeout}s — killed process tree")
             raise
 
         # Reap the process so `returncode` is set. On the Windows proactor

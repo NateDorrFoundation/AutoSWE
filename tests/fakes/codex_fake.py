@@ -159,9 +159,17 @@ class FakeProcess:
         self.stderr = FakeStreamReader([])  # stderr always empty
         self.stdin = FakeStdin(record=record_prompt)
         self.returncode = returncode
+        self.killed = False
 
     def kill(self) -> None:
-        """No-op — process is already 'done'."""
+        """Record a bare kill — the process is already 'done'.
+
+        ``killed`` lets tests assert the kill *path*: the backend's
+        ``_kill_tree`` (issue #327) reaches a real process via
+        ``os.killpg``/``taskkill``; when it falls back to ``process.kill()``
+        (no group / group already gone), this flag is the only trace.
+        """
+        self.killed = True
 
     async def wait(self) -> int:
         """Return the canned returncode."""
@@ -372,7 +380,7 @@ class CodexFake:
         self._saved_original = self._get_real_create()
         self._target_mod = asyncio
 
-        def _make_process(cmd):
+        def _make_process(cmd, spawn_kwargs):
             """Build a FakeProcess for the next scripted response.
 
             Returns a FakeProcess directly (synchronous — the outer async stub
@@ -380,6 +388,10 @@ class CodexFake:
             """
             # Record the parsed command
             call = _parse_command(list(cmd))
+            # Spawn kwargs (start_new_session, limit, ...) so tests can assert
+            # the transport contract, e.g. the process-group spawn flag of
+            # issue #327.
+            call["spawn_kwargs"] = dict(spawn_kwargs)
             self.calls.append(call)
 
             # Build the JSONL response
@@ -396,7 +408,7 @@ class CodexFake:
             return FakeProcess(lines, returncode=returncode, record_prompt=_record_prompt)
 
         async def fake_create_subprocess_exec(*cmd, **kwargs):
-            return _make_process(cmd)
+            return _make_process(cmd, kwargs)
 
         asyncio.create_subprocess_exec = fake_create_subprocess_exec
 

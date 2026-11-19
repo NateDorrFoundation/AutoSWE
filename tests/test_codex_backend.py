@@ -6,6 +6,7 @@ output on the simulated stdout pipe.  No live Codex calls are made.
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -183,11 +184,21 @@ class _MockProcess:
         returncode: int = 0,
         limit: int | None = None,
         record_prompt=None,
+        pid: int | None = None,
     ):
         self.returncode = returncode
         self.stdout = _MockStdoutReader(stdout.encode() if stdout else b"", limit=limit)
         self.stderr = _MockStderrReader(stderr.encode() if stderr else b"")
         self.stdin = _MockStdin(record=record_prompt)
+        # Real asyncio processes carry an int pid; _kill_tree (issue #327)
+        # reads it on the timeout path.  None keeps the old mock shape for
+        # tests that never reach a kill.
+        self.pid = pid
+        self.killed = False
+
+    def kill(self) -> None:
+        """Record a bare kill — the fallback path of _kill_tree only."""
+        self.killed = True
 
     async def wait(self) -> int:
         return self.returncode
@@ -1043,29 +1054,33 @@ def test_codex_killed_subtype():
     assert result.subtype == "killed"
 
 
-def test_codex_timeout():
-    """asyncio.TimeoutError is re-raised after killing the process."""
-    backend = CodexBackend()
-    spec = RunSpec(model="gpt-5.6-terra", prompt="Fix", cwd="/tmp", mode="read_write", timeout=0.5)
+@pytest.mark.skipif(os.name == "nt", reason="POSIX killpg path (see test_kill_tree_windows_taskkill)")
+def test_codex_timeout_kills_process_group(monkeypatch):
+    """Timeout must kill the process GROUP (issue #327), not just the shim.
 
-    mock_process = Mock()
-    mock_process.stdout = None
-    mock_process.stderr = None
-    mock_process.kill = Mock()
-    mock_process.wait = AsyncMock(return_value=-9)
-    mock_process.returncode = 9  # SIGKILL — positive signal number
+    A bare ``process.kill()`` leaves codex's children (and on Windows the
+    node process under the ``cmd /c`` shim) orphaned.  The fix spawns with
+    ``start_new_session=True`` and kills via ``os.killpg`` — SIGTERM first.
+    ``process.wait`` returns here, so the grace elapses before SIGKILL is
+    needed; the escalation itself is covered by
+    ``test_kill_tree_sigterm_then_sigkill``.
+    """
+    import signal
+
+    backend = CodexBackend()
+    spec = RunSpec(model="gpt-5.6-terra", prompt="Fix", cwd="/tmp", mode="read_write", timeout=0.05)
+
+    mock_process = _mock_create_process(returncode=-9)
 
     async def blocking_read():
         await asyncio.sleep(999)
 
-    mock_process.stdout = Mock()
     mock_process.stdout.readline = blocking_read
-    mock_process.stderr = Mock()
-    mock_process.stderr.read = AsyncMock(return_value=b"")
-    mock_process.stdin = Mock()
-    mock_process.stdin.write = Mock()
-    mock_process.stdin.drain = AsyncMock(return_value=None)
-    mock_process.stdin.close = Mock()
+    mock_process.pid = 4242  # pretend group leader
+
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
 
     async def _run():
         mock_exec = AsyncMock(return_value=mock_process)
@@ -1078,8 +1093,161 @@ def test_codex_timeout():
     except asyncio.TimeoutError:
         pass  # expected
 
-    # Verify the process was actually killed on timeout
-    mock_process.kill.assert_called_once()
+    # The whole process group got SIGTERM (wait() returned → no SIGKILL needed)
+    assert killpg_calls == [(4242, signal.SIGTERM)]
+    # ...and the bare shim-kill path was NOT the mechanism
+    assert mock_process.killed is False
+
+
+def test_codex_spawn_own_process_group():
+    """codex must spawn with start_new_session so _kill_tree can reach the
+    whole tree (issue #327)."""
+    backend = CodexBackend()
+    spec = RunSpec(model="gpt-5.6-terra", prompt="Fix", cwd="/tmp", mode="read_write")
+
+    async def _run():
+        mock_exec = AsyncMock(return_value=_mock_create_process(
+            stdout=_make_success_jsonl(), returncode=0,
+        ))
+        with patch("asyncio.create_subprocess_exec", mock_exec):
+            await _run_backend(backend, spec)
+        return mock_exec
+
+    mock_exec = asyncio.run(_run())
+    kwargs = mock_exec.await_args.kwargs
+    # POSIX: own session/group.  Windows: flag unused (taskkill /T walks the
+    # tree from the shim instead), so the backend only sets it off-nt.
+    assert kwargs["start_new_session"] is (os.name != "nt")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX killpg path (see test_kill_tree_windows_taskkill)")
+def test_kill_tree_sigterm_then_sigkill(monkeypatch):
+    """_kill_tree escalates SIGTERM → SIGKILL after the grace when the group
+    ignores SIGTERM (issue #327)."""
+    import signal
+
+    class _StubbornProcess:
+        pid = 4321
+        killed = False
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            await asyncio.sleep(999)  # never exits on its own
+
+    signals: list[int] = []
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals.append(sig))
+
+    proc = _StubbornProcess()
+    asyncio.run(_codex_mod._kill_tree(proc, grace=0.05))
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert proc.killed is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX killpg path (see test_kill_tree_windows_taskkill)")
+def test_kill_tree_falls_back_when_not_group_leader(monkeypatch):
+    """_kill_tree must NOT killpg a group it does not lead: with
+    pgid != pid the group kill would hit our own process group, so it falls
+    back to the direct-child kill (defensive guard, issue #327)."""
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid + 1)  # not the leader
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+
+    class _Child:
+        pid = 4321
+        killed = False
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            return 0
+
+    proc = _Child()
+    asyncio.run(_codex_mod._kill_tree(proc, grace=0.05))
+    assert killpg_calls == []
+    assert proc.killed is True
+
+
+def test_kill_tree_windows_taskkill(monkeypatch):
+    """On Windows _kill_tree walks the child tree with taskkill /T /F (the
+    ``cmd /c`` shim's node child is reached).  Cross-platform: os.name and
+    subprocess.run are patched, so this runs on POSIX hosts too."""
+    runs: list[list] = []
+
+    def fake_run(cmd, **kwargs):
+        runs.append(cmd)
+        return Mock(returncode=0)
+
+    monkeypatch.setattr(_codex_mod.os, "name", "nt")
+    monkeypatch.setattr(_codex_mod.subprocess, "run", fake_run)
+
+    class _Shim:
+        pid = 4567
+        killed = False
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            return -9
+
+    proc = _Shim()
+    asyncio.run(_codex_mod._kill_tree(proc))
+    assert runs == [["taskkill", "/T", "/F", "/PID", "4567"]]
+    # The bare process.kill() is never the Windows mechanism
+    assert proc.killed is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics (issue #327)")
+def test_kill_tree_kills_real_child_process():
+    """Real process tree: a grandchild (``sleep``) spawned by the direct
+    child dies with the group kill.  Before the fix (bare ``process.kill()``)
+    the grandchild survived as an orphan."""
+    import signal
+    import time
+
+    from autoswe.harness.backends.codex import _kill_tree
+
+    async def _go():
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c",
+            "import subprocess, time\n"
+            "child = subprocess.Popen(['sleep', '61'])\n"
+            "print(child.pid, flush=True)\n"
+            "time.sleep(61)\n",
+            stdout=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        child_pid = None
+        try:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=10)
+            child_pid = int(line.strip())
+            await _kill_tree(proc, grace=1.0)
+            rc = await asyncio.wait_for(proc.wait(), timeout=5)
+            assert rc is not None and rc < 0, f"direct child should die by signal, got {rc}"
+            # The grandchild must be gone too: poll until ESRCH.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("orphaned grandchild survived the process-group kill")
+        finally:
+            for pid in (proc.pid, child_pid):
+                if pid is None:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    asyncio.run(_go())
 
 
 def test_codex_not_found():

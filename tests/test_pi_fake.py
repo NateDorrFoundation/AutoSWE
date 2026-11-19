@@ -418,3 +418,20 @@ class TestPiFakeMcpFidelity:
         # body-derived progress line is emitted.
         assert not any(ln == "" for ln in lines)
         assert any(ln.startswith("Tool: ") for ln in lines)
+
+
+class TestPiFakeSpawnKwargs:
+    """The fake records the spawn kwargs so transport-level invariants are
+    assertable from ``fake.calls``."""
+
+    def test_spawn_records_session_flag(self):
+        """Issue #327: pi must spawn in its own process group so the
+        timeout kill reaches the whole tree, and the fake must capture that
+        kwarg."""
+        import os
+
+        fake = PiFake()
+        fake.script_response("done", session_id="pi-spawn")
+        _run(_spec(), fake)
+        kwargs = fake.calls[0]["spawn_kwargs"]
+        assert kwargs["start_new_session"] is (os.name != "nt")
