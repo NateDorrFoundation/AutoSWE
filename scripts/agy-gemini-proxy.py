@@ -24,16 +24,6 @@ ends `result.status:"ERROR"` (well-formed record), and agy re-issues the
 aborted request until its wall-clock/print-timeout fires — a hard-failed
 upstream exits via timeout, not fast.
 
-Install: copy as ~/.litellm-agy/gemini-openai-proxy.py next to a local proxy.env
-and run via scripts/agy-gemini-proxy.service (systemd user unit; the ExecStart
-path must match; see spike-antigravity.md §0.1.2 for the full BYOK recipe).
-"""
-
-"""Gemini generateContent wire -> OpenAI chat.completions proxy.
-
-Lets `agy` (Antigravity CLI) with GOOGLE_GEMINI_BASE_URL point at a local
-OpenAI-compatible upstream (LiteLLM at linux-server1:4000).
-
 Endpoints served:
   GET  /v1beta/models
   POST /v1beta/models/<model>:generateContent
@@ -41,6 +31,10 @@ Endpoints served:
 
 Minimal but tool-aware: systemInstruction, text parts, functionCall/
 functionResponse, tools -> OpenAI tools, usageMetadata, finishReason.
+
+Install: copy as ~/.litellm-agy/gemini-openai-proxy.py next to a local proxy.env
+and run via scripts/agy-gemini-proxy.service (systemd user unit; the ExecStart
+path must match; see spike-antigravity.md §0.1.2 for the full BYOK recipe).
 """
 import json
 import os
@@ -63,6 +57,7 @@ MODEL_RE = re.compile(r"^(?:gemini-api:|blade:|evergreen:|beyond-api:)(?:.*?/mod
 
 
 def normalize_model(name: str) -> str:
+    name = name.removeprefix("models/")
     if "/models/" in name:
         return name.split("/models/", 1)[1]
     m = MODEL_RE.match(name)
