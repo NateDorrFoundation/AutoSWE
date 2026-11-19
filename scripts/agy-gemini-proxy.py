@@ -41,9 +41,11 @@ Install: copy as ~/.litellm-agy/gemini-openai-proxy.py next to a local proxy.env
 and run via scripts/agy-gemini-proxy.service (systemd user unit; the ExecStart
 path must match; see spike-antigravity.md §0.1.2 for the full BYOK recipe).
 """
+
 import hmac
 import json
 import os
+import re
 import sys
 
 import httpx
@@ -72,10 +74,10 @@ def inbound_denied(request: Request):
     supplied = request.headers.get("x-goog-api-key") or request.query_params.get("key") or ""
     if hmac.compare_digest(supplied, BRIDGE_TOKEN):
         return None
-    return JSONResponse({"error": {"message": "invalid or missing API key",
-                                   "status": "UNAUTHENTICATED"}}, status_code=401)
+    return JSONResponse(
+        {"error": {"message": "invalid or missing API key", "status": "UNAUTHENTICATED"}}, status_code=401
+    )
 
-import re
 
 MODEL_RE = re.compile(r"^(?:gemini-api:|blade:|evergreen:|beyond-api:)(?:.*?/models/(.+)|(?:.*/)?([^/]+))$")
 
@@ -88,6 +90,7 @@ def normalize_model(name: str) -> str:
     if m:
         return m.group(1) or m.group(2)
     return name
+
 
 FINISH_MAP = {
     "stop": "STOP",
@@ -129,28 +132,31 @@ def gemini_to_openai(body: dict, model: str) -> dict:
                 fname = fc.get("name", "")
                 seq = call_seq.get(fname, 0)
                 call_seq[fname] = seq + 1
-                tool_calls.append({
-                    "id": f"call_{fname}_{seq}",
-                    "type": "function",
-                    "function": {
-                        "name": fname,
-                        "arguments": json.dumps(fc.get("args", {})),
-                    },
-                })
+                tool_calls.append(
+                    {
+                        "id": f"call_{fname}_{seq}",
+                        "type": "function",
+                        "function": {
+                            "name": fname,
+                            "arguments": json.dumps(fc.get("args", {})),
+                        },
+                    }
+                )
             elif "functionResponse" in p:
                 fr = p["functionResponse"]
                 fname = fr.get("name", "")
                 seq = resp_seq.get(fname, 0)
                 resp_seq[fname] = seq + 1
-                msgs.append({
-                    "role": "tool",
-                    "tool_call_id": f"call_{fname}_{seq}",
-                    "name": fname,
-                    "content": json.dumps(fr.get("response", {})),
-                })
+                msgs.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": f"call_{fname}_{seq}",
+                        "name": fname,
+                        "content": json.dumps(fr.get("response", {})),
+                    }
+                )
         if tool_calls:
-            m = {"role": "assistant", "content": "\n".join(texts) or None,
-                 "tool_calls": tool_calls}
+            m = {"role": "assistant", "content": "\n".join(texts) or None, "tool_calls": tool_calls}
             msgs.append(m)
         elif texts:
             # plain text turn; function-response-only turns were already appended
@@ -171,15 +177,18 @@ def gemini_to_openai(body: dict, model: str) -> dict:
     decls = []
     for t in tools:
         for d in t.get("functionDeclarations", []):
-            decls.append({
-                "type": "function",
-                "function": {
-                    "name": d.get("name"),
-                    "description": d.get("description", ""),
-                    "parameters": d.get("parametersJsonSchema")
-                        or d.get("parameters") or {"type": "object", "properties": {}},
-                },
-            })
+            decls.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": d.get("name"),
+                        "description": d.get("description", ""),
+                        "parameters": d.get("parametersJsonSchema")
+                        or d.get("parameters")
+                        or {"type": "object", "properties": {}},
+                    },
+                }
+            )
     if decls:
         cfg["tools"] = decls
         cfg["tool_choice"] = "auto"
@@ -203,11 +212,13 @@ def openai_to_gemini(resp: dict) -> dict:
         parts.append({"functionCall": {"name": tc["function"]["name"], "args": args}})
     usage = resp.get("usage") or {}
     out = {
-        "candidates": [{
-            "content": {"parts": parts or [{"text": ""}], "role": "model"},
-            "finishReason": FINISH_MAP.get(choice.get("finish_reason"), "STOP"),
-            "index": 0,
-        }],
+        "candidates": [
+            {
+                "content": {"parts": parts or [{"text": ""}], "role": "model"},
+                "finishReason": FINISH_MAP.get(choice.get("finish_reason"), "STOP"),
+                "index": 0,
+            }
+        ],
         "usageMetadata": {
             "promptTokenCount": usage.get("prompt_tokens", 0),
             "candidatesTokenCount": usage.get("completion_tokens", 0),
@@ -219,9 +230,11 @@ def openai_to_gemini(resp: dict) -> dict:
 
 
 def gemini_usage(usage: dict) -> dict:
-    return {"promptTokenCount": usage.get("prompt_tokens", 0),
-            "candidatesTokenCount": usage.get("completion_tokens", 0),
-            "totalTokenCount": usage.get("total_tokens", 0)}
+    return {
+        "promptTokenCount": usage.get("prompt_tokens", 0),
+        "candidatesTokenCount": usage.get("completion_tokens", 0),
+        "totalTokenCount": usage.get("total_tokens", 0),
+    }
 
 
 def flushed_calls(tool_acc: dict) -> list:
@@ -254,9 +267,15 @@ async def list_models(request: Request):
     denied = inbound_denied(request)
     if denied:
         return denied
-    return {"models": [{"name": "models/qwen3.8-flash-next",
-                        "displayName": "qwen3.8-flash-next (local)",
-                        "supportedGenerationMethods": ["generateContent"]}]}
+    return {
+        "models": [
+            {
+                "name": "models/qwen3.8-flash-next",
+                "displayName": "qwen3.8-flash-next (local)",
+                "supportedGenerationMethods": ["generateContent"],
+            }
+        ]
+    }
 
 
 @app.post("/v1beta/models/{model:path}:generateContent")
@@ -268,11 +287,13 @@ async def generate(model: str, request: Request):
     model = normalize_model(model)
     cfg = gemini_to_openai(body, model)
     async with httpx.AsyncClient(timeout=600) as client:
-        r = await client.post(f"{UPSTREAM}/chat/completions", json=cfg,
-                              headers={"Authorization": f"Bearer {UPSTREAM_KEY}"})
+        r = await client.post(
+            f"{UPSTREAM}/chat/completions", json=cfg, headers={"Authorization": f"Bearer {UPSTREAM_KEY}"}
+        )
     if r.status_code != 200:
-        return JSONResponse({"error": {"message": r.text[:2000], "status": "UPSTREAM_ERROR"}},
-                            status_code=r.status_code)
+        return JSONResponse(
+            {"error": {"message": r.text[:2000], "status": "UPSTREAM_ERROR"}}, status_code=r.status_code
+        )
     return JSONResponse(openai_to_gemini(r.json()))
 
 
@@ -292,66 +313,68 @@ async def stream(model: str, request: Request):
         model_out = model
         tool_acc = {}  # index -> {"name": str, "args": str}
         try:
-            async with httpx.AsyncClient(timeout=600) as client:
-                async with client.stream(
-                    "POST", f"{UPSTREAM}/chat/completions", json=cfg,
+            async with (
+                httpx.AsyncClient(timeout=600) as client,
+                client.stream(
+                    "POST",
+                    f"{UPSTREAM}/chat/completions",
+                    json=cfg,
                     headers={"Authorization": f"Bearer {UPSTREAM_KEY}"},
-                ) as r:
-                    if r.status_code != 200:
-                        text = (await r.aread()).decode()[:2000]
-                        # Error contract (module header): never STOP-with-error-text.
-                        # Raise so the except below emits the ERROR chunk and aborts.
-                        raise RuntimeError(f"upstream error: {text}")
-                    async for line in r.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        payload = line[5:].strip()
-                        if payload == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(payload)
-                        except json.JSONDecodeError:
-                            continue
-                        if chunk.get("model"):
-                            model_out = chunk["model"]
-                        if chunk.get("usage"):
-                            usage = chunk["usage"]
-                        for ch in chunk.get("choices") or []:
-                            d = ch.get("delta") or {}
-                            parts = []
-                            if d.get("reasoning_content") or d.get("reasoning"):
-                                rc = d.get("reasoning_content") or d.get("reasoning")
-                                if rc:
-                                    parts.append({"text": rc, "thought": True})
-                            if d.get("content"):
-                                parts.append({"text": d["content"]})
-                            for tc in d.get("tool_calls") or []:
-                                idx = tc.get("index", 0)
-                                acc = tool_acc.setdefault(idx, {"name": "", "args": ""})
-                                fn = tc.get("function") or {}
-                                if fn.get("name"):
-                                    acc["name"] += fn["name"]
-                                if fn.get("arguments"):
-                                    acc["args"] += fn["arguments"]
-                            finish = FINISH_MAP.get(ch.get("finish_reason")) \
-                                if ch.get("finish_reason") else None
-                            if finish and tool_acc:
-                                parts.extend(flushed_calls(tool_acc))
-                                tool_acc = {}
-                            if parts or finish:
-                                yield sse_gemini_chunk(parts or None, finish, None, model_out)
-                    # include_usage puts usage in its own trailing chunk
-                    # (choices: []) that arrives after the finish chunk; forward
-                    # it as a standalone usageMetadata chunk, before the flush.
-                    if usage:
-                        yield sse_gemini_chunk(None, None, gemini_usage(usage), model_out)
-                    if tool_acc:
-                        # Upstream ended with [DONE] but never sent a finish_reason:
-                        # flush the accumulated tool calls so they are not dropped.
-                        yield sse_gemini_chunk(flushed_calls(tool_acc), "STOP",
-                                               None, model_out)
-                        tool_acc = {}
-        except Exception as e:  # noqa: BLE001
+                ) as r,
+            ):
+                if r.status_code != 200:
+                    text = (await r.aread()).decode()[:2000]
+                    # Error contract (module header): never STOP-with-error-text.
+                    # Raise so the except below emits the ERROR chunk and aborts.
+                    raise RuntimeError(f"upstream error: {text}")
+                async for line in r.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    if chunk.get("model"):
+                        model_out = chunk["model"]
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
+                    for ch in chunk.get("choices") or []:
+                        d = ch.get("delta") or {}
+                        parts = []
+                        if d.get("reasoning_content") or d.get("reasoning"):
+                            rc = d.get("reasoning_content") or d.get("reasoning")
+                            if rc:
+                                parts.append({"text": rc, "thought": True})
+                        if d.get("content"):
+                            parts.append({"text": d["content"]})
+                        for tc in d.get("tool_calls") or []:
+                            idx = tc.get("index", 0)
+                            acc = tool_acc.setdefault(idx, {"name": "", "args": ""})
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                acc["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                acc["args"] += fn["arguments"]
+                        finish = FINISH_MAP.get(ch.get("finish_reason")) if ch.get("finish_reason") else None
+                        if finish and tool_acc:
+                            parts.extend(flushed_calls(tool_acc))
+                            tool_acc = {}
+                        if parts or finish:
+                            yield sse_gemini_chunk(parts or None, finish, None, model_out)
+                # include_usage puts usage in its own trailing chunk
+                # (choices: []) that arrives after the finish chunk; forward
+                # it as a standalone usageMetadata chunk, before the flush.
+                if usage:
+                    yield sse_gemini_chunk(None, None, gemini_usage(usage), model_out)
+                if tool_acc:
+                    # Upstream ended with [DONE] but never sent a finish_reason:
+                    # flush the accumulated tool calls so they are not dropped.
+                    yield sse_gemini_chunk(flushed_calls(tool_acc), "STOP", None, model_out)
+                    tool_acc = {}
+        except Exception as e:
             # Error contract (module header): ONE final chunk with finishReason
             # ERROR carrying the text, then re-raise so uvicorn aborts the
             # stream — `agy` never records a STOP (SUCCESS) on a failed run.
