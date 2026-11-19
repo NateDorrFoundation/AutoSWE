@@ -2,7 +2,7 @@
 """agy Gemini->OpenAI wire bridge (vendored; the Phase 0 spike depends on it).
 
 Purpose: `agy` (Antigravity CLI) speaks the Gemini generateContent wire, which
-LiteLLM cannot serve. This ~250-line proxy translates Gemini <-> OpenAI
+LiteLLM cannot serve. This proxy translates Gemini <-> OpenAI
 chat.completions in both directions, including accumulation of streamed
 function-call argument deltas into one complete functionCall at finish_reason
 (required: the CLI's tool loop does not reassemble OpenAI-style deltas itself).
