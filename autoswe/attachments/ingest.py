@@ -27,6 +27,7 @@ from autoswe.attachments import azure as az
 from autoswe.attachments import github as gh
 from autoswe.attachments.models import Attachment, AttachmentSet
 from autoswe.attachments.naming import looks_like_filename, pick_filename, sniff_content
+from autoswe.core.config import resolve_flag
 from autoswe.core.logging_utils import get_debug_logger
 
 dbg = get_debug_logger()
@@ -60,14 +61,6 @@ def resolve_attachment_cfg(cfg: dict | None, repo_cfg: dict | None) -> dict:
     cfg = cfg or {}
     rc = repo_cfg or {}
 
-    def flag(name: str, default: bool) -> bool:
-        ov = rc.get(name.lower())
-        if ov is not None:
-            return bool(ov)
-        if name.upper() in cfg:
-            return bool(cfg[name.upper()])
-        return default
-
     def ints(name: str, default: int) -> int:
         ov = rc.get(name.lower())
         if ov is not None:
@@ -77,7 +70,9 @@ def resolve_attachment_cfg(cfg: dict | None, repo_cfg: dict | None) -> dict:
         return default
 
     return {
-        "enabled": flag("attachments_enabled", True),
+        # The designated shared helper for the cfg/repo_cfg bool-override
+        # pattern (config.resolve_flag) — not reimplemented here.
+        "enabled": resolve_flag("ATTACHMENTS_ENABLED", cfg, rc, True),
         "max_size_bytes": ints("attachment_max_size_bytes", DEFAULT_MAX_SIZE_BYTES),
         "max_total_bytes": ints("attachment_max_total_bytes", DEFAULT_MAX_TOTAL_BYTES),
     }
@@ -165,6 +160,11 @@ def ingest_task_attachments(
     total_state = {"total": 0}
     items: list[Attachment] = []
     index = 1
+    # Memoizes Mechanism B's html+json body re-fetch per containing body for
+    # this ingest run only (never persisted): N assets in one private-repo
+    # body cost one refetch, not N — the ~300s signed-URL JWT window covers a
+    # sequential per-body pass.
+    html_body_cache: dict = {}
 
     try:
         if provider == "github":
@@ -184,6 +184,7 @@ def ingest_task_attachments(
                         max_bytes=acfg["max_size_bytes"],
                         context=ctx,
                         opener=opener,
+                        html_body_cache=html_body_cache,
                     )
                 except Exception as e:
                     dbg.warning("attachments: GitHub asset %s failed: %s", ctx.url, e)

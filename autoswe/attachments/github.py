@@ -145,6 +145,16 @@ def find_signed_url(html_body: str, asset_url: str) -> str | None:
     return None
 
 
+def html_body_cache_key(
+    owner: str, repo: str, issue_num: int, context: AssetContext | None,
+) -> tuple:
+    """Cache key for one containing body: (owner, repo, issue, comment_id).
+
+    ``comment_id`` ``None`` means the issue body itself.
+    """
+    return (owner, repo, issue_num, context.comment_id if context else None)
+
+
 def download_github_asset(
     url: str,
     *,
@@ -155,6 +165,7 @@ def download_github_asset(
     max_bytes: int,
     context: AssetContext | None = None,
     opener: request.OpenerDirector | None = None,
+    html_body_cache: dict | None = None,
 ) -> bytes:
     """Download one GitHub asset. Returns the bytes.
 
@@ -165,6 +176,12 @@ def download_github_asset(
     rendered body contains no signed URL for the asset (plain-link reference
     on a private repo — the documented open gap), raises
     :class:`downloads.DownloadError` with code ``"no_signed_url"``.
+
+    *html_body_cache*, when given, memoizes ``fetch_html_body`` per
+    containing body (keyed by :func:`html_body_cache_key`) for the duration
+    of one ingest run: N embedded assets in the same body of a private repo
+    then cost ONE ``html+json`` refetch, not N — comfortably inside the
+    signed URL's ~300s JWT window.
 
     Raises :class:`downloads.DownloadError` on any failure.
     """
@@ -180,7 +197,16 @@ def download_github_asset(
     # --- Mechanism B (private repos, embedded images only) ---
     if context is None:
         raise downloads.DownloadError(url, "no_context", "no containing body available")
-    html_body = fetch_html_body(owner, repo, issue_num, context.comment_id, token)
+    key = html_body_cache_key(owner, repo, issue_num, context)
+    if html_body_cache is not None and key in html_body_cache:
+        html_body = html_body_cache[key]
+    else:
+        html_body = fetch_html_body(owner, repo, issue_num, context.comment_id, token)
+        if html_body_cache is not None:
+            # Cache the result — including an empty body (a failed re-fetch
+            # will not succeed again inside this ingest window, so caching
+            # "" avoids a pointless extra API call per asset).
+            html_body_cache[key] = html_body
     if not html_body:
         raise downloads.DownloadError(url, "html_unavailable", "could not fetch body_html")
     signed = find_signed_url(html_body, url)

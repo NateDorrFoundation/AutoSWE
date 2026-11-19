@@ -511,6 +511,103 @@ class TestGithubFallback:
 
 
 # ============================================================================
+# Mechanism B html-body memoization (review round: one refetch per body)
+# ============================================================================
+
+class TestMechanismBBodyCache:
+    """N assets sharing one containing body -> ONE html+json refetch (MEDIUM)."""
+
+    _UUID3 = "33333333-4444-5555-6666-777777777777"
+
+    def _fixtures(self, monkeypatch):
+        """Patch downloads + fetch_html_body; return (gh, png, html_calls, asset_urls, signed_map)."""
+        from autoswe.attachments import downloads
+        from autoswe.attachments import github as gh
+
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        urls = [_ASSET_URL, _ASSET_URL2, f"https://github.com/user-attachments/assets/{self._UUID3}"]
+        signed_map = {
+            u: f"https://private-user-images.githubusercontent.com/1/555-{u.rsplit('/', 1)[-1]}.png?jwt=tok"
+            for u in urls
+        }
+        html_body = "<p>" + "".join(f'<img src="{s}" />' for s in signed_map.values()) + "</p>"
+
+        def fake_download(url, *, max_bytes, headers=None, opener=None):
+            if url.startswith("https://private-user-images."):
+                return png
+            raise downloads.DownloadError(url, "http_404", "HTTP 404")
+
+        html_calls = []
+
+        def counting_fetch(*a, **k):
+            html_calls.append(a)
+            return html_body
+
+        monkeypatch.setattr(gh.downloads, "download_bytes", fake_download)
+        monkeypatch.setattr(gh, "fetch_html_body", counting_fetch)
+        return gh, png, html_calls, urls
+
+    def test_three_assets_one_body_single_fetch(self, monkeypatch):
+        """Three assets in ONE comment body: the cache makes Mechanism B refetch
+        the containing body exactly once for all three downloads."""
+        from autoswe.attachments import github as gh
+
+        gh_mod, png, html_calls, urls = self._fixtures(monkeypatch)
+        cache: dict = {}
+        for u in urls:
+            ctx = gh.AssetContext(url=u, source="comment:42", body="..", comment_id=42)
+            data = gh_mod.download_github_asset(
+                u, owner="o", repo="r", issue_num=7, token="t", max_bytes=1024,
+                context=ctx, html_body_cache=cache,
+            )
+            assert data == png
+        assert len(html_calls) == 1, "expected one html+json refetch for three assets"
+
+    def test_no_cache_param_keeps_per_asset_fetch(self, monkeypatch):
+        """Without the optional cache param the old per-asset fetch behavior
+        is preserved (seam stays backward-compatible)."""
+        from autoswe.attachments import github as gh
+
+        gh_mod, png, html_calls, urls = self._fixtures(monkeypatch)
+        for u in urls:
+            ctx = gh.AssetContext(url=u, source="comment:42", body="..", comment_id=42)
+            gh_mod.download_github_asset(
+                u, owner="o", repo="r", issue_num=7, token="t", max_bytes=1024,
+                context=ctx,
+            )
+        assert len(html_calls) == 3
+
+    def test_cache_keyed_per_containing_body(self, monkeypatch):
+        """Assets in different bodies (different comment_id / issue body) get
+        one fetch each — the cache is per body, not global."""
+        from autoswe.attachments import github as gh
+
+        gh_mod, png, html_calls, urls = self._fixtures(monkeypatch)
+        cache: dict = {}
+        ctxs = [
+            gh.AssetContext(url=urls[0], source="issue", body="..", comment_id=None),
+            gh.AssetContext(url=urls[1], source="comment:42", body="..", comment_id=42),
+            gh.AssetContext(url=urls[2], source="comment:42", body="..", comment_id=42),
+        ]
+        for ctx in ctxs:
+            gh_mod.download_github_asset(
+                ctx.url, owner="o", repo="r", issue_num=7, token="t", max_bytes=1024,
+                context=ctx, html_body_cache=cache,
+            )
+        assert len(html_calls) == 2  # issue body once, comment:42 body once
+
+    def test_cache_key_distinguishes_repo_and_issue(self, monkeypatch):
+        from autoswe.attachments import github as gh
+
+        ctx = gh.AssetContext(url=_ASSET_URL, source="comment:42", body="..", comment_id=42)
+        base = gh.html_body_cache_key("o", "r", 7, ctx)
+        assert base == ("o", "r", 7, 42)
+        assert gh.html_body_cache_key("o", "r2", 7, ctx) != base
+        assert gh.html_body_cache_key("o", "r", 8, ctx) != base
+        assert gh.html_body_cache_key("o", "r", 7, None) == ("o", "r", 7, None)
+
+
+# ============================================================================
 # Azure discovery + download
 # ============================================================================
 
@@ -604,6 +701,51 @@ class TestIngestGithub:
         assert set_.dir.name.startswith("autoswe-attach-")
         set_.remove()
         assert not set_.dir.exists()
+
+    def test_ingest_three_assets_one_body_single_html_refetch(self, monkeypatch):
+        """End-to-end (review round MEDIUM): three embedded-image assets in one
+        issue body on a private repo (Mechanism A 404s) trigger exactly ONE
+        ``fetch_html_body`` — the ingest run threads a body cache through."""
+        from autoswe.attachments import downloads, ingest
+        from autoswe.attachments import github as gh
+
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        u3 = "https://github.com/user-attachments/assets/33333333-4444-5555-6666-777777777777"
+        urls = [_ASSET_URL, _ASSET_URL2, u3]
+
+        def fake_download(url, *, max_bytes, headers=None, opener=None):
+            if url.startswith("https://private-user-images."):
+                return png
+            raise downloads.DownloadError(url, "http_404", "HTTP 404")  # private repo
+
+        signed_html = "<p>" + "".join(
+            f'<img src="https://private-user-images.githubusercontent.com/1/555-'
+            f'{u.rsplit("/", 1)[-1]}.png?jwt=tok" />'
+            for u in urls
+        ) + "</p>"
+        html_calls = []
+
+        def counting_fetch(*a, **k):
+            html_calls.append(a)
+            return signed_html
+
+        monkeypatch.setattr(gh.downloads, "download_bytes", fake_download)
+        monkeypatch.setattr(gh, "fetch_html_body", counting_fetch)
+
+        body = "".join(f'![img{n}.png]({u})\n' for n, u in enumerate(urls))
+        set_ = ingest.ingest_task_attachments(
+            _StubTracker(), 1, body, [], {"ATTACHMENTS_ENABLED": True},
+            {"provider": "github", "owner": "o", "repo": "r", "pat": "t"},
+        )
+        try:
+            assert set_ is not None
+            assert len(set_.items) == 3
+            assert len(html_calls) == 1, (
+                f"expected 1 html+json refetch for 3 assets in one body, got {len(html_calls)}"
+            )
+        finally:
+            if set_ is not None:
+                set_.remove()
 
     def test_ingest_disabled_returns_none(self):
         from autoswe.attachments import ingest
