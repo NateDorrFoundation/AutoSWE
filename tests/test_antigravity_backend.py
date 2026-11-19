@@ -174,6 +174,7 @@ def _schema_path_from(argv: list[str]) -> str | None:
 
 def test_build_argv_fresh_shape():
     cmd = _build_argv(_spec(timeout=42), {}, None)
+    # [:7] — the fixed head is 7 tokens (flag/value pairs + --model <model>).
     assert cmd[:7] == [
         "--input-format", "stream-json", "--output-format", "stream-json",
         "--disable-slash-commands", "--model", MODEL,
@@ -607,6 +608,35 @@ def test_fallback_to_text_chunks_when_no_result():
     assert result.text == "Hello world"
 
 
+def test_delta_progress_fires_then_throttles_at_80_chars():
+    # _fire_delta_progress: first delta for a step index fires immediately
+    # (capped at 120 chars), then only once the accumulated text has grown by
+    # ~80 chars since the last fire.
+    acc = _AgyAccumulator()
+    fired: list[str] = []
+
+    def _step_line(delta: str) -> str:
+        return json.dumps({
+            "event": "step_update",
+            "step_update": {"step_index": 1, "state": "ACTIVE",
+                            "step_type": "agent_response", "text_delta": delta},
+        })
+
+    d1 = "a" * 100
+    _parse_line(_step_line(d1), acc, fired.append)
+    assert fired == [d1], "first delta must reach the callback"
+
+    d2 = "b" * 100
+    _parse_line(_step_line(d2), acc, fired.append)
+    assert fired == [d1, d2], "growth since last fire (100) >= 80 → fires again"
+
+    _parse_line(_step_line("c" * 10), acc, fired.append)
+    assert len(fired) == 2, "10-char growth since last fire stays throttled"
+
+    # Accumulation is independent of throttling: all chunks land.
+    assert "".join(acc._text_by_index[1]) == d1 + d2 + "c" * 10
+
+
 def test_active_done_deltas_not_double_counted():
     # Fixture T1 semantics: ACTIVE carries the partial, DONE carries the
     # remainder; concatenation equals result.response exactly.
@@ -631,6 +661,79 @@ def test_stream_overflow_errors_without_exception():
     assert result.subtype == "error"
     # stdout was drained after the ValueError (no child pipe deadlock).
     assert proc.stdout.drained
+
+
+def test_soft_deny_stderr_line_warns(monkeypatch):
+    # Spike P3b: a tool that would have prompted is auto-denied in headless
+    # print mode — not a crash, but the first sign of a permission
+    # misconfiguration, so read_stderr() must surface a loud [WARN] line.
+    deny_line = (
+        b"Warning: tool run_command requires approval; headless mode cannot "
+        b"prompt for it, so it was auto-denied.\n"
+    )
+    proc = _MockProcess(
+        stdout=_fixture_text("basic_success").encode(), stderr=deny_line
+    )
+    with patch.object(agy_mod, "log") as mock_log:
+        result, _ = _full_run(_spec(), proc)
+    warns = [
+        str(c.args[0])
+        for c in mock_log.call_args_list
+        if c.args and "soft-denied" in str(c.args[0])
+    ]
+    assert len(warns) == 1, "one WARN per matching stderr line"
+    assert all(w.startswith("[WARN][ANTIGRAVITY] soft-denied:") for w in warns)
+    assert "headless mode cannot prompt" in warns[0]
+    # The soft-deny WARN alone never fails the run (README lesson #4).
+    assert result.subtype == "success"
+
+
+def test_soft_deny_marker_without_match_does_not_warn():
+    proc = _MockProcess(
+        stdout=_fixture_text("basic_success").encode(),
+        stderr=b"some unrelated stderr noise\n",
+    )
+    with patch.object(agy_mod, "log") as mock_log:
+        result, _ = _full_run(_spec(), proc)
+    assert not any(
+        c.args and "soft-denied" in str(c.args[0]) for c in mock_log.call_args_list
+    )
+    assert result.subtype == "success"
+
+
+def test_runner_cancel_kills_tree_and_propagates(monkeypatch):
+    # The runner's wait_for(spec.timeout) fires 30s BEFORE the backend's own
+    # backstop and cancels the coroutine mid-gather.  _run_async must kill the
+    # process tree on CancelledError too, or agy leaks on every retry/cancel
+    # (review round-3 finding: the #327 orphan gap on the runner path).
+    hang = asyncio.Event()  # never set: the readers would block forever
+    proc = _MockProcess(hang=hang)
+    killed: list = []
+    monkeypatch.setattr(agy_mod, "_kill_tree", lambda p: killed.append(p))
+
+    async def main():
+        async def fake_exec(*argv, **kwargs):
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", new=fake_exec):
+            task = asyncio.create_task(AntigravityBackend().run(_spec(timeout=3600)))
+            # Wait until the stdin writer has completed inside the gather, so
+            # the task is demonstrably parked in the stream readers.
+            for _ in range(200):
+                await asyncio.sleep(0.005)
+                if proc.stdin.closed:
+                    break
+            assert proc.stdin.closed, "run never reached the gather"
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise AssertionError("CancelledError did not propagate")
+
+    asyncio.run(main())
+    assert killed == [proc], "cancellation must kill the process tree"
 
 
 def test_timeout_kills_tree_and_removes_temp_schema(monkeypatch):

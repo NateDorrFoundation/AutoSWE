@@ -975,6 +975,16 @@ class AntigravityBackend:
             )
             # Index 2 is read_stderr()'s tail (the others return None/returncode).
             stderr_tail = _gather_results[2] if len(_gather_results) > 2 else b""
+        except asyncio.CancelledError:
+            # The runner wraps backend.run() in its OWN wait_for(spec.timeout),
+            # which fires _HARD_TIMEOUT_SLACK seconds BEFORE our backstop and
+            # *cancels* this coroutine mid-gather — our TimeoutError branch
+            # below would then never run and the agy process tree would be
+            # orphaned on every cancel/retry (the exact #327 gap).  Kill the
+            # tree before propagating the cancellation.
+            _kill_tree(process)
+            log("[ANTIGRAVITY] run cancelled — killed process tree")
+            raise
         except asyncio.TimeoutError:
             # The CLI ignored its own --print-timeout and is wedged past the
             # backstop.  Kill the whole tree (a plain process.kill() would
