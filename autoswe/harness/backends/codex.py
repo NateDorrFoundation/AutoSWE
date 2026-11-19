@@ -46,7 +46,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import signal
 import subprocess
 import tempfile
 import time
@@ -55,6 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from autoswe.core.logging_utils import log
+from autoswe.harness.backends._proc_kill import kill_tree
 from autoswe.harness.backends.base import CLAUDE_COMMENT_TOOL_NAMES, RunResult, RunSpec
 from autoswe.harness.backends.codex_pricing import estimate_cost
 
@@ -63,77 +63,6 @@ from autoswe.harness.backends.codex_pricing import estimate_cost
 # Linux) and unbounded memory growth when the child process produces
 # pathological output.
 _MAX_STREAM_BYTES = 16 * 1024 * 1024  # 16 MB
-
-# Grace between the SIGTERM and the SIGKILL on the process-group kill path
-# (``_kill_tree``): give codex a moment to tear down its own children before
-# the whole group is force-killed.
-_KILL_GRACE_S = 5.0
-
-
-# ---------- Process-tree kill ----------
-
-
-def _kill_direct(process) -> None:
-    """Best-effort kill of just the direct child; never raises."""
-    try:
-        process.kill()
-    except ProcessLookupError:
-        pass
-
-
-async def _kill_tree(process, grace: float = _KILL_GRACE_S) -> None:
-    """Kill the codex process AND its whole process tree (issue #327).
-
-    codex spawns children (tool shells; and a Windows npm install puts the
-    real node process under a ``cmd /c`` shim), so a bare
-    ``process.kill()`` on the timeout path leaves orphans.  This mirrors the
-    proven ``_kill_tree`` from ``antigravity.py`` (same fix as pi.py #327).
-
-    POSIX: the subprocess is spawned with ``start_new_session=True`` so it
-    leads its own process group and ``os.killpg`` reaches the whole tree —
-    SIGTERM first, then SIGKILL after *grace* seconds if it is still alive.
-    The group kill is guarded on the child actually being the group leader
-    (``pgid == pid``), so a spawn that forgot the flag can never signal our
-    own group.  Windows: ``taskkill /T /F /PID`` walks the child tree from
-    the shim.  Best-effort: falls back to ``process.kill()`` when the
-    group/pid is already gone; never raises (callers are on the timeout path
-    and re-raise the TimeoutError after).
-    """
-    pid = process.pid
-    if os.name == "nt":
-        # /T walks the child tree (the shim's node child); /F forces.
-        subprocess.run(
-            ["taskkill", "/T", "/F", "/PID", str(pid)],
-            capture_output=True,
-            check=False,
-        )
-        return
-    try:
-        pgid = os.getpgid(pid)
-    except OSError:
-        _kill_direct(process)  # pid already gone
-        return
-    if pgid != pid:
-        # Not our session leader (spawn without start_new_session, or a
-        # test double): a group kill would hit the wrong group — kill just
-        # the direct child instead.
-        _kill_direct(process)
-        return
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return  # group already exited; the caller's wait() just reaps
-    except PermissionError:
-        _kill_direct(process)
-        return
-    try:
-        await asyncio.wait_for(process.wait(), timeout=grace)
-    except asyncio.TimeoutError:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-
 
 # Whether the installed Codex CLI supports --output-last-message.
 # None = unprobed; True/False = result of _probe_output_last_message_support().
@@ -744,9 +673,9 @@ class CodexBackend:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=spec.cwd,
-                # Own the process group so _kill_tree can reach the whole
-                # tree on the timeout path (issue #327): codex spawns
-                # children, and a bare process.kill() would orphan them.
+                # Own the process group so _proc_kill.kill_tree can reach
+                # the whole tree on the timeout path (issue #327): codex
+                # spawns children, and a bare process.kill() would orphan them.
                 start_new_session=(os.name != "nt"),
                 # StreamReader limit threads to BOTH stdout and stderr pipes.
                 # Default is 64 KiB: a single JSONL line larger than that makes
@@ -887,7 +816,7 @@ class CodexBackend:
                 timeout=spec.timeout,
             )
         except asyncio.TimeoutError:
-            await _kill_tree(process)
+            await kill_tree(process)
             await process.wait()
             log(f"[CODEX] timeout after {spec.timeout}s — killed process tree")
             raise

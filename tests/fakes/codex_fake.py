@@ -165,7 +165,7 @@ class FakeProcess:
         """Record a bare kill — the process is already 'done'.
 
         ``killed`` lets tests assert the kill *path*: the backend's
-        ``_kill_tree`` (issue #327) reaches a real process via
+        ``_proc_kill.kill_tree`` (issue #327) reaches a real process via
         ``os.killpg``/``taskkill``; when it falls back to ``process.kill()``
         (no group / group already gone), this flag is the only trace.
         """
