@@ -1,6 +1,7 @@
 # systemd user unit for the vendored agy Gemini->OpenAI bridge
 # (scripts/agy-gemini-proxy.py). Install:
 #   mkdir -p ~/.litellm-agy && cp scripts/agy-gemini-proxy.py ~/.litellm-agy/gemini-openai-proxy.py
+#   python3 -m venv ~/.venvs/agy-bridge && ~/.venvs/agy-bridge/bin/pip install fastapi httpx uvicorn
 #   echo 'AGY_PROXY_UPSTREAM_KEY=<real LiteLLM key>' > ~/.litellm-agy/proxy.env
 #   (the real key lives ONLY in proxy.env — never commit it)
 #   systemctl --user enable --now agy-gemini-proxy

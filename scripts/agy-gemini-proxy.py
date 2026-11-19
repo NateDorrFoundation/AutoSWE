@@ -15,6 +15,15 @@ EnvironmentFile) — never hardcode it here; keep the real key in a local
 proxy.env outside the repo. The `agy` side needs only GEMINI_API_KEY=<any
 non-empty string> + GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4001.
 
+Error contract: upstream failures and internal errors are never masqueraded
+as a normal reply. The stream yields ONE final chunk with finishReason "ERROR"
+carrying the error text, then raises, so uvicorn tears the response down —
+`agy` sees a stream abort / ERROR terminal, never STOP-with-error-text it
+could record as SUCCESS. Verified against the real CLI on a test port: the run
+ends `result.status:"ERROR"` (well-formed record), and agy re-issues the
+aborted request until its wall-clock/print-timeout fires — a hard-failed
+upstream exits via timeout, not fast.
+
 Install: copy as ~/.litellm-agy/gemini-openai-proxy.py next to a local proxy.env
 and run via scripts/agy-gemini-proxy.service (systemd user unit; the ExecStart
 path must match; see spike-antigravity.md §0.1.2 for the full BYOK recipe).
@@ -120,10 +129,9 @@ def gemini_to_openai(body: dict, model: str) -> dict:
             m = {"role": "assistant", "content": "\n".join(texts) or None,
                  "tool_calls": tool_calls}
             msgs.append(m)
-        elif texts or (msgs and msgs[-1].get("role") == "tool"):
-            # keep function-response-only turns (already appended) and plain text
-            if texts:
-                msgs.append({"role": role, "content": "\n".join(texts)})
+        elif texts:
+            # plain text turn; function-response-only turns were already appended
+            msgs.append({"role": role, "content": "\n".join(texts)})
     cfg = {
         "model": model,
         "messages": msgs,
@@ -215,6 +223,9 @@ def sse_gemini_chunk(parts=None, finish=None, usage=None, model="") -> str:
     return "data: " + json.dumps(obj) + "\n\n"
 
 
+# TODO(phase-1): host-specific constants — this model list and the UPSTREAM
+# default are deployment values; parameterize (AGY_PROXY_UPSTREAM already
+# overrides UPSTREAM; a AGY_BRIDGE_MODELS env would cover this list).
 @app.get("/v1beta/models")
 async def list_models():
     return {"models": [{"name": "models/qwen3.8-flash-next",
@@ -256,9 +267,9 @@ async def stream(model: str, request: Request):
                 ) as r:
                     if r.status_code != 200:
                         text = (await r.aread()).decode()[:2000]
-                        yield sse_gemini_chunk(
-                            [{"text": f"upstream error: {text}"}], "STOP")
-                        return
+                        # Error contract (module header): never STOP-with-error-text.
+                        # Raise so the except below emits the ERROR chunk and aborts.
+                        raise RuntimeError(f"upstream error: {text}")
                     async for line in r.aiter_lines():
                         if not line.startswith("data:"):
                             continue
@@ -295,18 +306,25 @@ async def stream(model: str, request: Request):
                             if finish and tool_acc:
                                 parts.extend(flushed_calls(tool_acc))
                                 tool_acc = {}
-                            u = gemini_usage(usage) if (usage and finish) else None
                             if parts or finish:
-                                yield sse_gemini_chunk(parts or None, finish, u, model_out)
+                                yield sse_gemini_chunk(parts or None, finish, None, model_out)
+                    # include_usage puts usage in its own trailing chunk
+                    # (choices: []) that arrives after the finish chunk; forward
+                    # it as a standalone usageMetadata chunk, before the flush.
+                    if usage:
+                        yield sse_gemini_chunk(None, None, gemini_usage(usage), model_out)
                     if tool_acc:
                         # Upstream ended with [DONE] but never sent a finish_reason:
                         # flush the accumulated tool calls so they are not dropped.
-                        yield sse_gemini_chunk(
-                            flushed_calls(tool_acc), "STOP",
-                            gemini_usage(usage) if usage else None, model_out)
+                        yield sse_gemini_chunk(flushed_calls(tool_acc), "STOP",
+                                               None, model_out)
                         tool_acc = {}
         except Exception as e:  # noqa: BLE001
-            yield sse_gemini_chunk([{"text": f"proxy error: {e}"}], "STOP", None, model)
+            # Error contract (module header): ONE final chunk with finishReason
+            # ERROR carrying the text, then re-raise so uvicorn aborts the
+            # stream — `agy` never records a STOP (SUCCESS) on a failed run.
+            yield sse_gemini_chunk([{"text": f"proxy error: {e}"}], "ERROR", None, model)
+            raise
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

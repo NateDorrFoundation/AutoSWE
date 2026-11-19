@@ -66,7 +66,7 @@ becomes a follow-up instead of blocking the core backend.
 | `plan_permission` | ❌ | — | — |
 | `plan_file` | ❌ | no native plan file. The planner's `~/.claude/plans` scan stays skipped | — |
 | `max_turns` | no-op | no turn cap. The guard is wall-clock `timeout` (+ `--print-timeout`) | 1 |
-| `cost_usd` | `None` | tokens only, no USD. Never estimate (the same rule as pi, the reverse of codex) | 1 |
+| `cost_usd` | `None` | no usage at all on the BYOK bridge path — the bridge reports **zero token counts** and no USD (verified: all-zero `usage` in every fixture). Never estimate (the same rule as pi, the reverse of codex) | 1 |
 
 ## Phases
 
