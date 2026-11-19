@@ -53,11 +53,15 @@ the same LiteLLM gateway the claude-code/codex backends use. Verified end-to-end
 
 1. **Wire bridge** — `agy` speaks the Gemini `generateContent` wire. LiteLLM cannot
    serve that wire, so there is a Gemini↔OpenAI translation proxy:
-   - Code: `~/.litellm-agy/gemini-openai-proxy.py`, listens `127.0.0.1:4001`,
-     forwards to `http://linux-server1:4000/v1` (same LiteLLM key as
-     claude-code/codex backends).
-   - systemd user service `agy-gemini-proxy` (enabled, `Restart=always`, linger on →
-     survives reboots). Streaming tool calls required argument accumulation in the
+   - Code: **vendored at `scripts/agy-gemini-proxy.py`** (repo copy of the source of
+     truth); installed location `~/.litellm-agy/gemini-openai-proxy.py`. Listens
+     `127.0.0.1:4001`, forwards to `http://linux-server1:4000/v1` (same LiteLLM key
+     as claude-code/codex backends). Streaming tool calls need the bridge's
+     functionCall-argument accumulation — see the header comment.
+   - systemd user service: **vendored at `scripts/agy-gemini-proxy.service`**
+     (installed as `~/.config/systemd/user/agy-gemini-proxy.service`; enabled,
+     `Restart=always`, linger on → survives reboots). The upstream key lives only in
+     a local `proxy.env` (`EnvironmentFile`) — it is not and must never be committed. Streaming tool calls required argument accumulation in the
      bridge (OpenAI deltas → one complete Gemini `functionCall` at `finish_reason`).
 2. **Settings** (can be passed per-run via `--settings`, no global mutation):
    ```json
@@ -172,8 +176,8 @@ and the raw captures. Event protocol (documented NDJSON, confirmed): `init` →
 | T5 | `--model does-not-exist` | **Exit 1**, single `result` line, **no `init` event**: `status:"ERROR"`, `finished_reason:"error"`, `error:"invalid model selection (--model …): model … is not recognized as a known model or custom model in settings\nAvailable models: …"` (the list includes custom models → doubles as the model pre-flight). stderr has the same text. | `unknown_model.jsonl` |
 | T6 | `--json-schema <file>` + multi-step tool use (read file, run command, then answer in schema) | `result.structured_output` **is populated after a multi-step agentic run** (`{"file_exists":true,"first_word":"autoSWE"}`), with extra internal `user_input`/`finish` steps at the end. **But it is advisory:** in the violation run (schema `line_count ≥ 1000`, true value 4) the model **fudged the answer to `1000`** and the run still reported SUCCESS. The harness **must validate `structured_output` downstream** (trust-boundary rule) — the schema does not guarantee truth. | `structured_output.jsonl`, `structured_output_violation.jsonl` |
 | T7 | T1, then `--conversation <id>` "what did I ask?" | **Resume works headless.** The `conversation_id` **stays the same**; `step_index` continues from where the prior run left off; `num_turns` increments. | `resume.jsonl` |
-| T8 | `run_command sleep 30`, then `kill -TERM -<pgid>` on the process group | The CLI traps SIGTERM and writes a **final `result` line** before dying: `status:"ERROR"`, `error:"interrupted"`, `finished_reason:"interrupted"`; stderr `error: interrupted`. Killing the **process group** leaves no orphans (the `sleep` child dies with it). The conversation is **still resumable** afterward (follow-up `--conversation <id>` run: SUCCESS, and the agent correctly reports the cancelled `sleep 30`). | `killed_partial.jsonl` |
-| T9 | `--print-timeout 10s` on a `sleep 25` task | **Exit code 3** (distinct from auth/model errors' 1). `result.status:"ERROR"`, `finished_reason:"print_timeout"`, `error:"print timeout after 10s with the turn still in progress; the response is partial"`. stderr additionally emits a machine-readable line: `AGY_ERROR: {"short_error":…,"status":"DEADLINE_EXCEEDED","retryable":false,"reason":"print_timeout"}` — Phase 1 can key the timeout subtype off `finished_reason:"print_timeout"` and exit 3. | `print_timeout.jsonl` |
+| T8 | `run_command sleep 30`, then `kill -TERM -<pgid>` on the process group | The CLI traps SIGTERM and writes a **final `result` line** before dying: `status:"ERROR"`, `error:"interrupted"`, `finished_reason:"interrupted"`; stderr `error: interrupted`. Killing the **process group** leaves no orphans (the `sleep` child dies with it). The conversation is **still resumable** afterward (follow-up `--conversation <id>` run: SUCCESS, and the agent correctly reports the cancelled `sleep 30`). **Note:** `result.duration_seconds` on this path is CLI accounting, not wall-clock (kill at ~5 s recorded `12.85`) — Phase 1 times kills with its own `time.monotonic()`. | `killed_partial.jsonl` |
+| T9 | `--print-timeout 10s` on a `sleep 25` task | **Exit code 3** (distinct from auth/model errors' 1). `result.status:"ERROR"`, `finished_reason:"print_timeout"`, `error:"print timeout after 10s with the turn still in progress; the response is partial"`. stderr additionally emits a machine-readable line: `AGY_ERROR: {"short_error":…,"status":"DEADLINE_EXCEEDED","retryable":false,"reason":"print_timeout"}` — Phase 1 can key the timeout subtype off `finished_reason:"print_timeout"` and exit 3. Same duration caveat: the 10 s timeout fired with `duration_seconds:5.94` — never read wall-clock from `result.duration_seconds`. | `print_timeout.jsonl` |
 | T10 | prompt that makes the agent call `ask_question` | **There is no `WAITING` status in headless print mode.** The question step surfaces as `step_type:"unknown"` and completes immediately with *no selection returned*; the agent continues and the run ends **SUCCESS**. A second run with `ask_question` denied via `--settings permissions.deny` behaved identically (SUCCESS, no hang). So `ask_question` **can** be denied, and headless can never pause on a question — the AskUserQuestion → `autoswe:waiting` semantics are **SDK-only (Phase 7)**. | `waiting.jsonl` |
 | T11 | prompt starting with `/plan` text, with vs without `--disable-slash-commands` | Without the flag the CLI **expands** the slash text (93-line run: the agent executed the expanded planning/skill behavior on the repo). With `--disable-slash-commands` no expansion occurs. **Phase 1 must always pass `--disable-slash-commands`** — issue-comment bodies must never be run as CLI slash commands. | — (behavioral) |
 | T12 | launch with subprocess `cwd=<repo>`, inspect `init.cwd` | Confirmed: `init.cwd` == the subprocess `cwd`; there is **no `-C` flag**. The subprocess `cwd=` is the only workspace lever (works fine with `create_subprocess_exec(cwd=…)`). | — (in every fixture) |
@@ -265,6 +269,12 @@ no worse than the plan feared. Not blocking for Phases 1–6.
 | Auth | **SOLVED (BYOK bridge)** | §0.1.2 recipe; no OAuth, no keyring, no TTY dependency. |
 
 ## Fixtures committed (`tests/fixtures/antigravity/`)
+
+The fixtures dir carries a `README.md` with the **durable exit-code table**
+(T5=1, T9=3, T8=143/SIGTERM, all others 0 — including the schema-violation run
+ending exit 0, which is why `structured_output` must be validated downstream).
+Exit codes exist only there: the NDJSON stream has no exit-code channel, and the
+raw `.exit`/`.stdout` captures in `/tmp/agy-spike/raw/` are ephemeral.
 
 `basic_success` (T1) · `stdin_single_turn` (T2) · `tool_steps` (T3) ·
 `tool_error_recovered` (T4) · `unknown_model` (T5) · `structured_output` +

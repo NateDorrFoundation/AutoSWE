@@ -78,3 +78,17 @@ Then the downstream files:
 - [ ] All docs updated, and nothing in `docs/` still calls antigravity a "candidate"
 - [ ] Live E2E matrix filled in for both providers
 - [ ] Gate green; merge PR `antigravity` → `master`
+
+**Windows parity pass (deferred from Phase 0 — windows-pending checklist, from
+`spike-antigravity.md` "Deferred / windows-pending parity items"):**
+
+- [ ] `(Get-Command agy).Source` → `.exe`/`.cmd`/`.ps1` — pin the
+      `_resolve_agy_executable` Windows branch against the real shim type.
+- [ ] `taskkill /T /F` tree-kill equivalence for the T8 process-group kill
+      (`kill -TERM -<pgid>` on Linux; confirm the CLI writes its final
+      `finished_reason:"interrupted"` result line under `taskkill` too).
+- [ ] `--sandbox` OS-level write-blocking behavior on Windows (Linux finding P4:
+      deny rules alone already block; sandbox added nothing observable).
+- [ ] OAuth / Windows-Credential-Manager auth mode shape (unused on the BYOK path;
+      record the quota-exhaustion / `useG1Credits:false` envelope **only** if a
+      deployment ever runs that mode).

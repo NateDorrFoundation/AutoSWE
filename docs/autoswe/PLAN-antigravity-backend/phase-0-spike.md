@@ -105,11 +105,14 @@ Only to decide whether Phase 7 is worth doing:
 
 ## Exit criteria
 
-- [ ] `spike-antigravity.md` committed, with a filled-in answer for every table row above
-- [ ] Fixtures committed under `tests/fixtures/antigravity/` (redacted)
-- [ ] README capability matrix updated (strike out anything that failed)
-- [ ] Go/no-go recorded for: stdin transport (T2), `mode` (P1–P3), `mcp` naming + env (M2/M3),
-      `structured_output` (T6)
-- [ ] If T2 fails (stdin single-turn does not exit cleanly): record the fallback, which is `-p` with
+- [x] `spike-antigravity.md` committed, with a filled-in answer for every table row above
+- [x] Fixtures committed under `tests/fixtures/antigravity/` (redacted) — 13 streams +
+      `README.md` with the durable exit-code table
+- [x] README capability matrix updated (strike out anything that failed) — no strike-outs;
+      both "(if confirmed)" rows promoted with corrected mechanisms
+- [x] Go/no-go recorded for: stdin transport (T2), `mode` (P1–P3), `mcp` naming + env (M2/M3),
+      `structured_output` (T6) — all GO (`mode` via per-run `--settings`, not `--mode plan`;
+      `structured_output` advisory → validate downstream)
+- [x] If T2 fails (stdin single-turn does not exit cleanly): record the fallback, which is `-p` with
       a short bootstrap prompt that tells the agent to `view_file` a temp prompt file
-      outside the repo, and adjust Phase 1
+      outside the repo, and adjust Phase 1 — **T2 passed; fallback not needed**
