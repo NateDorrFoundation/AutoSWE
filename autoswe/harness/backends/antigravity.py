@@ -1075,33 +1075,40 @@ class AntigravityBackend:
         # seam, _stage_run_config).  The staged dir is reclaimed in the
         # _wrapped finally below alongside the schema temp file — covering
         # success, failure, kill and cancel — and nothing is ever written to
-        # the host-global settings file.
+        # the host-global settings file.  Everything that can still fail
+        # AFTER cleanup is bound (schema staging included) lives inside
+        # _wrapped, so its finally owns every resource: a failure between
+        # here and the spawn must not strand the staged dir (review MEDIUM).
         settings_args, env_patch, cleanup = _stage_run_config(spec, harness_cfg)
 
-        # Structured output: write the schema to a private temp file up front
-        # (mkstemp — unique, user-controlled path, mode 600) so the file's
-        # lifetime spans the whole run and is always reclaimed in the finally
-        # below, including the kill path (the codex --output-last-message
-        # pattern).  Never inline: too long for the Windows command line and
-        # quoting hazards.
-        schema_path: str | None = None
-        if spec.output_format is not None:
-            schema_fd, schema_path = tempfile.mkstemp(
-                prefix="autoswe-agy-schema-", suffix=".json"
-            )
-            try:
-                with os.fdopen(schema_fd, "w", encoding="utf-8") as f:
-                    json.dump(spec.output_format.get("schema", spec.output_format), f)
-            except OSError:
-                try:
-                    os.unlink(schema_path)
-                except OSError:
-                    pass
-                schema_path = None
-                raise
-
         async def _wrapped() -> RunResult:
+            # Structured output: write the schema to a private temp file
+            # (mkstemp — unique, user-controlled path, mode 600) so the
+            # file's lifetime spans the whole run and is always reclaimed in
+            # the finally below, including the kill path (the codex
+            # --output-last-message pattern).  Never inline: too long for the
+            # Windows command line and quoting hazards.
+            schema_path: str | None = None
             try:
+                if spec.output_format is not None:
+                    schema_fd, schema_path = tempfile.mkstemp(
+                        prefix="autoswe-agy-schema-", suffix=".json"
+                    )
+                    try:
+                        with os.fdopen(schema_fd, "w", encoding="utf-8") as f:
+                            json.dump(
+                                spec.output_format.get("schema", spec.output_format), f
+                            )
+                    except BaseException:
+                        # Any failure mode (OSError, non-serializable schema…)
+                        # leaves the staged settings dir to the finally below;
+                        # here just drop the half-written schema file.
+                        try:
+                            os.unlink(schema_path)
+                        except OSError:
+                            pass
+                        schema_path = None
+                        raise
                 return await self._run_async(
                     spec, harness_cfg, schema_path, settings_args, env_patch
                 )

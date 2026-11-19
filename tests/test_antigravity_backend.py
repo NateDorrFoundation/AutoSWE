@@ -1020,6 +1020,33 @@ def test_two_concurrent_runs_get_distinct_settings_dirs():
         b_cleanup()
 
 
+def test_staged_dir_reclaimed_when_schema_staging_fails(monkeypatch):
+    # Review MEDIUM: schema staging used to live between _stage_run_config
+    # and _wrapped, so a mkstemp/json failure propagated before the finally
+    # existed and stranded the autoswe-agy-run-* dir.  Staging now runs
+    # inside _wrapped, so the finally reclaims it even when nothing spawned.
+    staged: list[str] = []
+    real_mkdtemp = agy_mod.tempfile.mkdtemp
+
+    def spy_mkdtemp(*args, **kwargs):
+        d = real_mkdtemp(*args, **kwargs)
+        staged.append(d)
+        return d
+
+    def boom(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(agy_mod.tempfile, "mkdtemp", spy_mkdtemp)
+    monkeypatch.setattr(agy_mod.tempfile, "mkstemp", boom)
+    spec = _spec(mode="read_write", output_format={"schema": {"type": "object"}})
+
+    with pytest.raises(OSError, match="No space left"):
+        asyncio.run(AntigravityBackend().run(spec))
+
+    assert len(staged) == 1
+    assert not os.path.exists(staged[0])
+
+
 def test_staged_settings_content_pins_worktree_prefix():
     args, _, cleanup = agy_mod._stage_run_config(
         _spec(mode="plan", cwd="/home/me/wt/issue-1"), {})
