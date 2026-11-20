@@ -136,7 +136,11 @@ _HARD_TIMEOUT_SLACK = 30
 MIN_AGY_VERSION = "1.5.11"
 
 # Once-per-process guard for _warn_if_below_floor: the probe costs a
-# subprocess spawn, so at most one per poll-cycle process, ever.
+# subprocess spawn, so at most one completes per poll-cycle process.  Set only
+# once the probe finishes — a transient failure (timeout on a busy box) then
+# lets the next run retry rather than silencing the floor for the whole
+# process.  Two runs racing through the check pre-completion may both probe:
+# warn-only, worst case one duplicated spawn.
 _agy_version_checked = False
 
 
@@ -160,9 +164,10 @@ def _query_agy_version(argv: list[str]) -> str | None:
     """
     try:
         # 15 s here vs 30 s (_VERSION_TIMEOUT_S) in tests/test_agy_cli_version.py:
-        # intentional.  This probe runs on the async run path — a hung CLI must
-        # stall the first run at most a few seconds — while the offline guard
-        # tolerates slower CI boxes.  Both swallow any query failure silently.
+        # intentional.  The run path runs this probe OFF the event loop
+        # (asyncio.to_thread in _warn_if_below_floor), so a hung CLI delays at
+        # most the one run awaiting it — it never stalls concurrent runs.  The
+        # offline guard tolerates slower CI boxes.  Both swallow failures silently.
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         # UnicodeDecodeError is a ValueError raised by the strict-UTF-8 decode
@@ -175,7 +180,7 @@ def _query_agy_version(argv: list[str]) -> str | None:
     return (proc.stdout or proc.stderr or "").strip() or None
 
 
-def _warn_if_below_floor(
+async def _warn_if_below_floor(
     exe: str, prefix_argv: list[str] | tuple[str, ...] = ()
 ) -> None:
     """Log ``[WARN]`` once per process when the installed agy is below the floor.
@@ -187,13 +192,18 @@ def _warn_if_below_floor(
     (``["/c", path]`` for ``.cmd``/``.bat``, the powershell arms for ``.ps1``):
     the probe must run the *full* invocation, or a shimmed host would get a
     bare ``cmd --version`` — an interactive prompt, not the CLI's version.
-    Never raises, never fails the run.
+    The blocking ``subprocess.run`` is awaited via ``asyncio.to_thread`` so a
+    wedged CLI never stalls the event loop (and thus concurrent runs); the
+    guard flag flips only after the probe completes.  Never raises, never
+    fails the run.
     """
     global _agy_version_checked
     if _agy_version_checked:
         return
+    reported = await asyncio.to_thread(
+        _query_agy_version, [exe, *prefix_argv, "--version"]
+    )
     _agy_version_checked = True
-    reported = _query_agy_version([exe, *prefix_argv, "--version"])
     if reported is None:
         return
     parts = _agy_version_tuple(reported)
@@ -1741,8 +1751,10 @@ class AntigravityBackend:
         # full invocation (exe + shim prefix) must be threaded: a `.cmd`/`.ps1`
         # shim resolves to exe="cmd"/"powershell" with the real path in
         # prefix_argv, so probing the bare exe would stall on an interactive
-        # prompt and the floor could never warn on a shimmed host.
-        _warn_if_below_floor(exe, prefix_argv)
+        # prompt and the floor could never warn on a shimmed host.  Awaited
+        # off-loop (asyncio.to_thread inside) — a wedged CLI must never stall
+        # the event loop and the concurrent runs sharing it.
+        await _warn_if_below_floor(exe, prefix_argv)
         argv = [
             exe, *prefix_argv,
             *_build_argv(spec, harness_cfg, schema_path, settings_args),

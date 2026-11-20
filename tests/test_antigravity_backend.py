@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1915,8 +1916,8 @@ def test_warn_fires_once_per_process_below_floor(monkeypatch):
     _reset_version_guard(monkeypatch)
     monkeypatch.setattr(agy_mod, "_query_agy_version", lambda argv: "1.5.10")
     with patch.object(agy_mod, "log") as mock_log:
-        agy_mod._warn_if_below_floor("/usr/local/bin/agy")
-        agy_mod._warn_if_below_floor("/usr/local/bin/agy")
+        asyncio.run(agy_mod._warn_if_below_floor("/usr/local/bin/agy"))
+        asyncio.run(agy_mod._warn_if_below_floor("/usr/local/bin/agy"))
     msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
     warns = [m for m in msgs if "[WARN]" in m and "below the pinned floor" in m]
     assert len(warns) == 1, "warn must fire exactly once per process"
@@ -1926,14 +1927,14 @@ def test_no_warn_at_or_above_floor(monkeypatch):
     _reset_version_guard(monkeypatch)
     monkeypatch.setattr(agy_mod, "_query_agy_version", lambda argv: agy_mod.MIN_AGY_VERSION)
     with patch.object(agy_mod, "log") as mock_log:
-        agy_mod._warn_if_below_floor("/usr/local/bin/agy")
+        asyncio.run(agy_mod._warn_if_below_floor("/usr/local/bin/agy"))
     msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
     assert not [m for m in msgs if "[WARN]" in m]
     # And a newer CLI is equally silent.
     monkeypatch.setattr(agy_mod, "_agy_version_checked", False)
     monkeypatch.setattr(agy_mod, "_query_agy_version", lambda argv: "99.0.1")
     with patch.object(agy_mod, "log") as mock_log:
-        agy_mod._warn_if_below_floor("/usr/local/bin/agy")
+        asyncio.run(agy_mod._warn_if_below_floor("/usr/local/bin/agy"))
     msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
     assert not [m for m in msgs if "[WARN]" in m]
 
@@ -1944,10 +1945,52 @@ def test_unqueryable_version_is_silent(monkeypatch):
     _reset_version_guard(monkeypatch)
     monkeypatch.setattr(agy_mod, "_query_agy_version", lambda argv: None)
     with patch.object(agy_mod, "log") as mock_log:
-        agy_mod._warn_if_below_floor("/usr/local/bin/agy")  # must not raise
+        asyncio.run(agy_mod._warn_if_below_floor("/usr/local/bin/agy"))  # must not raise
     assert not [
         c for c in mock_log.call_args_list if "[WARN]" in str(c.args[0] if c.args else "")
     ]
+
+
+def test_version_probe_runs_off_the_event_loop(monkeypatch):
+    """The blocking probe must never starve the event loop (review E MEDIUM).
+
+    A synchronous ``subprocess.run`` on the async run path stalled every
+    concurrent task for up to the 15 s timeout — once per poll cycle, since
+    cron launches a fresh process each time.  Pinned by running the guard
+    concurrently with a ticking coroutine: the tick must keep advancing while
+    the (sleeping) probe is in flight, proving ``asyncio.to_thread`` offload.
+    """
+    _reset_version_guard(monkeypatch)
+    state = {"ticks": 0, "at_probe_completion": None}
+
+    def slow_query(argv):
+        time.sleep(0.2)
+        # Runs in the to_thread worker: snapshot loop liveness at the exact
+        # moment the probe finishes.  A loop-blocking probe would give 0 —
+        # the ticker could not have run during the sleep.
+        state["at_probe_completion"] = state["ticks"]
+        return agy_mod.MIN_AGY_VERSION
+
+    monkeypatch.setattr(agy_mod, "_query_agy_version", slow_query)
+
+    async def scenario():
+        stop = asyncio.Event()
+
+        async def ticker():
+            while not stop.is_set():
+                await asyncio.sleep(0.01)
+                state["ticks"] += 1
+
+        task = asyncio.create_task(ticker())
+        await agy_mod._warn_if_below_floor("/usr/bin/agy")
+        stop.set()
+        await task
+
+    asyncio.run(scenario())
+    assert state["at_probe_completion"] is not None
+    assert state["at_probe_completion"] > 0, (
+        "the event loop must stay live while the version probe is in flight"
+    )
 
 
 @pytest.mark.parametrize(

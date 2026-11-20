@@ -675,7 +675,7 @@ logged and ignored, pi-style.
 confirm before the mechanism is called fully live-verified:
 
 - **Grep allow-rule stream spelling** — **resolved.** Branch evidence:
-  every one of the 13 live-captured fixtures' `init.tools` registry lists
+  every one of the 12 live-captured fixtures that carry an `init` event lists
   `grep_search`, and `antigravity.py` allows BOTH `search(<cwd>/)` and
   `grep_search(<cwd>/)`. An unmatched ALLOW entry is a no-op under
   deny>ask>allow, so the dual spelling is a design guarantee that grep can
