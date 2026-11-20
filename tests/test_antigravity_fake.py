@@ -279,6 +279,26 @@ class TestAntigravityFakeFidelity:
         with pytest.raises(OSError):
             _run(_spec(), fake)
 
+    def test_attestation_none_omits_init_permission_mode(self):
+        """attestation=None truly drops init.permission_mode end-to-end:
+        on a read-only phase the real §4.4 self-check then fails closed
+        (proving the field is absent, not merely un-checked)."""
+        fake = AntigravityFake()
+        fake.script_response("ok", attestation=None)
+
+        with pytest.raises(RuntimeError, match="did not attest permission_mode"):
+            _run(_spec(mode="plan"), fake)
+
+    def test_attestation_none_passes_on_read_write(self):
+        """The omitted attestation itself is inert on a read_write run —
+        only the read-only self-check consumes it."""
+        fake = AntigravityFake()
+        fake.script_response("ok", attestation=None)
+
+        result = _run(_spec(mode="read_write"), fake)
+
+        assert result.subtype == "success"
+
 
 # ---------------------------------------------------------------------------
 # 2. Call-record (argv) fidelity

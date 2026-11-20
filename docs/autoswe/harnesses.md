@@ -524,7 +524,7 @@ There is no price table analogous to `codex_pricing.py`.
 - **Large JSON line handling (issue #251).** The subprocess (and the MCP warm-up) is spawned with a StreamReader ``limit=_MAX_STREAM_BYTES + 1`` (16 MiB + 1) so that either pipe can hold a legitimately large single JSON line — the asyncio default is only 64 KiB. If a line still exceeds that limit, ``readline()`` raises ``ValueError``; the backend catches it, sets the run's error flag, and drains the rest of stdout, so the run surfaces as ``subtype="error"`` instead of the uncaught exception propagating out of the runner and crashing the poller.
 - Duration is tracked via ``time.monotonic()`` locally.
 
-#### `antigravity` (candidate — docs mirrored, backend not yet implemented)
+#### `antigravity` (implemented — headless CLI; read-only enforced via per-run `--settings`)
 
 Two transports exist; the Phase 0 spike picked the headless CLI as the core, with the
 Python SDK deferred to Phase 7:
@@ -548,7 +548,7 @@ endpoints — see its README for the ToC and refresh commands). Start with
 `cli-headless.md`, `cli-reference.md`, then `sdk-overview.md`, `sdk-tools.md`, `sdk-mcp.md`.
 
 **Implementation plan:** `docs/autoswe/PLAN-antigravity-backend/` (README + Phases 0–7,
-proposed 2026-11-18; Phase 0 complete).
+proposed 2026-11-18; Phases 0–4 complete).
 
 **Resolved by the Phase 0 spike** (go/no-go table in `spike-antigravity.md`):
 headless print mode **does** emit a usable streaming protocol — `init →
@@ -559,6 +559,106 @@ same `conversation_id` across runs — T7; SDK resume deferred to Phase 7);
 there are no Google credits to map — never estimate, same rule as pi); stdin
 single-turn transport, per-run `--settings` read-only isolation, and MCP
 eager-tool naming + env inheritance are all **GO**.
+
+**Real read-only enforcement (Phase 4, issue #321 — `mode` is advertised, so
+plan/review do NOT loudly degrade).** Unlike Codex ([No
+`mode`](#codex-phase-4)) — which accepts `RunSpec.mode` but enforces nothing —
+antigravity enforces read-only at the CLI level, so
+`has_read_only_enforcement` is `True` for an agy profile and the planner and
+reviewer keep their read-only guarantees; `ensure_worktree_unchanged` stays
+only as the backstop it always was. Two facts shape the mechanism:
+
+- **`--mode plan` is advisory only** (spike P1 FAIL — the agent can keep
+  writing; live re-confirm 2026-11-20: the CLI itself warns `--mode plan has
+  no effect while slash command expansion is disabled`, and autoSWE always
+  passes `--disable-slash-commands` (T11 mandatory), so on the agy profile
+  the flag is provably inert belt — the staged deny rules are the ONLY
+  enforcement layer). It is still passed on `plan` runs as intent, but it is
+  never the security boundary. The same live check confirmed the §4.4
+  self-check's expected attestation spelling on the real binary
+  (`init.permission_mode == "request-review"` under `--mode plan` + staged
+  `--settings`), so the fail-closed path does not misfire.
+- **The lever is `--settings <path>`** — a live-binary flag (absent from the
+  mirrored docs) meaning "settings for this session only, never saved".
+  `antigravity.py:_stage_run_config` (the ONE seam) stages a throwaway
+  `settings.json` in a private `mkdtemp` dir per run — profile
+  `base-settings.json` (or `{}`) merged with the mode-derived
+  `permissions.deny`/`allow` block — passes `--settings <path>` in argv, and
+  deletes the run dir in a `finally` (success, failure, kill and cancel all
+  reclaim it). The host-global `~/.gemini/antigravity-cli/settings.json` is
+  **never** written: it is shared, so per-run writes there would race a
+  concurrent `/fix` under `MAX_CONCURRENT > 1` and leak a lockdown on crash.
+  Distinct temp dirs make concurrent runs race-free by construction.
+- **`--settings` LAYERS over the host-global file — it never replaces it**
+  (live-verified on the dedicated box: an isolated `HOME` whose global
+  settings carried only the model-provider config resolved that custom model
+  normally under a `--settings` file containing *only* a permissions block —
+  consistent with the flag text "for this session only, never saved").
+  Consequently `config_home/base-settings.json` is an **optional per-profile
+  override layer, not a required seed**: a fresh install with no such file
+  loses nothing — `/plan` and `/fix` keep whatever the unsandboxed CLI has
+  (`useG1Credits`, `modelProvider`/custom models, …). Author it only to
+  override host config for one profile or to park per-profile state (the
+  Phase 5 MCP registration). Do **not** auto-copy the host-global file into
+  `config_home` — under layering that buys nothing and would freeze a stale
+  snapshot the host later changes.
+
+**Mode → permissions mapping (deny targets are directory prefixes WITH a
+trailing slash — globs silently do NOT match, spike P2):**
+
+| `RunSpec.mode` | `permissions.deny` | `permissions.allow` |
+|---|---|---|
+| `plan` / `read_only` | every mutating tool (`write_file`/`replace_file_content`/`multi_replace_file_content`/`sed_file`/`notebook_edit`) against the worktree, `write_file(<cwd>/.git/)`, `command(*)`, the three `ask_*` | `read_file`/`view_file`/`search` + `grep_search`/`list_dir` against the worktree, `mcp(autoswe_comment/*)` (+ `read_only` also `mcp(autoswe_inline_comment/*)`); `read_only` also gets no `--mode` flag, `plan` gets the advisory `--mode plan` |
+| `read_write` / unset | `write_file(<cwd>/.git/)` belt-and-braces, the three `ask_*` | *(none — default posture)* |
+
+`ask_question`/`ask_permission`/`ask_custom_permission` are denied in **every**
+mode (headless print mode can never answer a prompt — spike T10: a question
+step completes with no selection; denying is deterministic). Deny > Ask >
+Allow, so the allow list only rescues reads and can never reopen a denied
+tool (P5 confirmed deny + MCP allow coexist in one run). The read-only modes
+also never receive `--dangerously-skip-permissions`. `spec.disallowed_tools_override`
+maps to the equivalent agy rule (`Bash→command(*)`, `Write→write_file(<cwd>/)`,
+`mcp__server__tool→mcp(server/tool)`); names without a clean equivalent are
+logged and ignored, pi-style.
+
+**Live-pass checklist (Phase 6).** Remaining rows the dedicated box must
+confirm before the mechanism is called fully live-verified:
+
+- **Grep allow-rule stream spelling** — the read-only allow list carries
+  BOTH `search(<cwd>/)` and `grep_search(<cwd>/)`. No committed fixture
+  stream pins the search tool's stream name (`grep_search` appears only in
+  the `init.tools` *registry* — a different namespace, and the rules key off
+  stream names per P2's lesson). An unmatched ALLOW entry is a no-op under
+  deny>ask>allow, so carrying both is functionally free and the planner
+  cannot silently lose grep; the live check should confirm which spelling
+  the matcher honors and drop the dead one.
+
+**The `permission_mode` self-check (§4.4).** After `init`, the CLI-attested
+`init.permission_mode` is compared against the posture the run asked for
+(`request-review` for read-only phases; `always-proceed` for `read_write`
+with the skip flag). A **read-only** run attesting anything else means the
+staged deny rules were not honored — a plan run that silently has write
+access is worse than a failed plan run, so the backend logs
+`[ERROR][ANTIGRAVITY] read-only not in effect…` and **raises**
+(`RuntimeError`, outside `retryable_exceptions()` → one attempt). Failing
+**without** attestation fails closed too: under staged `--settings` the CLI
+always stamps `init.permission_mode`, so a parsed init that carries none is
+treated as an unverified guard (`…CLI did not attest permission_mode…`, same
+ERROR + raise path). Only streams that die *before* `init` keep their normal
+error/killed mapping — there was never an attestation to check. The raise,
+not just an error-flagged result, is load-bearing: the planner never inspects
+`RunResult.subtype`, so a returned-but-flagged run would park the task in
+`waiting` as if legitimate; the raise flows through the handler's exception
+boundary into the `FAILED:` comment (transition row
+`agy_plan_permission_mode_mismatch`). A `read_write` posture drift only warns
+(`[WARN]… the skip flag may not be in effect`). Soft-deny notices on stderr
+are logged at **info** level on a read-only run — there they are the deny
+block *working* — and at `[WARN]` elsewhere.
+
+**Capabilities (not yet supported):** `mcp` (Phase 5 wires the comment-posting
+server through `--settings`), `session_fork` (agy resumes in place via
+`--conversation`; `/retry` degrades to a fresh run), and the Claude-only SDK
+levers `can_use_tool`/`plan_permission`/`plan_file`.
 
 ### Shared RunSpec → RunResult contract (backends/base.py)
 

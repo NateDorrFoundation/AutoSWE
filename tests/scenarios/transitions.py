@@ -2108,6 +2108,50 @@ TRANSITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "agy_plan_permission_mode_mismatch",
+        "description": (
+            "antigravity-specific (Phase 4 §4.4): /plan whose init attests "
+            "permission_mode=always-proceed even though the run was launched "
+            "read-only (no skip flag + staged --settings deny block) — the CLI "
+            "ignored the per-run permissions block. A plan run that silently "
+            "has write access is worse than a failed plan run, so the backend "
+            "logs [ERROR][ANTIGRAVITY] read-only not in effect and refuses "
+            "the result (RuntimeError, outside retryable_exceptions → one "
+            "attempt). The planner's exception boundary turns that into the "
+            "FAILED comment; the task parks in failed with the /retry hint, "
+            "and the successful-looking plan text never reaches the thread."
+        ),
+        # The failure only exists where the self-check does: on the default
+        # claude_code axis the very same response is just a successful plan,
+        # so the shared expect cannot describe both (unlike the other agy
+        # rows, which are deliberately dual-axis).
+        "skip_backends": ["claude_code"],
+        "start": {
+            "issue": {"body": "/plan"},
+            "queue_task": None,
+        },
+        "claude_responses": [
+            {
+                "text": "<AUTOSWE_PLAN>This plan would have shipped anyway.</AUTOSWE_PLAN>",
+                "session_id": "s-agy-plan-42",
+                "subtype": "success",
+                # Pin the init posture to override the spawn-time derivation
+                # (which would otherwise attest request-review, matching the
+                # read-only flags, and the check would pass).
+                "permission_mode": "always-proceed",
+            },
+        ],
+        "git_calls": ["create_worktree"],
+        "expect": {
+            "label_after": "autoswe:failed",
+            "autoswe_status": "failed",
+            "comment_contains": [
+                "Failed:",
+                "read-only not in effect",
+            ],
+        },
+    },
+    {
         "name": "agy_fix_killed",
         "description": (
             "/fix whose agy run is interrupted mid-flight (result ERROR with "
@@ -3558,8 +3602,10 @@ PI_TRANSITIONS: list[str] = [
 # Antigravity backend transition rows
 
 # Curated set of transition names to run against the antigravity (agy) backend.
-# These cover the Phase 1/2 divergences: no read-only enforcement (loud-degrade
-# + rollback instead of --tools/mode), structured_output on every plan/review
+# These cover the Phase 1/2 divergences: read-only ENFORCEMENT via the staged
+# per-run --settings block (Phase 4 — no loud-degrade, skip flag never reaches
+# plan/review, and the §4.4 permission_mode self-check fails a misattested
+# read-only run), structured_output on every plan/review
 # run (--json-schema always requested), --conversation resume semantics, the
 # provenance gate declining EVERY /retry (agy has no session_fork capability,
 # even when the checkpoint's backend matches), the killed/config_error subtype
@@ -3570,9 +3616,10 @@ PI_TRANSITIONS: list[str] = [
 # azure conversion of these rows is itself part of the Phase 3 exit criteria.
 
 ANTIGRAVITY_TRANSITIONS: list[str] = [
-    "fresh_plan_command",                       # text-pattern plan + loud-degrade (no mode/can_use_tool)
+    "fresh_plan_command",                       # text-pattern plan + staged --settings enforcement (mode, no skip flag)
     "agy_plan_structured_output",               # --json-schema plan payload preferred over the tags
     "agy_plan_waiting_status",                  # result WAITING → planner parks the task in waiting
+    "agy_plan_permission_mode_mismatch",        # §4.4: init attests always-proceed on a plan run → backend refuses → failed
     "fresh_fix_command",                        # Fix phase: fresh run, default --dangerously-skip-permissions
     "plan_ready_then_fix",                      # fix from planned → --conversation resumes the checkpoint
     "fresh_fix_fails",                          # error subtype → failed (retryable subtype, budget not spent)
