@@ -671,13 +671,16 @@ run's `spec.mcp_servers` names `autoswe_comment`
   top-level keys are preserved, owned keys absent from the current run's
   owned set are pruned as stale (e.g. an `autoswe_inline_comment` left by a
   GitHub fix run now facing a plan/Azure run), the payload is compared
-  before writing, and any `OSError` is logged and never raised — the run
+  before writing, and any `OSError` or decode failure (e.g. a UTF-16 file
+  from a PowerShell `>` redirect) is logged and never raised — the run
   degrades to the text fallback. The whole read-modify-write (read, merge,
   prune, write) is serialised under an **advisory exclusive lock on a
   sibling `<file>.lock`** (`fcntl.flock` / `msvcrt.locking`, best-effort: a
-  lock failure logs and proceeds). The prune makes concurrent runs' owned
-  sets differ, so identical-bytes last-writer-wins is not a safety argument
-  here — the lock is. A workspace `.agents/mcp_config.json` can never shadow
+  lock failure logs and proceeds), and the final write is a same-dir temp
+  plus `os.replace()` — an atomic rename as far as the lock-free `agy`
+  reader is concerned, which never sees a truncated file. The prune makes
+  concurrent runs' owned sets differ, so identical-bytes last-writer-wins
+  is not a safety argument here — the lock and the atomic replace are. A workspace `.agents/mcp_config.json` can never shadow
   the global `autoswe_comment` entry (spike M4), which is what makes the
   global file safe under Phase 4's Option C (`--settings`) instead of a run
   dir.

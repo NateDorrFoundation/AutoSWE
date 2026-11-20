@@ -1773,7 +1773,7 @@ def test_merge_repairs_corrupt_file(agy_config_path):
 
 
 def test_merge_write_failure_logs_and_never_raises(tmp_path, monkeypatch):
-    # A directory where the file belongs: open(..., "w") raises OSError.
+    # A directory where the file belongs: os.replace onto it raises OSError.
     path = tmp_path / "mcp_config.json"
     path.mkdir()
     monkeypatch.setattr(agy_mod, "antigravity_mcp_config_path", lambda: path)
@@ -1783,6 +1783,46 @@ def test_merge_write_failure_logs_and_never_raises(tmp_path, monkeypatch):
     assert result.subtype == "success"  # run proceeds — text fallback path
     msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
     assert any("could not write" in m for m in msgs)
+
+
+def test_merge_recovers_from_undecodable_config(agy_config_path):
+    """A PowerShell ``>``-redirected UTF-16LE file raises UnicodeDecodeError
+    (a ValueError, not OSError) on read_text: the merge must log and rewrite
+    it like any corrupt file — the run proceeds and the owned entry lands."""
+    agy_config_path.parent.mkdir(parents=True)
+    agy_config_path.write_bytes('{"mcpServers": {}}'.encode("utf-16"))
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    with patch.object(agy_mod, "log") as mock_log:
+        result, _ = _full_run(_mcp_spec(agy_config_path.parent.parent), proc)  # must not raise
+    assert result.subtype == "success"
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert any("could not read existing" in m for m in msgs)
+    written = json.loads(agy_config_path.read_text(encoding="utf-8"))  # now valid UTF-8 JSON
+    assert written["mcpServers"]["autoswe_comment"]["tools"]["post_plan"]["eager"] is True
+
+
+def test_merge_writes_atomically_via_os_replace(agy_config_path):
+    """The final write must be same-dir temp + os.replace, never a
+    truncating open(path, "w") — the lock-free agy child must only ever see
+    the old or the new complete file."""
+    calls = []
+    real_replace = os.replace
+
+    def spy(src, dst, *args, **kwargs):
+        calls.append((str(src), str(dst)))
+        return real_replace(src, dst, *args, **kwargs)
+
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    with patch.object(os, "replace", side_effect=spy):
+        _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
+    hits = [(src, dst) for src, dst in calls if dst == str(agy_config_path)]
+    assert len(hits) == 1, "the merge's final write must go through os.replace"
+    src, _ = hits[0]
+    assert os.path.dirname(src) == str(agy_config_path.parent)  # same directory
+    assert src != str(agy_config_path)
+    # No temp debris left behind in the config dir.
+    leftovers = [p.name for p in agy_config_path.parent.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
 
 
 def test_no_mcp_servers_never_touches_config(agy_config_path):

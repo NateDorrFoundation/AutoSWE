@@ -264,6 +264,8 @@ def _classify_mcp_comment_call(step: dict) -> tuple[str | None, str]:
         body = params.get("body")
     elif tool_name == _LAZY_PROXY_TOOL_NAME and str(params.get("ServerName") or "") == "autoswe_comment":
         target = str(params.get("ToolName") or "")
+        # Suffix, not exact: the proxy may report ToolName bare (``post_plan``)
+        # or fully qualified (``autoswe_comment_post_plan``); both classify.
         role = next(
             (kind for bare, kind in _MCP_COMMENT_TOOL_KINDS
              if target == bare or target.endswith("_" + bare)),
@@ -402,7 +404,11 @@ def _merge_antigravity_mcp_config_locked(
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         pass
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError (e.g. a PowerShell ``>``-redirected UTF-16LE
+        # file) is a ValueError, not an OSError: left uncaught it would
+        # escape _run_async as a hard task FAILED instead of degrading to
+        # the text fallback this function's contract promises.
         log(f"[WARN][ANTIGRAVITY] could not read existing {path} ({e}); rewriting")
     if raw is not None:
         try:
@@ -430,8 +436,26 @@ def _merge_antigravity_mcp_config_locked(
         return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(payload)
+        # Atomic replace, not a truncating open("w"): the advisory lock
+        # serialises autoSWE *writers*, but the agy child reads WITHOUT it,
+        # so a concurrent rewrite could be caught mid-truncation by a
+        # freshly-spawned agy (torn/empty config, server silently missing).
+        # Same-directory temp + os.replace means a reader only ever sees the
+        # old or the new complete file (atomic rename on POSIX; Windows
+        # os.replace replaces despite open read handles).
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp_name, path)
+        except OSError:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
         log(f"[ANTIGRAVITY] wrote autoswe_comment config to {path}")
     except OSError as e:
         log(f"[WARN][ANTIGRAVITY] could not write {path}: {e} — MCP tools may be unavailable (text fallback)")

@@ -197,3 +197,13 @@ dedicated-box pass.
   primary entry is now seeded from `build_antigravity_mcp_config`, making
   the spec-mandated builder load-bearing (pinned by
   `test_subprocess_entry_matches_mcp_config_builder`).
+- Round 6: the merge's read arm catches `(OSError, UnicodeDecodeError)` —
+  an undecodable config (e.g. PowerShell `>`-redirected UTF-16LE) is a
+  `ValueError` that previously escaped as a hard task FAILED instead of the
+  documented log-and-rewrite degrade (`test_merge_recovers_from_undecodable_config`);
+  the final write is same-dir temp + `os.replace()` so the lock-free `agy`
+  child never sees a truncated file mid-rewrite
+  (`test_merge_writes_atomically_via_os_replace`).
+  **Out-of-scope follow-up (Phase 6):** `pi.py:_write_pi_mcp_json` has the
+  identical `UnicodeDecodeError` read-arm gap — same one-line fix applies,
+  left untouched here by scope decision.
