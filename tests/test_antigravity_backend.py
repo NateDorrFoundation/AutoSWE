@@ -933,8 +933,24 @@ def test_rule_prefix_relative_cwd_absolutized(tmp_path, monkeypatch):
     # into a rule as-is.  chdir to a known dir so the expectation is a
     # literal, not the same expression _rule_prefix computes.
     monkeypatch.chdir(tmp_path)
-    expected = str(tmp_path) + "/relative/wt/"
+    expected = str(tmp_path.resolve()) + "/relative/wt/"
     assert agy_mod._rule_prefix("relative/wt") == expected
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink creation needs no privilege")
+def test_rule_prefix_canonicalizes_symlinked_cwd(tmp_path):
+    # Review MEDIUM: the CLI resolves writes against canonical paths, so a
+    # symlink component in spec.cwd must not leave abspath-built deny targets
+    # unmatched (silent enforcement weakening behind a passing self-check).
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    expected = str(real.resolve()).replace("\\", "/").rstrip("/") + "/"
+    # Whole-cwd symlink …
+    assert agy_mod._rule_prefix(str(link)) == expected
+    # … and a symlink component mid-path (tail need not exist).
+    assert agy_mod._rule_prefix(str(link) + "/wt") == expected + "wt/"
 
 
 def test_rule_prefix_rejects_empty_cwd():

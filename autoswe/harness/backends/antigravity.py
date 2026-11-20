@@ -169,6 +169,17 @@ _FILE_TOOL_VERBS = {
 # ``plan`` comes from the planner, ``read_only`` from the reviewer.
 _READ_ONLY_MODES = frozenset({"plan", "read_only"})
 
+# LIVE CHECK (dedicated box, 2026-11-20 — issue #321 exit criterion), two
+# findings recorded here so future passes don't re-litigate them:
+#   1. ``--mode plan`` + staged ``--settings`` attests init.permission_mode
+#      == "request-review" on the real binary — the §4.4 self-check's
+#      expected spelling is confirmed, so fail-closed will not misfire.
+#   2. stderr warns "--mode plan has no effect while slash command expansion
+#      is disabled", and we ALWAYS pass --disable-slash-commands (T11
+#      mandatory).  ``--mode plan`` is therefore provably inert belt on the
+#      agy profile — the staged deny rules are the ONLY enforcement layer
+#      (a second, mechanism-level proof of P1's advisory finding).
+
 # Mutating stream tool names (T3: ``permissions.deny`` rules are keyed off
 # the STREAM names — write_file/read_file — not the init.tools registry
 # names write_to_file/view_file).  Every mutating tool is denied against the
@@ -452,7 +463,7 @@ def _user_event(prompt: str) -> bytes:
 
 
 def _rule_prefix(cwd: str) -> str:
-    """Absolute normalized prefix for permission-rule targets.
+    """Canonical absolute prefix for permission-rule targets.
 
     P2's hard lesson: deny targets are **directory prefixes with a trailing
     slash** — a glob (``<repo>/*``) silently does NOT match, and a prefix
@@ -461,7 +472,14 @@ def _rule_prefix(cwd: str) -> str:
     semantics verified on Linux, spike §0.3; Windows path rules ride the
     Phase 6 parity pass).
 
-    Raises on a falsy cwd: falling back to ``abspath("")`` would silently
+    ``realpath``, not ``abspath``: the CLI resolves writes against canonical
+    paths, so a symlink component anywhere in ``spec.cwd`` would leave
+    ``abspath``-built deny targets unmatched — enforcement silently weakened
+    while the §4.4 self-check still sees ``request-review``.  Canonicalizing
+    here matches the init.cwd sanity check below (same module), which already
+    compares realpaths.
+
+    Raises on a falsy cwd: falling back to the empty path would silently
     anchor every deny rule to the *poller's* cwd — a mis-plumbed spec must
     fail loudly instead of enforcing nothing.
     """
@@ -470,7 +488,7 @@ def _rule_prefix(cwd: str) -> str:
             "antigravity permission rules require an explicit spec.cwd; "
             "refusing to target deny rules at the poller's working directory"
         )
-    path = os.path.abspath(str(cwd)).replace("\\", "/").rstrip("/")
+    path = os.path.realpath(str(cwd)).replace("\\", "/").rstrip("/")
     return path + "/"
 
 

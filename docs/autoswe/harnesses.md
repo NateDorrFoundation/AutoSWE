@@ -569,8 +569,15 @@ reviewer keep their read-only guarantees; `ensure_worktree_unchanged` stays
 only as the backstop it always was. Two facts shape the mechanism:
 
 - **`--mode plan` is advisory only** (spike P1 FAIL — the agent can keep
-  writing). It is still passed on `plan` runs as intent, but it is never the
-  security boundary.
+  writing; live re-confirm 2026-11-20: the CLI itself warns `--mode plan has
+  no effect while slash command expansion is disabled`, and autoSWE always
+  passes `--disable-slash-commands` (T11 mandatory), so on the agy profile
+  the flag is provably inert belt — the staged deny rules are the ONLY
+  enforcement layer). It is still passed on `plan` runs as intent, but it is
+  never the security boundary. The same live check confirmed the §4.4
+  self-check's expected attestation spelling on the real binary
+  (`init.permission_mode == "request-review"` under `--mode plan` + staged
+  `--settings`), so the fail-closed path does not misfire.
 - **The lever is `--settings <path>`** — a live-binary flag (absent from the
   mirrored docs) meaning "settings for this session only, never saved".
   `antigravity.py:_stage_run_config` (the ONE seam) stages a throwaway
