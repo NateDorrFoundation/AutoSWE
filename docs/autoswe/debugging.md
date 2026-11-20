@@ -66,6 +66,36 @@ Scripts are idempotent — running on a clean system prints an all-zero summary 
 
 Session state lives at `~/.claude/projects/<encoded-worktree-path>/<session-id>.jsonl`. The `session_id` is stored in `queue.json` for each task. Use it to locate the session file for inspection.
 
+## Antigravity (agy) Backend
+
+### Where agy Logs
+
+There is no single `agy.log`. Three places, in order of usefulness:
+
+- **Per-run CLI log file** — the profile's `log_dir`: the backend passes `--log-file <log_dir>/<uuid4hex>.log` (the uuid is chosen before the run because the conversation id is not known until `init` starts; the file is full NDJSON, and its `init`/`result` events carry the conversation id).
+- **The CLI's own host log** — `~/.gemini/antigravity-cli/cli.log`, with crash dumps in `~/.gemini/antigravity-cli/crashes/`.
+- **The per-issue autoSWE log** — `logs/<slug>/<slug>.log`, where the backend's `[ANTIGRAVITY]` lines land (run start with mode/enforcement/conversation, `init` with the attested `permission_mode`, usage, subtype).
+
+### Replaying a Conversation
+
+`agy --conversation <conversation_id>` — interactively. The id is the task's `session_id` in `queue.json` (`python autoswe.py queue status --repo O/R --issue N`); the per-issue log's `[ANTIGRAVITY] running ... conversation=<id>` line shows only the 8-char prefix, and the full id is also in the `init`/`result` events of the per-run CLI log in `log_dir`.
+
+### Soft-Deny Stderr Lines
+
+`headless mode cannot prompt` / `so it was auto-denied` on stderr means a tool that would have prompted the user was auto-denied in print mode — not a crash. The backend surfaces them as `[WARN][ANTIGRAVITY] soft-denied: ...` on `read_write` runs (first sign of a permission misconfiguration); on read-only runs the same lines are info-level `soft-denied (expected, read-only)` — there the denial is the point.
+
+### Auth-Expired Runs
+
+Symptom: `subtype=config_error` with error text matching `authentication required` / `authentication failed` / `authentication timed out` (the same non-retryable bucket also catches `not recognized as a known model` / `invalid model selection` — a wrong model slug looks the same as dead auth). `config_error` is deliberately outside `retryable_subtypes`: retrying a dead auth just burns attempts. Fix: run `agy` interactively once on the host to re-authenticate (or correct the profile's `model`).
+
+### Stale Per-Run Settings Dirs
+
+Each antigravity run stages its throwaway `--settings` permissions block in a private temp dir at `$TMPDIR/autoswe-agy-run-*` (system temp). Cleanup runs in a `finally` on every path — success, failure, kill, cancel — so leftovers only appear after a SIGKILL of the dispatcher itself. Safe to `rm -rf`.
+
+### Updates and PATH
+
+`agy` self-updates on interactive launch; `update.sh`/`update.ps1` deliberately never touch it (only `autoswe` code goes through the update scripts). The pinned floor is **1.5.11** (`MIN_AGY_VERSION`) — below it the backend logs `[WARN][ANTIGRAVITY] ... below the pinned floor ...` once per process but never fails the run. `agy` is **not** on the default non-login PATH (its install dir is `~/.local/bin`), so harness profiles must pin an absolute `cli_path`. `setup.sh`/`setup.ps1` print a one-time "run `agy` interactively once to authenticate" hint when any profile uses the antigravity backend; there is deliberately **no** agy warm-up — eager MCP tools work on a cold run (unlike pi).
+
 ## Common Failure Modes
 
 | Symptom | Label | Likely Cause | Fix |

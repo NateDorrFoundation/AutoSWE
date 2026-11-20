@@ -21,7 +21,7 @@ autoSWE is **queue-driven**, not label-driven:
 | [labels.md](labels.md) | The `autoswe:*` labels as a read-only mirror of `autoswe_status`; bot-marker convention |
 | [slash-commands.md](slash-commands.md) | User-facing commands, parsing, auto-resume, multi-command-last-wins |
 | [config.md](config.md) | autoswe.env keys, repos.json fields, model resolution, prompt templates |
-| [harnesses.md](harnesses.md) | Harness profiles (`harnesses.json`), pluggable coding backends (`claude_code`, `codex`, `pi`; `antigravity` candidate), per-phase resolution, capability degradation |
+| [harnesses.md](harnesses.md) | Harness profiles (`harnesses.json`), pluggable coding backends (`claude_code`, `codex`, `pi`, `antigravity`), per-phase resolution, capability degradation |
 | [providers.md](providers.md) | IssueTracker/VCSProvider protocols, GitHub + Azure backends, factory |
 | [git-worktrees.md](git-worktrees.md) | Per-repo clones, per-issue worktrees, branch naming, GC |
 | [safeguards.md](safeguards.md) | MAX_CONCURRENT, MAX_ATTEMPTS, time limits, completion anchor |
@@ -38,7 +38,7 @@ refresh commands live in each folder's README:
 - `docs/claude-agent-sdk/` — Claude Agent SDK (default backend)
 - `docs/codex/` — Codex CLI/app surfaces
 - `docs/pi/` — pi coding agent (JSON/RPC transports)
-- `docs/antigravity/` — Google Antigravity SDK + headless CLI (`agy -p`), MCP/tools — candidate backend
+- `docs/antigravity/` — Google Antigravity SDK + headless CLI (`agy -p`), MCP/tools
 - `docs/github-api/`, `docs/azure-devops-api/` — provider API references
 
 ## Derivation Rule

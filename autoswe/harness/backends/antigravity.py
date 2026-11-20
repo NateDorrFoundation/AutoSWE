@@ -124,6 +124,70 @@ _STDERR_TAIL_BYTES = 64 * 1024
 # the CLI itself is wedged.
 _HARD_TIMEOUT_SLACK = 30
 
+# Pinned CLI version floor (Phase 6 §6.2): the exact version the Phase 0 spike
+# validated (docs/autoswe/spike-antigravity.md: ``agy --version`` → 1.5.11,
+# one line, no prefix).  Kept in lockstep with tests/test_agy_cli_version.py,
+# which imports this constant; bumping the floor is a one-line change here plus
+# the version quoted in docs/autoswe/harnesses.md.  The installed CLI is
+# checked once per process (below) and a too-old CLI only warns — a version
+# drift must not fail a run whose stream still parses; the offline stream
+# fixtures are the behavioural contract.
+MIN_AGY_VERSION = "1.5.11"
+
+# Once-per-process guard for _warn_if_below_floor: the probe costs a
+# subprocess spawn, so at most one per poll-cycle process, ever.
+_agy_version_checked = False
+
+
+def _agy_version_tuple(version: str) -> tuple[int, ...]:
+    """Parse a dotted version into a comparable integer tuple.
+
+    ``"1.5.12"`` → ``(1, 5, 12)``.  Stdlib-only numeric run, same approach as
+    tests/test_cli_version.py's ``_vtuple``: no ``packaging`` dependency, and
+    ordering is by component, not lexical (1.5.9 < 1.5.11).
+    """
+    return tuple(int(part) for part in re.findall(r"\d+", version.split("(")[0]))
+
+
+def _query_agy_version(exe: str) -> str | None:
+    """Return ``agy --version`` output, or None if it cannot be queried."""
+    try:
+        proc = subprocess.run(
+            [exe, "--version"], capture_output=True, text=True, timeout=15
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or proc.stderr or "").strip() or None
+
+
+def _warn_if_below_floor(exe: str) -> None:
+    """Log ``[WARN]`` once per process when the installed agy is below the floor.
+
+    Best-effort by design (Phase 6 §6.2): an unqueryable CLI (missing flag on
+    some shim, timeout, unparseable output) is silently skipped — the floor is
+    operator guidance, and tests/test_agy_cli_version.py is the enforcement
+    point.  Never raises, never fails the run.
+    """
+    global _agy_version_checked
+    if _agy_version_checked:
+        return
+    _agy_version_checked = True
+    reported = _query_agy_version(exe)
+    if reported is None:
+        return
+    parts = _agy_version_tuple(reported)
+    if not parts:
+        return
+    if parts < _agy_version_tuple(MIN_AGY_VERSION):
+        log(
+            f"[WARN][ANTIGRAVITY] installed agy CLI {reported!r} (resolved to {exe}) is "
+            f"below the pinned floor {MIN_AGY_VERSION} (docs/autoswe/harnesses.md); "
+            "the CLI self-updates on interactive launch — run `agy` once to update, "
+            "or reinstall from the Antigravity installer."
+        )
+
 # Statuses the CLI may stamp on a terminal ``result`` event.  RUNNING should
 # never reach a result line; it is included defensively so an unexpected
 # status maps to a sane subtype instead of falling through the mapping.
@@ -1652,6 +1716,9 @@ class AntigravityBackend:
         exe, prefix_argv = _resolve_agy_executable(
             str(spec.cli_path or harness_cfg.get("cli_path") or "").strip()
         )
+        # Phase 6 §6.2: warn once per process when the installed CLI is below
+        # MIN_AGY_VERSION — guidance only, the run proceeds regardless.
+        _warn_if_below_floor(exe)
         argv = [
             exe, *prefix_argv,
             *_build_argv(spec, harness_cfg, schema_path, settings_args),

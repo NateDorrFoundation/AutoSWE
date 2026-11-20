@@ -2047,6 +2047,25 @@ def test_pi_mcp_merges_existing_agent_dir_mcp_json(tmp_path):
     assert data["settings"]["freezeDirectTools"] is True
 
 
+def test_pi_mcp_recovers_from_undecodable_mcp_json(tmp_path):
+    """A PowerShell ``>``-redirected UTF-16LE mcp.json raises UnicodeDecodeError
+    (a ValueError, not OSError) on the utf-8 read: _write_pi_mcp_json must log
+    and rewrite it like any corrupt file rather than crash every pi run.
+
+    Phase 6 follow-up to issue #322: the identical gap was closed in
+    antigravity.py's _merge_antigravity_mcp_config_locked.
+    """
+    from autoswe.harness.backends.pi import _write_pi_mcp_json
+
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    mcp = agent_dir / "mcp.json"
+    mcp.write_bytes('{"mcpServers": {"other_server": {}}}'.encode("utf-16"))
+    _write_pi_mcp_json(str(agent_dir))  # must not raise
+    data = json.loads(mcp.read_text(encoding="utf-8"))  # rewritten as valid UTF-8 JSON
+    assert "autoswe_comment" in data["mcpServers"]
+
+
 def test_pi_mcp_write_helper_no_agent_dir_is_noop(tmp_path):
     """_write_pi_mcp_json('') is a no-op — no agent_dir means no file written.
 

@@ -177,6 +177,8 @@ The agent that does the coding isn't hard-wired. A **harness profile** binds eac
 |---|---|---|
 | `claude_code` | Claude Agent SDK (default) | Full feature set — MCP, inline clarifying questions, plan capture, session resume |
 | `codex` | OpenAI Codex CLI (`codex exec`) | No Anthropic dependency; MCP/question features degrade gracefully |
+| `pi` | pi CLI (`pi --mode json`) | Read-only enforced via a tool allowlist; session fork; MCP comment posting via the pi-mcp-adapter |
+| `antigravity` | Antigravity CLI (`agy`, `stream-json` over stdin/stdout) | Read-only enforced via per-run `--settings`; resumes in place (no fork primitive); MCP comment posting via the agy global `mcp_config` registration |
 
 Run plan on Claude and fix on Codex, go all-Codex to drop the Anthropic dependency, or point a profile at a local Ollama model — it's per-phase, per-repo. See [Harnesses & Backends](docs/autoswe/harnesses.md).
 

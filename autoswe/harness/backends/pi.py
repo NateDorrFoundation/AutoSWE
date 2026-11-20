@@ -244,9 +244,13 @@ def _write_pi_mcp_json(agent_dir: str) -> None:
                 existing = json.load(f)
         if not isinstance(existing, dict):
             existing = {}
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
         # A corrupt/unreadable existing file would otherwise crash every pi run;
         # start fresh rather than die. The autoswe_comment entry is authoritative.
+        # UnicodeDecodeError (e.g. a PowerShell ``>``-redirected UTF-16LE file) is
+        # a ValueError, not an OSError: left uncaught it escapes as a hard run
+        # failure instead of degrading to a rewrite. Same gap Phase 5 closed in
+        # antigravity.py's _merge_antigravity_mcp_config_locked (issue #322).
         log(f"[PI] could not read existing {path} ({e}); rewriting")
         existing = {}
 

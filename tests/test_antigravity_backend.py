@@ -1884,3 +1884,81 @@ def test_subprocess_entry_matches_mcp_config_builder(agy_config_path):
     assert written["mcpServers"]["autoswe_comment"] == antigravity_comment_server(
         sys.executable, str(autoswe_repo_root())
     )
+
+
+# --- CLI version floor (Phase 6 §6.2) --------------------------------------
+
+
+def _reset_version_guard(monkeypatch):
+    monkeypatch.setattr(agy_mod, "_agy_version_checked", False)
+
+
+@pytest.mark.parametrize(
+    "reported,expected",
+    [
+        ("1.5.12", (1, 5, 12)),
+        ("  1.5.11\n", (1, 5, 11)),
+        ("1.10.2 (antigravity)", (1, 10, 2)),
+    ],
+)
+def test_agy_version_tuple_parses_cli_output(reported, expected):
+    assert agy_mod._agy_version_tuple(reported) == expected
+
+
+def test_agy_version_tuple_orders_by_component_not_lexically():
+    """1.5.9 < 1.5.11 — the trap a string comparison would fall into."""
+    assert agy_mod._agy_version_tuple("1.5.9") < agy_mod._agy_version_tuple("1.5.11")
+    assert agy_mod._agy_version_tuple("1.6.0") > agy_mod._agy_version_tuple("1.5.99")
+
+
+def test_warn_fires_once_per_process_below_floor(monkeypatch):
+    _reset_version_guard(monkeypatch)
+    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda exe: "1.5.10")
+    with patch.object(agy_mod, "log") as mock_log:
+        agy_mod._warn_if_below_floor("/usr/local/bin/agy")
+        agy_mod._warn_if_below_floor("/usr/local/bin/agy")
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    warns = [m for m in msgs if "[WARN]" in m and "below the pinned floor" in m]
+    assert len(warns) == 1, "warn must fire exactly once per process"
+
+
+def test_no_warn_at_or_above_floor(monkeypatch):
+    _reset_version_guard(monkeypatch)
+    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda exe: agy_mod.MIN_AGY_VERSION)
+    with patch.object(agy_mod, "log") as mock_log:
+        agy_mod._warn_if_below_floor("/usr/local/bin/agy")
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert not [m for m in msgs if "[WARN]" in m]
+    # And a newer CLI is equally silent.
+    monkeypatch.setattr(agy_mod, "_agy_version_checked", False)
+    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda exe: "99.0.1")
+    with patch.object(agy_mod, "log") as mock_log:
+        agy_mod._warn_if_below_floor("/usr/local/bin/agy")
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert not [m for m in msgs if "[WARN]" in m]
+
+
+def test_unqueryable_version_is_silent(monkeypatch):
+    """A CLI that cannot be queried never warns and never raises — enforcement
+    lives in tests/test_agy_cli_version.py, not in the run path."""
+    _reset_version_guard(monkeypatch)
+    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda exe: None)
+    with patch.object(agy_mod, "log") as mock_log:
+        agy_mod._warn_if_below_floor("/usr/local/bin/agy")  # must not raise
+    assert not [
+        c for c in mock_log.call_args_list if "[WARN]" in str(c.args[0] if c.args else "")
+    ]
+
+
+def test_run_path_checks_version_once_with_resolved_exe(monkeypatch):
+    """The wiring: every run consults the guard exactly once, with the resolved
+    executable (the probe itself is guarded process-wide inside it)."""
+    seen = []
+    monkeypatch.setattr(agy_mod, "_warn_if_below_floor", lambda exe: seen.append(exe))
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    _full_run(_spec(), proc)
+    assert len(seen) == 1
+
+
+def test_query_agy_version_swallows_missing_binary(tmp_path):
+    assert agy_mod._query_agy_version(str(tmp_path / "nope-agy")) is None
