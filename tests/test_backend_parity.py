@@ -271,15 +271,27 @@ class TestCommentToolNamesParity:
 
         assert CodexBackend.comment_tool_names() == CLAUDE_COMMENT_TOOL_NAMES
 
-    def test_antigravity_returns_claude_default(self):
-        """agy (no MCP until Phase 5) returns the Claude default, same as Codex."""
+    def test_antigravity_eager_single_underscore_names(self):
+        """Phase 5: agy's eager registration names the tools
+        ``mcp_<server>_<tool>`` — single underscores throughout (M2 pinned
+        ``mcp_autoswe_comment_post_plan`` on the real binary)."""
         from autoswe.harness.backends.antigravity import AntigravityBackend
-        from autoswe.harness.backends.base import CLAUDE_COMMENT_TOOL_NAMES
 
         names = AntigravityBackend.comment_tool_names()
-        assert names == CLAUDE_COMMENT_TOOL_NAMES
+        assert names == {
+            "post_plan": "mcp_autoswe_comment_post_plan",
+            "post_question": "mcp_autoswe_comment_post_question",
+            "update_progress": "mcp_autoswe_comment_update_progress",
+        }
         # The issue's parity requirement stated as an explicit key assertion.
         assert {"post_plan", "post_question", "update_progress"} <= set(names)
+        # Distinct from Claude (double underscore) AND from pi (the adapter's
+        # toolPrefix shape keeps a double underscore before the server name).
+        from autoswe.harness.backends.claude_code import ClaudeCodeBackend
+        from autoswe.harness.backends.pi import PiBackend
+
+        assert names != ClaudeCodeBackend.comment_tool_names()
+        assert names != PiBackend.comment_tool_names()
 
     def test_pi_names_differ_from_claude(self):
         """The whole point of Phase 3: pi and Claude spell the names differently."""
@@ -294,11 +306,18 @@ class TestCommentToolNamesParity:
         Guards against the returned dict drifting from the allowlist constant the
         parser/allowlist actually use (the two must stay in lockstep).
         """
+        from autoswe.harness.backends.antigravity import (
+            _ROLE_BY_EAGER_TOOL,
+            AntigravityBackend,
+        )
         from autoswe.harness.backends.claude_code import _MCP_COMMENT_TOOLS, ClaudeCodeBackend
         from autoswe.harness.backends.pi import _MCP_COMMENT_TOOL_NAMES, PiBackend
 
         assert set(ClaudeCodeBackend.comment_tool_names().values()) == set(_MCP_COMMENT_TOOLS)
         assert set(PiBackend.comment_tool_names().values()) == set(_MCP_COMMENT_TOOL_NAMES)
+        # agy: the names the prompt renders are exactly the eager names the
+        # stream classifier keys on.
+        assert set(AntigravityBackend.comment_tool_names().values()) == set(_ROLE_BY_EAGER_TOOL)
 
     def test_runner_dispatch_returns_backend_names(self):
         """runner.comment_tool_names() resolves through the factory per backend."""
@@ -310,6 +329,9 @@ class TestCommentToolNamesParity:
         assert comment_tool_names(
             {"backend": "pi", "model": "claude-sonnet-4-5"}
         )["post_plan"] == "mcp__autoswe_comment_post_plan"
+        assert comment_tool_names(
+            {"backend": "antigravity", "model": "gemini-test"}
+        )["post_plan"] == "mcp_autoswe_comment_post_plan"
 
     def test_runner_dispatch_defaults_to_claude(self):
         """With no harness cfg, runner.comment_tool_names() gives the Claude default."""
@@ -597,7 +619,8 @@ class TestCapabilityHonesty:
 
         Phase 1 gained resume + progress_stream + structured_output; Phase 4
         added "mode" (per-run ``--settings`` deny enforcement, so the planner
-        no longer loudly degrades for agy).  Still out: "mcp" (Phase 5),
+        no longer loudly degrades for agy); Phase 5 added "mcp" (eager
+        autoswe_comment tools, stream-parsed posted flags).  Still out:
         "session_fork" (agy resumes in place — no fork primitive), "plan_file",
         and the Claude-only SDK levers "can_use_tool"/"plan_permission".
         """
@@ -605,8 +628,9 @@ class TestCapabilityHonesty:
 
         caps = AntigravityBackend.capabilities()
         assert "mode" in caps, "Phase 4: agy must advertise mode read-only enforcement"
+        assert "mcp" in caps, "Phase 5: agy must advertise MCP comment posting"
         unsupported = {
-            "mcp", "can_use_tool", "plan_permission",
+            "can_use_tool", "plan_permission",
             "plan_file", "session_fork",
         }
         overlap = caps & unsupported
@@ -835,8 +859,9 @@ class TestRunnerDispatcherParity:
 
         Phase 1: resume + progress_stream + structured_output; Phase 4 added
         mode (plan/review are now ENFORCED via the staged --settings deny
-        block, no loud-degrade).  Still out: mcp (Phase 5), session_fork
-        (/retry degrades to a fresh run), can_use_tool/plan_file.
+        block, no loud-degrade); Phase 5 added mcp (the planner's has_mcp
+        branch engages).  Still out: session_fork (/retry degrades to a fresh
+        run), can_use_tool/plan_file.
         """
         from autoswe.harness.runner import backend_has_capability
 
@@ -845,7 +870,7 @@ class TestRunnerDispatcherParity:
         assert backend_has_capability(harness, "progress_stream")
         assert backend_has_capability(harness, "structured_output")
         assert backend_has_capability(harness, "mode")
-        assert not backend_has_capability(harness, "mcp")
+        assert backend_has_capability(harness, "mcp")
         assert not backend_has_capability(harness, "session_fork")
         assert not backend_has_capability(harness, "can_use_tool")
         assert not backend_has_capability(harness, "plan_permission")

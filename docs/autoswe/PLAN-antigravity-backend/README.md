@@ -1,6 +1,8 @@
 # Plan — add `antigravity` as a first-class coding backend
 
-**Status:** Phase 0 complete — spike verdict in
+**Status:** Phases 0–5 complete (Phase 5 = MCP comment posting, issue #322;
+the Phase 5 live exit criterion is open for the Phase 6 dedicated-box pass) —
+spike verdict in
 [`spike-antigravity.md`](../spike-antigravity.md): transport = headless CLI (BYOK
 bridge auth), **GO** on stdin transport / `mode` via per-run `--settings` / MCP
 eager+env / `structured_output` (advisory — validate downstream) (run 2026-11-18,

@@ -144,7 +144,7 @@ class TestAntigravityFakeFidelity:
         assert result.subtype == "success"
 
     def test_questions_mcp_off_by_default(self):
-        """mcp=False (the Phase 3 default) emits NO tool step — text path only."""
+        """mcp=False (the text-fallback default) emits NO tool step."""
         fake = AntigravityFake()
         fake.script_questions("Which DB?", session_id="conv-q")
 
@@ -153,20 +153,57 @@ class TestAntigravityFakeFidelity:
 
         assert not any("post_question" in ln for ln in lines)
 
-    def test_questions_mcp_on_emits_tool_step_but_no_flag(self):
-        """Phase 5 switch ON: an eager post_question tool step streams, but
-        without the "mcp" capability the parser does NOT set question_posted —
-        the text tags are what drive WAITING in Phase 3/7."""
+    def test_questions_mcp_on_emits_eager_step_and_sets_flag(self):
+        """Phase 5 switch ON: the eager post_question step streams under the
+        agy spelling, and the backend now advertises "mcp" — so the parser
+        DOES set question_posted (the text tags are gone: the question is on
+        the thread via MCP)."""
         fake = AntigravityFake()
         fake.script_questions("Which DB?", session_id="conv-q", mcp=True)
 
         lines: list[str] = []
         result = _run(_spec(progress_callback=lines.append), fake)
 
-        assert any("mcp__autoswe_comment__post_question" in ln for ln in lines), (
+        assert any("mcp_autoswe_comment_post_question" in ln for ln in lines), (
             f"mcp=True must stream the eager post_question step; got {lines!r}"
         )
-        assert result.question_posted is False
+        assert result.question_posted is True
+
+    def test_questions_mcp_lazy_emits_proxy_and_sets_flag(self):
+        """mcp="lazy" scripts the call_mcp_tool proxy shape; the parser's
+        fallback branch still classifies it."""
+        fake = AntigravityFake()
+        fake.script_questions("Which DB?", session_id="conv-q", mcp="lazy")
+
+        lines: list[str] = []
+        result = _run(_spec(progress_callback=lines.append), fake)
+
+        assert any("call_mcp_tool" in ln for ln in lines), lines
+        assert result.question_posted is True
+
+    def test_plan_mcp_on_sets_plan_posted_with_body(self):
+        """script_plan(mcp=True): eager post_plan pair (shared step_index),
+        plan_posted + plan_posted_body captured for the #241 re-push."""
+        fake = AntigravityFake()
+        fake.script_plan("Step 1: do the thing", session_id="conv-p", mcp=True)
+
+        result = _run(_spec(), fake)
+
+        assert result.plan_posted is True
+        assert result.plan_posted_body == "Step 1: do the thing"
+        assert "<AUTOSWE_PLAN>" not in result.text
+
+    def test_plan_mcp_error_unsets_the_flag(self):
+        """mcp_error=True: terminal step carries tool_info.error — §5.3 says
+        the parser must un-set plan_posted so the text fallback stays live."""
+        fake = AntigravityFake()
+        fake.script_plan("never posted", session_id="conv-e",
+                         mcp=True, mcp_error=True)
+
+        result = _run(_spec(), fake)
+
+        assert result.plan_posted is False
+        assert result.plan_posted_body is None
 
     def test_fix_progress_labels(self):
         """script_fix(files=...) surfaces per-file progress via the callback."""

@@ -15,8 +15,11 @@ runs a turn for each; closing stdin ends the run).  This keeps a 10-20 KB
 ``/fix`` prompt off the command line (Windows' ``cmd /c`` shim caps at ~8191
 chars) and avoids quoting hazards entirely.
 
-**Capabilities (Phase 4):** ``resume``, ``progress_stream``,
-``structured_output``, ``mode`` — ``mcp`` arrives in Phase 5.  With ``mode``
+**Capabilities (Phase 4 + 5):** ``resume``, ``progress_stream``,
+``structured_output``, ``mode``, ``mcp``.  With ``mcp`` advertised the agent
+posts plans/questions/progress through the shared ``autoswe_comment`` server
+and ``planner.py``'s ``has_mcp`` branch turns on for this backend (no more
+``<AUTOSWE_PLAN>`` scraping on MCP runs).  With ``mode``
 advertised, ``has_read_only_enforcement`` is True and the planner/reviewer
 loud-degrade warnings (issue #166) stop for this backend;
 ``ensure_worktree_unchanged`` still runs as the unconditional backstop.
@@ -24,6 +27,21 @@ There is **no fork primitive**: ``agy`` resumes a conversation in place
 (``--conversation``), so ``fork_session`` is logged and treated as resume
 (the runner's capability gate keeps it from happening; the log line is a
 guard).
+
+**MCP comment posting (Phase 5, spike §0.4 M2–M5).** The ``autoswe_comment``
+server is registered in the agy **global** ``~/.gemini/config/mcp_config.json``
+(entry-scoped merge, ``_merge_antigravity_mcp_config`` — foreign servers
+preserved, never a worktree ``.agents/mcp_config.json``, which M4 proved can
+never shadow the global entry anyway).  The file carries **stable values only**
+(python path, repo root): per-task ``AUTOSWE_*`` env rides the ``agy``
+subprocess env, which M3 proved the MCP child inherits (same stable-file
+design as ``pi.py:_write_pi_mcp_json``).  The entry's tools are **eager**, so
+the agent's calls surface as first-class tool steps named
+``mcp_autoswe_comment_<tool>`` (M2-confirmed spelling); the lazy
+``call_mcp_tool`` proxy shape is parsed as a fallback.  Classification happens
+on the ``ACTIVE`` step and is **un-set on a ``DONE``/``ERROR`` step carrying
+``tool_info.error``** — stricter than pi (which classifies on start): a failed
+post must not count as posted, or the planner would skip its text fallback.
 
 **Read-only enforcement (Phase 4, spike §0.3):** ``--mode plan`` is
 **advisory only** (P1: a plan-mode run wrote files anyway) — it is never a
@@ -69,18 +87,21 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 from collections.abc import Awaitable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from autoswe.core.logging_utils import get_debug_logger, log
-from autoswe.harness.backends.base import (
-    CLAUDE_COMMENT_TOOL_NAMES,
-    RunResult,
-    RunSpec,
+from autoswe.harness.backends.base import RunResult, RunSpec
+from autoswe.harness.mcp_config import (
+    antigravity_mcp_config_path,
+    autoswe_repo_root,
+    build_antigravity_mcp_config,
 )
 
 # Internal diagnostics (forward-compat skips) go to the debug logger only —
@@ -161,6 +182,283 @@ _FILE_TOOL_VERBS = {
     "list_dir": "list",
     "grep_search": "grep",
 }
+
+
+# ---------- MCP comment tools (Phase 5, spike §0.4 M2) ----------
+
+# The autoswe_comment server's three tools as the agy CLI names them when the
+# config entry registers them eagerly (``"eager": true``): ``mcp_<server>_<tool>``
+# with SINGLE underscores (docs/antigravity/mcp.md "Eager loading").  Phase 0
+# M2 confirmed the spelling live: exactly ``mcp_autoswe_comment_post_plan``.
+# This dict is the single source of truth (CodingBackend.comment_tool_names
+# contract): the prompt placeholders render from it, the stream classifier
+# matches on it, and the config entry's eager list keys the same three tools.
+ANTIGRAVITY_COMMENT_TOOL_NAMES: dict[str, str] = {
+    "post_plan": "mcp_autoswe_comment_post_plan",
+    "post_question": "mcp_autoswe_comment_post_question",
+    "update_progress": "mcp_autoswe_comment_update_progress",
+}
+
+# Logical role per tool (mirrors pi's _MCP_COMMENT_TOOL_KINDS): post_plan /
+# post_question set the RunResult already-posted flags; update_progress feeds
+# the live progress callback.
+_MCP_COMMENT_TOOL_KINDS: tuple[tuple[str, str], ...] = (
+    ("post_plan", "plan"),
+    ("post_question", "question"),
+    ("update_progress", "progress"),
+)
+
+# eager tool name -> role, for the classifier's direct-shape branch.
+_ROLE_BY_EAGER_TOOL: dict[str, str] = {
+    ANTIGRAVITY_COMMENT_TOOL_NAMES[bare]: kind for bare, kind in _MCP_COMMENT_TOOL_KINDS
+}
+
+# The lazy proxy built-in (docs/antigravity/mcp.md "lazy vs eager" step 3):
+# an agent that reads the tool schema from disk invokes every lazy MCP tool
+# through this one, with parameters {ServerName, ToolName, Arguments}.  Eager
+# registration is the primary path; this is the built-in fallback if a future
+# CLI keeps the tools lazy despite the config.
+_LAZY_PROXY_TOOL_NAME = "call_mcp_tool"
+
+
+def _coerce_args(value) -> dict:
+    """Coerce a lazy-proxy ``Arguments`` value into a dict (pi's twin).
+
+    ``Arguments`` may arrive as an object or as a JSON string; returns ``{}``
+    for anything that is not (or does not parse into) a dict.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _classify_mcp_comment_call(step: dict) -> tuple[str | None, str]:
+    """Classify a ``tool`` step_update as an autoswe_comment call.
+
+    Returns ``(role, body)`` where *role* is ``"plan"`` / ``"question"`` /
+    ``"progress"`` / ``None`` and *body* is the tool's ``body`` argument
+    (``""`` when absent).  Two shapes reach here (§5.3):
+
+    - **eager / direct** — ``tool_name`` is one of the
+      ``ANTIGRAVITY_COMMENT_TOOL_NAMES`` values; the body rides in
+      ``tool_info.parameters.body``.
+    - **lazy proxy** — ``tool_name == "call_mcp_tool"`` with parameters
+      ``{ServerName: "autoswe_comment", ToolName: <tool>, Arguments: {body}}``
+      (``Arguments`` may be a JSON string, so ``_coerce_args`` it).
+    """
+    tool_name = str(step.get("tool_name") or "")
+    tool_info = step.get("tool_info")
+    params = tool_info.get("parameters") if isinstance(tool_info, dict) else None
+    if not isinstance(params, dict):
+        params = {}
+
+    if tool_name in _ROLE_BY_EAGER_TOOL:
+        role = _ROLE_BY_EAGER_TOOL[tool_name]
+        body = params.get("body")
+    elif tool_name == _LAZY_PROXY_TOOL_NAME and str(params.get("ServerName") or "") == "autoswe_comment":
+        target = str(params.get("ToolName") or "")
+        # Suffix, not exact: the proxy may report ToolName bare (``post_plan``)
+        # or fully qualified (``autoswe_comment_post_plan``); both classify.
+        role = next(
+            (kind for bare, kind in _MCP_COMMENT_TOOL_KINDS
+             if target == bare or target.endswith("_" + bare)),
+            None,
+        )
+        body = _coerce_args(params.get("Arguments")).get("body")
+    else:
+        return None, ""
+
+    if not isinstance(body, str):
+        body = ""
+    return role, body
+
+
+def _mcp_comment_active(spec: RunSpec) -> bool:
+    """True when the run's ``spec.mcp_servers`` names the autoswe_comment server.
+
+    The Phase 5 trigger, mirroring ``pi.py:_mcp_comment_active``: it both
+    merges the stable entry into the agy global config and routes the entry's
+    per-task ``env`` block into the subprocess env (never the file).
+    """
+    servers = spec.mcp_servers or {}
+    cfg = servers.get("autoswe_comment") if isinstance(servers, dict) else None
+    return isinstance(cfg, dict)
+
+
+# The only keys autoSWE ever writes into the global mcpServers map.  An owned
+# key present on disk but absent from the current run's owned set is a stale
+# autoSWE entry — e.g. an ``autoswe_inline_comment`` left behind by a GitHub
+# fix run now facing a review/Azure run with no inline spec — and is pruned,
+# so the agent never sees a registered server that can only fail server-side.
+# Foreign keys are never in this tuple and are therefore never touched.
+_OWNED_MCP_KEYS = ("autoswe_comment", "autoswe_inline_comment")
+
+
+if sys.platform == "win32":  # pragma: no cover - exercised on Windows hosts
+    import msvcrt
+
+    def _lock_file_exclusive(f) -> None:
+        # LK_LOCK blocks in ~1/8 s steps for up to 10 s, then raises OSError —
+        # bounded on purpose so a wedged holder can never stall a run forever.
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+
+    def _unlock_file(f) -> None:
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _lock_file_exclusive(f) -> None:
+        # Advisory to any other flock() user — every autoSWE writer of this
+        # file takes the same lock, which is the whole race class we own.
+        fcntl.flock(f, fcntl.LOCK_EX)
+
+    def _unlock_file(f) -> None:
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _unlock_file_safely(f) -> None:
+    # Best-effort, and closing the fd right after releases the lock anyway.
+    try:
+        _unlock_file(f)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _advisory_mcp_lock(config_path: Path):
+    """Hold an advisory exclusive lock on the sibling ``<config>.lock``.
+
+    Best-effort: a failed mkdir/open logs and the body runs unlocked; a
+    failed lock (wedged holder past the bounded Windows wait) likewise logs
+    and proceeds — the merge must never fail on lock problems.  ``yielded``
+    flips immediately before the first yield, so an OSError raised *by the
+    body* re-raises instead of falling into the acquisition-failure arm —
+    the generator yields exactly once on every path.
+    """
+    lock_path = config_path.with_name(config_path.name + ".lock")
+    yielded = False
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+b") as f:
+            try:
+                _lock_file_exclusive(f)
+            except OSError as e:
+                log(f"[WARN][ANTIGRAVITY] could not lock {lock_path} ({e}); merging unlocked")
+            yielded = True
+            try:
+                yield
+            finally:
+                _unlock_file_safely(f)
+    except OSError as e:
+        if yielded:
+            raise
+        log(f"[WARN][ANTIGRAVITY] could not lock {lock_path} ({e}); merging unlocked")
+        yield
+
+
+def _merge_antigravity_mcp_config(owned_entries: dict[str, dict]) -> None:
+    """Entry-scoped merge of autoSWE's servers into the agy global mcp_config.
+
+    Only called when a run names the comment server (``_mcp_comment_active``).
+    autoSWE owns **only** the keys in *owned_entries* (``autoswe_comment`` and
+    optionally ``autoswe_inline_comment``) — every other server and top-level
+    key an operator put in the file is preserved, exactly like
+    ``pi.py:_write_pi_mcp_json``.  Owned keys present on disk but absent from
+    *owned_entries* are stale and pruned (see ``_OWNED_MCP_KEYS``).  The file
+    carries stable values only (per-task env rides the subprocess env, M3),
+    so the serialized bytes are equal for every task: **compare before
+    writing** and skip the write when the file already matches (the
+    host-stable file is written once).
+
+    The whole read-modify-write (read, merge, prune, write) is serialised
+    under an advisory exclusive lock on a sibling ``<file>.lock``.  The prune
+    makes the owned-entry sets differ between concurrent runs (a GitHub fix
+    run owns ``autoswe_inline_comment``; a concurrent plan/Azure run prunes
+    it), so last-writer-wins is NOT benign — without the lock a run's agy
+    child could load a config that another run already pruned a live entry
+    out of.  Locking is best-effort like everything else here: any OSError
+    (uncreatable lock file, wedged holder past the bounded wait) logs and
+    proceeds unlocked rather than failing the run.
+    """
+    path = antigravity_mcp_config_path()
+    with _advisory_mcp_lock(path):
+        _merge_antigravity_mcp_config_locked(owned_entries, path)
+
+
+def _merge_antigravity_mcp_config_locked(
+    owned_entries: dict[str, dict], path: Path
+) -> None:
+    """Read-merge-prune-write core, called under ``_lock_file_exclusive``."""
+    existing: dict = {}
+    raw: str | None = None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError (e.g. a PowerShell ``>``-redirected UTF-16LE
+        # file) is a ValueError, not an OSError: left uncaught it would
+        # escape _run_async as a hard task FAILED instead of degrading to
+        # the text fallback this function's contract promises.
+        log(f"[WARN][ANTIGRAVITY] could not read existing {path} ({e}); rewriting")
+    if raw is not None:
+        try:
+            existing = json.loads(raw)
+        except json.JSONDecodeError as e:
+            # A corrupt file would otherwise keep the entry from ever landing;
+            # the autoswe entries are authoritative, so start fresh.
+            log(f"[WARN][ANTIGRAVITY] {path} is not valid JSON ({e}); rewriting")
+            existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+
+    servers = existing.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers.update(owned_entries)
+    for key in _OWNED_MCP_KEYS:
+        if key not in owned_entries:
+            servers.pop(key, None)
+    existing["mcpServers"] = servers
+
+    payload = json.dumps(existing, indent=2) + "\n"
+    if raw is not None and payload == raw:
+        # Idempotent: stable values, stable bytes — skip the write.
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic replace, not a truncating open("w"): the advisory lock
+        # serialises autoSWE *writers*, but the agy child reads WITHOUT it,
+        # so a concurrent rewrite could be caught mid-truncation by a
+        # freshly-spawned agy (torn/empty config, server silently missing).
+        # Same-directory temp + os.replace means a reader only ever sees the
+        # old or the new complete file (atomic rename on POSIX; Windows
+        # os.replace replaces despite open read handles).
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp_name, path)
+        except OSError:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        log(f"[ANTIGRAVITY] wrote autoswe_comment config to {path}")
+    except OSError as e:
+        log(f"[WARN][ANTIGRAVITY] could not write {path}: {e} — MCP tools may be unavailable (text fallback)")
 
 
 # ---------- Read-only mode table (Phase 4, spike §0.3 / plan §4.3) ----------
@@ -301,6 +599,28 @@ class _AgyAccumulator:
     # Tool-level errors seen on step_update (README lesson #4: a failed tool
     # is NOT a run failure — do NOT set error_flag here).
     tool_errors: list[str] = field(default_factory=list)
+    # MCP already-posted flags (Phase 5).  Set when an ACTIVE tool step
+    # classifies (via _classify_mcp_comment_call) as post_plan / post_question;
+    # these feed RunResult.plan_posted / question_posted so the planner's
+    # has_mcp branch sees the comment already on the thread.
+    plan_posted: bool = False
+    question_posted: bool = False
+    # The post_plan tool's ``body`` argument (the plan markdown), captured on
+    # the ACTIVE step so the planner can finalize the sticky planning comment
+    # in place after the run — the last call's body wins (issue #241).
+    # None when post_plan was never called with a non-empty body.
+    plan_posted_body: str | None = None
+    # step_index -> role for IN-FLIGHT comment calls, so the DONE/ERROR step
+    # can un-set the flag when the post failed (§5.3: stricter than pi, which
+    # classifies on start and never looks back).  step_index is always present
+    # in fixture-confirmed streams; a missing one is tracked under -1 (the
+    # un-set then degrades to the conservative direction).
+    _comment_steps: dict[int, str] = field(default_factory=dict)
+    # Outstanding (ACTIVE, not yet resolved) post_plan / post_question call
+    # counts.  The flags derive from ``count > 0`` so a failed second call
+    # cannot wipe a successful first one's flag, and vice versa.
+    _plan_calls: int = 0
+    _question_calls: int = 0
 
 
 # ---------- Executable resolution ----------
@@ -877,6 +1197,48 @@ def _parse_line(line: str, acc: _AgyAccumulator, callback) -> None:
 
         elif step_type == "tool":
             if state == "ACTIVE":
+                # Phase 5: classify the call on the START step (the tool may
+                # never reach a DONE the parser sees, e.g. a hard kill
+                # mid-post — same optimistic-set rationale as pi).  A tracked
+                # DONE/ERROR WITH tool_info.error un-sets it again below, so
+                # an answered-but-failed post never suppresses the planner's
+                # text fallback (§5.3).
+                role, body = _classify_mcp_comment_call(step)
+                if role is not None:
+                    index = step.get("step_index")
+                    if not isinstance(index, int):
+                        index = -1
+                    if role == "plan":
+                        if acc.question_posted:
+                            # Question-terminal precedence (issue #230): the
+                            # run already asked the user, so a post_plan that
+                            # follows must NOT flip the outcome back to a
+                            # posted plan — same rule and log shape as pi.
+                            # Deliberately NOT counted and NOT tracked: this
+                            # call never entered _plan_calls, so a later
+                            # error-DONE for it must not decrement the count
+                            # and wipe an earlier successful plan's flag.
+                            log("[ANTIGRAVITY] post_plan ignored — post_question already observed in this run (question-terminal)")
+                        else:
+                            acc._plan_calls += 1
+                            acc.plan_posted = True
+                            # Capture the body so the planner can finalize the
+                            # sticky planning comment in place (#241); the
+                            # last non-empty body wins.
+                            if body:
+                                acc.plan_posted_body = body
+                            log(f"[ANTIGRAVITY] autoswe_comment post_plan (body {len(body)} chars)")
+                            acc._comment_steps[index] = role
+                    elif role == "question":
+                        acc._question_calls += 1
+                        acc.question_posted = True
+                        log(f"[ANTIGRAVITY] autoswe_comment post_question (body {len(body)} chars)")
+                        acc._comment_steps[index] = role
+                    elif role == "progress":
+                        # update_progress drives the live progress callback
+                        # with its body so the operator sees the status line.
+                        if callback and body:
+                            callback(body[:200])
                 if callback:
                     callback(f"Tool: {_tool_label(step)}")
             elif state in ("DONE", "ERROR"):
@@ -887,6 +1249,32 @@ def _parse_line(line: str, acc: _AgyAccumulator, callback) -> None:
                 # NOT set error_flag.
                 tool_info = step.get("tool_info")
                 err = tool_info.get("error") if isinstance(tool_info, dict) else None
+                # Phase 5 §5.3: a FAILED comment post must not count as
+                # posted, or the planner's has_mcp branch would skip the text
+                # fallback while nothing is on the thread.  Resolve the
+                # in-flight call tracked from the ACTIVE step.
+                index = step.get("step_index")
+                if not isinstance(index, int):
+                    index = -1
+                role = acc._comment_steps.pop(index, None)
+                if role is not None and err:
+                    if role == "plan":
+                        acc._plan_calls = max(0, acc._plan_calls - 1)
+                        acc.plan_posted = acc._plan_calls > 0
+                        if not acc.plan_posted:
+                            acc.plan_posted_body = None
+                        still = acc.plan_posted
+                    elif role == "question":
+                        acc._question_calls = max(0, acc._question_calls - 1)
+                        acc.question_posted = acc._question_calls > 0
+                        still = acc.question_posted
+                    else:
+                        still = False
+                    # Count-based: only un-set when no successful call of this
+                    # role remains; say so truthfully in the log.
+                    log(f"[ANTIGRAVITY] autoswe_comment post_{role} FAILED — "
+                        + ("posted flag kept (another call succeeded)" if still
+                           else "un-set posted flag (planner text fallback stays available)"))
                 if isinstance(err, dict):
                     name = str(step.get("tool_name") or tool_info.get("name") or "tool")
                     etype_ = str(err.get("type", "error"))
@@ -1054,9 +1442,12 @@ def _finalize(
         cost_usd=None,
         duration_seconds=duration_seconds,
         plan_file_path=None,
-        # Phase 5 (MCP) sets the posted flags; Phase 1 has no comment tools.
-        plan_posted=False,
-        question_posted=False,
+        # Phase 5 (MCP): set from the stream by _parse_line.  A killed or
+        # overflowed stream never invents plan_posted — the flags only ever
+        # reflect tool calls actually seen (and un-set if their post failed).
+        plan_posted=acc.plan_posted,
+        question_posted=acc.question_posted,
+        plan_posted_body=acc.plan_posted_body,
         structured_output=acc.structured_output,
     )
 
@@ -1116,7 +1507,7 @@ class AntigravityBackend:
     T8/T9).
     """
 
-    # Phase 1 honest set + Phase 4's ``mode``:
+    # Phase 1 honest set + Phase 4's ``mode`` + Phase 5's ``mcp``:
     #   resume           — --conversation <id> (T7 confirmed headless resume)
     #   progress_stream  — step_update events drive progress_callback
     #   structured_output— --json-schema + result.structured_output (T6,
@@ -1125,10 +1516,16 @@ class AntigravityBackend:
     #                      read-only on plan/read_only phases (§4.2/§4.3);
     #                      this is what flips has_read_only_enforcement to
     #                      True and stops the issue #166 loud-degrade.
-    # NOT advertised: mcp (Phase 5), session_fork (no primitive),
-    # can_use_tool, plan_file.
+    #   mcp              — eager autoswe_comment registration in the agy
+    #                      global mcp_config.json (M2 tool naming, M3 env
+    #                      inheritance); the stream classifier turns the
+    #                      post_plan/post_question steps into the
+    #                      plan_posted/question_posted flags, which is what
+    #                      turns on planner.py's has_mcp branch (no more
+    #                      <AUTOSWE_PLAN> scraping on MCP runs).
+    # NOT advertised: session_fork (no primitive), can_use_tool, plan_file.
     CAPABILITIES: set[str] = {
-        "resume", "progress_stream", "structured_output", "mode",
+        "resume", "progress_stream", "structured_output", "mode", "mcp",
     }
     RETRYABLE_SUBTYPES: set[str] = {"error", "killed"}
 
@@ -1138,13 +1535,17 @@ class AntigravityBackend:
 
     @classmethod
     def comment_tool_names(cls) -> dict[str, str]:
-        """Claude defaults — agy has no MCP yet (Phase 5 overrides).
+        """The agy eager spellings: ``mcp_autoswe_comment_<tool>``.
 
-        Same precedent as Codex: a prompt placeholder still renders to a
-        concrete tool name and the missing-tool case degrades to the text
-        fallback.
+        Single underscores after the server name (agy naming, M2-confirmed
+        exactly ``mcp_autoswe_comment_post_plan``) — unlike Claude Code's
+        double-underscore ``mcp__autoswe_comment__post_plan``.  This dict is
+        the single source of truth: the prompt placeholders render from it,
+        and the stream classifier matches the same names, so the names the
+        agent is granted, the names the parser recognizes, and the names the
+        prompt references can never drift apart.  Fresh dict each call.
         """
-        return dict(CLAUDE_COMMENT_TOOL_NAMES)
+        return dict(ANTIGRAVITY_COMMENT_TOOL_NAMES)
 
     @classmethod
     def retryable_subtypes(cls) -> set[str]:
@@ -1275,6 +1676,54 @@ class AntigravityBackend:
         # backend's own isolation.  Never written back to os.environ.
         if env_patch:
             env.update(env_patch)
+
+        # Phase 5 MCP wiring — same design as pi, same proof behind it:
+        # stable values in the config file, per-task values in THIS process's
+        # env.  M3 proved the MCP child inherits agy's process env, so the
+        # server entry's per-task ``env`` block (comment id, owner/repo, PAT,
+        # provider, …) is merged into the subprocess env here and NEVER into
+        # mcp_config.json — the file carries stable bytes and is written at
+        # most once per host.  The merge itself is entry-scoped (foreign
+        # servers preserved) and best-effort (a write failure logs and the
+        # run degrades to the text fallback).
+        mcp_servers = spec.mcp_servers or {}
+        if _mcp_comment_active(spec):
+            comment_cfg = mcp_servers.get("autoswe_comment")
+            inline_cfg = mcp_servers.get("autoswe_inline_comment") \
+                if isinstance(mcp_servers, dict) else None
+            # Seeded from the spec-mandated builder so the backend and
+            # ``build_antigravity_mcp_config`` can never drift (the builder
+            # owns the launch triple, timeoutSeconds and the eager tools;
+            # cwd is its autoSWE-checkout-root, not spec.cwd — the builder
+            # already pins that).
+            owned: dict[str, dict] = dict(
+                build_antigravity_mcp_config(
+                    sys.executable, str(autoswe_repo_root())
+                )["mcpServers"]
+            )
+            if isinstance(inline_cfg, dict):
+                # Verbatim launch bits (no eager ``tools`` block — lazy is
+                # fine for the review-only inline server).  ``env`` is
+                # stripped: it must never reach the file.  ``cwd`` is added
+                # even though ``build_mcp_inline_comment_server`` omits it:
+                # agy spawns with cwd=spec.cwd (the target worktree) and the
+                # entry's cwd defaults to that when unset
+                # (docs/antigravity/mcp.md), where
+                # ``python -m mcp_servers.autoswe_inline_comment_server``
+                # cannot resolve — the mcp_servers package lives at the
+                # autoSWE checkout root, same lever as the primary entry.
+                owned["autoswe_inline_comment"] = {
+                    **{k: v for k, v in inline_cfg.items() if k != "env"},
+                    "cwd": str(autoswe_repo_root()),
+                }
+                inline_env = inline_cfg.get("env")
+                if isinstance(inline_env, dict):
+                    env.update(inline_env)
+            if isinstance(comment_cfg, dict):
+                server_env = comment_cfg.get("env")
+                if isinstance(server_env, dict):
+                    env.update(server_env)
+            _merge_antigravity_mcp_config(owned)
 
         run_mode = str(spec.mode or "read_write")
         read_only = run_mode in _READ_ONLY_MODES

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,11 +19,14 @@ import pytest
 
 import autoswe.harness.backends.antigravity as agy_mod
 from autoswe.harness.backends.antigravity import (
+    ANTIGRAVITY_COMMENT_TOOL_NAMES,
     AntigravityBackend,
     _AgyAccumulator,
     _build_argv,
+    _classify_mcp_comment_call,
     _finalize,
     _kill_tree,
+    _mcp_comment_active,
     _parse_line,
     _resolve_agy_executable,
     _tool_label,
@@ -881,15 +885,18 @@ def test_kill_tree_falls_back_when_group_gone(monkeypatch):
 def test_backend_contract():
     backend = AntigravityBackend()
     assert isinstance(backend, CodingBackend)
-    # Phase 1 honest set + Phase 4's mode (mcp/session_fork stay unadvertised:
-    # Phase 5 / no fork primitive respectively).
+    # Phase 1 honest set + Phase 4's mode + Phase 5's mcp (session_fork stays
+    # unadvertised: agy has no fork primitive).
     assert backend.capabilities() == {
-        "resume", "progress_stream", "structured_output", "mode",
+        "resume", "progress_stream", "structured_output", "mode", "mcp",
     }
-    # Fresh dict each call, Claude defaults until Phase 5.
-    assert backend.comment_tool_names() == CLAUDE_COMMENT_TOOL_NAMES
+    # Fresh dict each call, agy eager spellings since Phase 5 (single
+    # underscores — NOT the Claude double-underscore shape).
+    assert backend.comment_tool_names() == ANTIGRAVITY_COMMENT_TOOL_NAMES
+    assert "mcp_autoswe_comment_post_plan" in ANTIGRAVITY_COMMENT_TOOL_NAMES.values()
+    assert CLAUDE_COMMENT_TOOL_NAMES != ANTIGRAVITY_COMMENT_TOOL_NAMES
     backend.comment_tool_names()["post_plan"] = "mutated"
-    assert backend.comment_tool_names() == CLAUDE_COMMENT_TOOL_NAMES
+    assert backend.comment_tool_names() == ANTIGRAVITY_COMMENT_TOOL_NAMES
     assert backend.retryable_subtypes() == {"error", "killed"}
     assert asyncio.TimeoutError in backend.retryable_exceptions()
     assert OSError in backend.retryable_exceptions()
@@ -1359,3 +1366,521 @@ def test_soft_deny_on_read_only_run_is_info_not_warn():
     assert soft == ["[ANTIGRAVITY] soft-denied (expected, read-only): " + deny_line.decode().rstrip()]
     assert all(not m.startswith("[WARN]") for m in soft)
     assert result.subtype == "success"
+
+
+# ---------- Phase 5 §5.3: MCP comment classification & flags ----------
+
+
+def _step_event(index: int, state: str, tool_name: str, params=None, error=None) -> str:
+    """One step_update line in the fixture-confirmed shape (ACTIVE and DONE
+    of one call share step_index)."""
+    tool_info: dict = {"name": tool_name}
+    if params is not None:
+        tool_info["parameters"] = params
+    if error is not None:
+        tool_info["error"] = error
+    return json.dumps({
+        "event": "step_update",
+        "step_update": {
+            "step_index": index,
+            "step_type": "tool",
+            "state": state,
+            "tool_name": tool_name,
+            "tool_info": tool_info,
+        },
+    })
+
+
+def _parse_lines(*lines: str) -> tuple[_AgyAccumulator, list]:
+    acc = _AgyAccumulator()
+    progress: list = []
+    for line in lines:
+        _parse_line(line, acc, progress.append)
+    return acc, progress
+
+
+def _eager_pair(index, tool_name, body, error=None) -> list[str]:
+    return [
+        _step_event(index, "ACTIVE", tool_name, {"body": body}),
+        _step_event(index, "DONE", tool_name, {"body": body}, error=error),
+    ]
+
+
+def test_classifier_eager_shape():
+    for tool, kind in [
+        ("mcp_autoswe_comment_post_plan", "plan"),
+        ("mcp_autoswe_comment_post_question", "question"),
+        ("mcp_autoswe_comment_update_progress", "progress"),
+    ]:
+        role, body = _classify_mcp_comment_call({
+            "tool_name": tool, "tool_info": {"parameters": {"body": "hello"}},
+        })
+        assert (role, body) == (kind, "hello")
+
+
+def test_classifier_lazy_proxy_dict_and_string_arguments():
+    base = {"ServerName": "autoswe_comment", "ToolName": "post_plan"}
+    role, body = _classify_mcp_comment_call({
+        "tool_name": "call_mcp_tool",
+        "tool_info": {"parameters": {**base, "Arguments": {"body": "B"}}},
+    })
+    assert (role, body) == ("plan", "B")
+    # Arguments may arrive as a JSON string.
+    role, body = _classify_mcp_comment_call({
+        "tool_name": "call_mcp_tool",
+        "tool_info": {"parameters": {**base, "Arguments": json.dumps({"body": "S"})}},
+    })
+    assert (role, body) == ("plan", "S")
+
+
+def test_classifier_rejects_foreign_servers_and_unknown_tools():
+    # Lazy proxy for a DIFFERENT server is not ours.
+    role, _ = _classify_mcp_comment_call({
+        "tool_name": "call_mcp_tool",
+        "tool_info": {"parameters": {"ServerName": "other", "ToolName": "post_plan",
+                                     "Arguments": {"body": "x"}}},
+    })
+    assert role is None
+    # An eager-named but foreign tool name is not ours.
+    role, _ = _classify_mcp_comment_call({"tool_name": "mcp_other_post_plan"})
+    assert role is None
+    # A plain built-in tool.
+    role, _ = _classify_mcp_comment_call({"tool_name": "write_file",
+                                          "tool_info": {"parameters": {"path": "/x"}}})
+    assert role is None
+
+
+def test_classifier_body_never_non_string():
+    role, body = _classify_mcp_comment_call({
+        "tool_name": "mcp_autoswe_comment_post_plan",
+        "tool_info": {"parameters": {"body": {"nope": 1}}},
+    })
+    assert (role, body) == ("plan", "")
+
+
+def test_mcp_comment_active_trigger():
+    assert _mcp_comment_active(_spec(mcp_servers={"autoswe_comment": {}})) is True
+    assert _mcp_comment_active(_spec()) is False
+    assert _mcp_comment_active(_spec(mcp_servers={})) is False
+    assert _mcp_comment_active(_spec(mcp_servers={"autoswe_comment": "not-a-dict"})) is False
+
+
+def test_eager_post_plan_sets_flags():
+    acc, progress = _parse_lines(*_eager_pair(3, "mcp_autoswe_comment_post_plan", "the plan"))
+    assert acc.plan_posted is True
+    assert acc.plan_posted_body == "the plan"
+    assert acc.question_posted is False
+    assert any("Tool: mcp_autoswe_comment_post_plan" in p for p in progress)
+
+
+def test_eager_post_plan_error_unsets_flag_and_body():
+    err = {"type": "mcp_tool_error", "message": "provider 403"}
+    acc, _ = _parse_lines(
+        _step_event(4, "ACTIVE", "mcp_autoswe_comment_post_plan", {"body": "x"}),
+        _step_event(4, "DONE", "mcp_autoswe_comment_post_plan", {"body": "x"}, error=err),
+    )
+    # §5.3: an answered-but-failed post must NOT suppress the text fallback.
+    assert acc.plan_posted is False
+    assert acc.plan_posted_body is None
+    # The tool error is still collected (README lesson #4: not a run failure).
+    assert acc.tool_errors and not acc.error_flag
+
+
+def test_error_state_step_also_unsets():
+    # Permission-denied posts end state=ERROR, not DONE — same treatment.
+    err = {"type": "permission_denied", "message": "mcp(autoswe_comment/*) not allowed"}
+    acc, _ = _parse_lines(
+        _step_event(5, "ACTIVE", "mcp_autoswe_comment_post_question", {"body": "?"}),
+        _step_event(5, "ERROR", "mcp_autoswe_comment_post_question", {"body": "?"}, error=err),
+    )
+    assert acc.question_posted is False
+
+
+def test_second_plan_error_preserves_first_success():
+    # Two post_plan calls: the FIRST lands, the SECOND fails.  The flag is a
+    # count, not a latch — a failed re-push must not un-post the successful
+    # one.  The body keeps the *last* non-empty intent (documented "last
+    # non-empty body wins"): the planner's #241 re-push puts that newest
+    # intended plan on the thread regardless.
+    err = {"type": "mcp_tool_error", "message": "boom"}
+    acc, _ = _parse_lines(
+        *_eager_pair(1, "mcp_autoswe_comment_post_plan", "first"),
+        _step_event(2, "ACTIVE", "mcp_autoswe_comment_post_plan", {"body": "second"}),
+        _step_event(2, "DONE", "mcp_autoswe_comment_post_plan", {"body": "second"}, error=err),
+    )
+    assert acc.plan_posted is True
+    assert acc.plan_posted_body == "second"
+
+
+def test_ignored_plan_error_done_cannot_wipe_successful_plan():
+    """Review regression (issue #322 round 2): the full unmasked chain —
+    post_plan SUCCEEDS → post_question ACTIVE → second post_plan is IGNORED
+    (question-terminal, so never counted) and must also never be tracked →
+    the ignored call's ERROR terminal → question also ERRORs.  Before the
+    fix the ignored call sat in ``_comment_steps`` un-counted, so its
+    error-DONE decremented ``_plan_calls`` 1→0 and wiped the *successful*
+    plan's flag/body.  Now only counted calls are tracked: plan_posted
+    stays True with the original body; only the question is un-set."""
+    from tests.fakes.antigravity_fake import (
+        _mcp_comment_steps,
+        _step_tool_active,
+        _step_tool_done,
+        _success_stream,
+    )
+
+    question_name = ANTIGRAVITY_COMMENT_TOOL_NAMES["post_question"]
+    err = {"type": "mcp_tool_error", "message": "post failed"}
+    steps = [
+        *_mcp_comment_steps("s1", 1, "post_plan", "P"),                 # success
+        _step_tool_active("s1", 2, question_name, {"body": "?"}),        # question in flight
+        *_mcp_comment_steps("s1", 3, "post_plan", "ignored", error=err),  # ignored ACTIVE + ERROR
+        _step_tool_done("s1", 2, question_name, error=err),              # question fails too
+    ]
+    stream = _success_stream("s1", "tag-free text", tool_steps=steps)
+    proc = _MockProcess(stdout=("\n".join(stream) + "\n").encode())
+
+    result, _ = _full_run(_spec(), proc)
+
+    assert result.subtype == "success"
+    assert result.plan_posted is True
+    assert result.plan_posted_body == "P"
+    assert result.question_posted is False
+
+
+def test_question_terminal_precedence_and_risk_edge():
+    """The Risks-test: question ACTIVE -> plan ACTIVE (must be ignored) ->
+    question DONE WITH error -> NEITHER flag set -> text fallback stays live."""
+    err = {"type": "mcp_tool_error", "message": "post_question failed"}
+    with patch.object(agy_mod, "log") as mock_log:
+        acc, _ = _parse_lines(
+            _step_event(1, "ACTIVE", "mcp_autoswe_comment_post_question", {"body": "Which DB?"}),
+            _step_event(2, "ACTIVE", "mcp_autoswe_comment_post_plan", {"body": "ignored plan"}),
+            _step_event(1, "DONE", "mcp_autoswe_comment_post_question", {"body": "Which DB?"}, error=err),
+        )
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert any("post_plan ignored" in m and "question-terminal" in m for m in msgs)
+    assert acc.plan_posted is False and acc.plan_posted_body is None
+    assert acc.question_posted is False
+
+
+def test_lazy_proxy_pair_classified_end_to_end():
+    params = {"ServerName": "autoswe_comment", "ToolName": "post_plan",
+              "Arguments": json.dumps({"body": "lazy plan"})}
+    acc, _ = _parse_lines(
+        _step_event(7, "ACTIVE", "call_mcp_tool", params),
+        _step_event(7, "DONE", "call_mcp_tool", params),
+    )
+    assert acc.plan_posted is True
+    assert acc.plan_posted_body == "lazy plan"
+
+
+def test_update_progress_feeds_callback():
+    long_body = "x" * 500
+    acc, progress = _parse_lines(
+        _step_event(9, "ACTIVE", "mcp_autoswe_comment_update_progress", {"body": long_body}),
+        _step_event(9, "DONE", "mcp_autoswe_comment_update_progress", {"body": long_body}),
+    )
+    assert long_body[:200] in progress
+    assert acc.plan_posted is False and acc.question_posted is False
+
+
+def test_flags_survive_to_finalize():
+    acc, _ = _parse_lines(*_eager_pair(1, "mcp_autoswe_comment_post_question", "?"))
+    result = _finalize(acc, 0)
+    assert result.question_posted is True
+    assert result.plan_posted is False
+
+
+# ---------- Phase 5 §5.1/§5.2: config merge & env routing ----------
+
+
+def _mcp_spec(tmp_path, **overrides) -> RunSpec:
+    """A spec that triggers the MCP path, with the global config retargeted at
+    tmp_path (antigravity_mcp_config_path resolves home at call time, but the
+    tests retarget the function itself for cross-platform determinism)."""
+    servers = {
+        "autoswe_comment": {
+            "command": "/usr/bin/python3",
+            "args": ["-m", "mcp_servers.autoswe_comment_server"],
+            "env": {
+                "AUTOSWE_COMMENT_ID": "991",
+                "AUTOSWE_TOKEN": "ghp_secret",
+                "AUTOSWE_SUPPRESS_POSTING": "0",
+            },
+        },
+    }
+    servers.update(overrides)
+    return _spec(mcp_servers=servers)
+
+
+@pytest.fixture()
+def agy_config_path(tmp_path, monkeypatch):
+    p = tmp_path / ".gemini" / "config" / "mcp_config.json"
+    monkeypatch.setattr(agy_mod, "antigravity_mcp_config_path", lambda: p)
+    return p
+
+
+def test_merge_creates_file_with_stable_entry_only(agy_config_path):
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    _, captured = _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
+
+    written = json.loads(agy_config_path.read_text(encoding="utf-8"))
+    assert set(written.keys()) == {"mcpServers"}
+    entry = written["mcpServers"]["autoswe_comment"]
+    assert entry["tools"]["post_plan"] == {"eager": True}
+    assert entry["timeoutSeconds"] == 120
+    # §5.2 hard rule: per-task values NEVER reach the file.
+    assert "env" not in entry
+    assert "ghp_secret" not in agy_config_path.read_text(encoding="utf-8")
+    assert "991" not in agy_config_path.read_text(encoding="utf-8")
+    # ...and they DO ride the agy subprocess env (M3).
+    assert captured["env"]["AUTOSWE_COMMENT_ID"] == "991"
+    assert captured["env"]["AUTOSWE_TOKEN"] == "ghp_secret"
+
+
+def test_merge_preserves_foreign_servers_and_top_level_keys(agy_config_path):
+    foreign = {
+        "mcpServers": {
+            "operator_server": {"command": "npx", "args": ["-y", "something"]},
+            "autoswe_comment": {"command": "STALE", "args": []},
+        },
+        "someOperatorTopLevelKey": {"keep": "me"},
+    }
+    agy_config_path.parent.mkdir(parents=True)
+    agy_config_path.write_text(json.dumps(foreign, indent=2) + "\n", encoding="utf-8")
+
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
+
+    written = json.loads(agy_config_path.read_text(encoding="utf-8"))
+    assert written["someOperatorTopLevelKey"] == {"keep": "me"}
+    assert written["mcpServers"]["operator_server"] == foreign["mcpServers"]["operator_server"]
+    # Only OUR entry was replaced.
+    assert written["mcpServers"]["autoswe_comment"]["command"] != "STALE"
+
+
+def test_merge_prunes_stale_owned_inline_entry(agy_config_path):
+    """A GitHub fix run writes autoswe_inline_comment; the global file keeps it
+    for later runs.  A run whose spec has NO inline entry (plan/review, or an
+    Azure fix) must prune that stale autoSWE-owned entry — the agent must not
+    see an inline server that can only fail server-side — while the owned
+    autoswe_comment entry is refreshed and foreign keys are untouched."""
+    seeded = {
+        "mcpServers": {
+            "operator_server": {"command": "npx", "args": ["-y", "something"]},
+            "autoswe_comment": {"command": "STALE", "args": []},
+            "autoswe_inline_comment": {
+                "command": "/usr/bin/python3",
+                "args": ["-m", "mcp_servers.autoswe_inline_comment_server"],
+                "cwd": "/old/checkout",
+            },
+        },
+    }
+    agy_config_path.parent.mkdir(parents=True)
+    agy_config_path.write_text(json.dumps(seeded, indent=2) + "\n", encoding="utf-8")
+
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    # _mcp_spec()'s default carries autoswe_comment only — no inline, the
+    # read_only/Azure shape from the finding.
+    _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
+
+    written = json.loads(agy_config_path.read_text(encoding="utf-8"))
+    assert written["mcpServers"]["autoswe_comment"]["command"] != "STALE"
+    assert "autoswe_inline_comment" not in written["mcpServers"]
+    # Foreign servers are never pruned — ownership covers autoSWE keys only.
+    assert written["mcpServers"]["operator_server"] == seeded["mcpServers"]["operator_server"]
+
+
+def test_merge_serialises_under_sibling_lockfile(agy_config_path):
+    """Round-4 MEDIUM: the prune makes concurrent runs' owned sets differ, so
+    the whole read-modify-write is serialised under an advisory lock on the
+    sibling <file>.lock — exercise it end-to-end through _full_run."""
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    taken = []
+    real = agy_mod._lock_file_exclusive
+
+    def spy(f):
+        taken.append(f.name)
+        return real(f)
+
+    with patch.object(agy_mod, "_lock_file_exclusive", side_effect=spy):
+        _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
+
+    assert taken == [str(agy_config_path.parent / (agy_config_path.name + ".lock"))]
+    assert (agy_config_path.parent / (agy_config_path.name + ".lock")).exists()
+    # ...and it's the sibling of the GLOBAL config, never a worktree path.
+    assert all("/tmp/repo" not in name for name in taken)
+
+
+def test_merge_proceeds_unlocked_when_lockfile_unusable(tmp_path, monkeypatch):
+    """The mkdir/open arm of the best-effort lock: with a directory squatting
+    on the lock path, opening it raises, the merge logs and proceeds, and the
+    config still lands."""
+    cfg_dir = tmp_path / "cfg"
+    (cfg_dir / "mcp_config.json.lock").mkdir(parents=True)  # a directory where the lock file belongs
+    path = cfg_dir / "mcp_config.json"
+    monkeypatch.setattr(agy_mod, "antigravity_mcp_config_path", lambda: path)
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    with patch.object(agy_mod, "log") as mock_log:
+        result, _ = _full_run(_mcp_spec(tmp_path), proc)
+    assert result.subtype == "success"
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert any("merging unlocked" in m for m in msgs)
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["mcpServers"]["autoswe_comment"]["tools"]["post_plan"]["eager"] is True
+
+
+def test_merge_proceeds_unlocked_when_lock_fails(agy_config_path):
+    """Locking is best-effort like the rest of the merge: an OSError from the
+    platform lock logs a warning and the merge still lands — a wedged holder
+    must never fail the run."""
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    with patch.object(agy_mod, "_lock_file_exclusive", side_effect=OSError("locked")):
+        with patch.object(agy_mod, "log") as mock_log:
+            result, _ = _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
+    assert result.subtype == "success"
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert any("merging unlocked" in m for m in msgs)
+    written = json.loads(agy_config_path.read_text(encoding="utf-8"))
+    assert written["mcpServers"]["autoswe_comment"]["tools"]["post_plan"]["eager"] is True
+
+
+def test_merge_is_idempotent_compare_before_write(agy_config_path):
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    spec = _mcp_spec(agy_config_path.parent.parent)
+    _full_run(spec, proc)
+    first = agy_config_path.read_text(encoding="utf-8")
+
+    # Age the mtime; a rewrite would refresh it.  Second run must NOT write.
+    past = 1_000_000_000
+    os.utime(agy_config_path, (past, past))
+    _full_run(spec, proc)
+    assert agy_config_path.read_text(encoding="utf-8") == first
+    st = os.stat(agy_config_path)
+    assert st.st_mtime == past  # skipped: stable values, stable bytes
+
+
+def test_merge_repairs_corrupt_file(agy_config_path):
+    agy_config_path.parent.mkdir(parents=True)
+    agy_config_path.write_text("{not json", encoding="utf-8")
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    with patch.object(agy_mod, "log") as mock_log:
+        _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert any("[WARN]" in m and "not valid JSON" in m for m in msgs)
+    written = json.loads(agy_config_path.read_text(encoding="utf-8"))
+    assert written["mcpServers"]["autoswe_comment"]["tools"]["post_plan"]["eager"] is True
+
+
+def test_merge_write_failure_logs_and_never_raises(tmp_path, monkeypatch):
+    # A directory where the file belongs: os.replace onto it raises OSError.
+    path = tmp_path / "mcp_config.json"
+    path.mkdir()
+    monkeypatch.setattr(agy_mod, "antigravity_mcp_config_path", lambda: path)
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    with patch.object(agy_mod, "log") as mock_log:
+        result, _ = _full_run(_mcp_spec(tmp_path), proc)  # must not raise
+    assert result.subtype == "success"  # run proceeds — text fallback path
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert any("could not write" in m for m in msgs)
+
+
+def test_merge_recovers_from_undecodable_config(agy_config_path):
+    """A PowerShell ``>``-redirected UTF-16LE file raises UnicodeDecodeError
+    (a ValueError, not OSError) on read_text: the merge must log and rewrite
+    it like any corrupt file — the run proceeds and the owned entry lands."""
+    agy_config_path.parent.mkdir(parents=True)
+    agy_config_path.write_bytes('{"mcpServers": {}}'.encode("utf-16"))
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    with patch.object(agy_mod, "log") as mock_log:
+        result, _ = _full_run(_mcp_spec(agy_config_path.parent.parent), proc)  # must not raise
+    assert result.subtype == "success"
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert any("could not read existing" in m for m in msgs)
+    written = json.loads(agy_config_path.read_text(encoding="utf-8"))  # now valid UTF-8 JSON
+    assert written["mcpServers"]["autoswe_comment"]["tools"]["post_plan"]["eager"] is True
+
+
+def test_merge_writes_atomically_via_os_replace(agy_config_path):
+    """The final write must be same-dir temp + os.replace, never a
+    truncating open(path, "w") — the lock-free agy child must only ever see
+    the old or the new complete file."""
+    calls = []
+    real_replace = os.replace
+
+    def spy(src, dst, *args, **kwargs):
+        calls.append((str(src), str(dst)))
+        return real_replace(src, dst, *args, **kwargs)
+
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    with patch.object(os, "replace", side_effect=spy):
+        _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
+    hits = [(src, dst) for src, dst in calls if dst == str(agy_config_path)]
+    assert len(hits) == 1, "the merge's final write must go through os.replace"
+    src, _ = hits[0]
+    assert os.path.dirname(src) == str(agy_config_path.parent)  # same directory
+    assert src != str(agy_config_path)
+    # No temp debris left behind in the config dir.
+    leftovers = [p.name for p in agy_config_path.parent.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
+
+
+def test_no_mcp_servers_never_touches_config(agy_config_path):
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    _, captured = _full_run(_spec(), proc)
+    assert not agy_config_path.exists()
+    assert "AUTOSWE_COMMENT_ID" not in captured["env"]
+
+
+def test_inline_entry_written_without_env_but_env_routes(agy_config_path):
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    spec = _mcp_spec(
+        agy_config_path.parent.parent,
+        autoswe_inline_comment={
+            "command": "/usr/bin/python3",
+            "args": ["-m", "mcp_servers.autoswe_inline_comment_server"],
+            "env": {"AUTOSWE_PR_NUMBER": "77", "AUTOSWE_COMMIT_SHA": "deadbeef"},
+        },
+    )
+    _, captured = _full_run(spec, proc)
+
+    from autoswe.harness.mcp_config import autoswe_repo_root
+
+    written = json.loads(agy_config_path.read_text(encoding="utf-8"))
+    inline = written["mcpServers"]["autoswe_inline_comment"]
+    assert inline["args"] == ["-m", "mcp_servers.autoswe_inline_comment_server"]
+    assert "env" not in inline
+    # Review round-2: the inline entry must carry the SAME stable cwd as the
+    # primary — the mcp_servers package only resolves from the autoSWE
+    # checkout root, never from spec.cwd (the target worktree the agy
+    # subprocess runs in, which the entry would otherwise inherit).
+    assert inline["cwd"] == str(autoswe_repo_root())
+    assert inline["cwd"] != "/tmp/repo"
+    raw = agy_config_path.read_text(encoding="utf-8")
+    assert "deadbeef" not in raw and "AUTOSWE_PR_NUMBER" not in raw
+    assert captured["env"]["AUTOSWE_PR_NUMBER"] == "77"
+    assert captured["env"]["AUTOSWE_COMMIT_SHA"] == "deadbeef"
+
+
+def test_subprocess_entry_matches_mcp_config_builder(agy_config_path):
+    """The file entry is exactly mcp_config.build_antigravity_mcp_config output.
+
+    The backend seeds its owned entry from the builder (round-4 review
+    suggestion), so the spec-mandated builder is load-bearing and this pins
+    that neither it nor antigravity_comment_server can drift from what the
+    backend writes."""
+    from autoswe.harness.mcp_config import (
+        antigravity_comment_server,
+        autoswe_repo_root,
+        build_antigravity_mcp_config,
+    )
+
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
+    written = json.loads(agy_config_path.read_text(encoding="utf-8"))
+    assert written["mcpServers"]["autoswe_comment"] == build_antigravity_mcp_config(
+        sys.executable, str(autoswe_repo_root())
+    )["mcpServers"]["autoswe_comment"]
+    assert written["mcpServers"]["autoswe_comment"] == antigravity_comment_server(
+        sys.executable, str(autoswe_repo_root())
+    )

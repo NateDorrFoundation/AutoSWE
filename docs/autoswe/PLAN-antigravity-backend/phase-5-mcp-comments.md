@@ -135,4 +135,75 @@ Otherwise write "no warm-up needed (eager registration)" in the spike doc and sk
 
 - [ ] Live: `/plan` on the test project posts the plan through MCP (sticky comment finalized
       in place, no `<AUTOSWE_PLAN>` scraping in the log), on GitHub **and** Azure
-- [ ] Gate green
+- [x] Gate green (2026-11-20, issue #322: `pytest -q -m "not live"` + `ruff check autoswe tests scripts` clean)
+
+## Completion record (2026-11-20, issue #322)
+
+Implemented exactly as specified above, on the `autoswe/issue-322` branch off
+`antigravity`:
+
+- `mcp_config.py`: `comment_server_launch` (shared launch triple with pi),
+  `antigravity_comment_server` (timeoutSeconds + three `eager: true` tools),
+  `build_antigravity_mcp_config`, `antigravity_mcp_config_path` (home resolved
+  at call time). Phase 4 Option C means the global file is the only surface
+  (M4: unshadowable), so §5.1's Option-A run-dir variant does not apply.
+- `antigravity.py`: `_mcp_comment_active` trigger; entry-scoped
+  `_merge_antigravity_mcp_config` (foreign servers preserved, compare-before-
+  write, OSError → log + text fallback, never raise); per-task env routed to
+  the agy subprocess env only (M3), inline entry written verbatim-minus-`env`;
+  `_classify_mcp_comment_call` (eager names incl. string-`Arguments` lazy
+  proxy fallback); ACTIVE-classify with DONE/ERROR `tool_info.error` un-set
+  (§5.3) over per-role call counts — an earlier successful post keeps its
+  flag when a later one fails; `mcp` capability + `ANTIGRAVITY_COMMENT_TOOL_NAMES`.
+  §5.4 needed no production change (Phase 4 already allowed
+  `mcp(autoswe_comment/*)` / `mcp(autoswe_inline_comment/*)`); §5.5 SKIPPED
+  per M5 — no warm-up, `cli.py:_cmd_warmup` untouched.
+- Tests: `test_antigravity_backend.py` (classifier, merge semantics, env
+  routing incl. never-in-file bytes, flag semantics incl. the Risks edge),
+  `test_config.py` (builders/path), `test_backend_capabilities.py`,
+  `test_backend_parity.py` (name + capability parity), `test_prompts.py`
+  (agy eager names render), `test_planner_returns.py` (has_mcp branch on the
+  agy axis), `AntigravityFake` (`mcp=True/"lazy"/mcp_error` scripting),
+  scenario feeder (`mcp_tool` → eager tool pair), and two new
+  `ANTIGRAVITY_TRANSITIONS` rows (`agy_plan_mcp_post_plan`,
+  `agy_plan_mcp_post_question`); `fresh_plan_command` is the kept
+  text-fallback row (mcp advertised, tool never called).
+
+**Gate:** green (offline suite + ruff).
+**Live exit criterion:** NOT yet checked — requires a host with the `agy`
+binary (absent here). The two live boxes above stay open for the Phase 6
+dedicated-box pass.
+
+**Review-round follow-ups (rounds 2–5, same branch):**
+- Round 2: `_comment_steps` registers only calls that were *counted*, so a
+  question-terminal-ignored `post_plan` can never have its error-DONE wipe a
+  successful plan's flag (`test_ignored_plan_error_done_cannot_wipe_successful_plan`);
+  the owned inline entry carries `cwd=autoswe_repo_root()` (agy inherits
+  `spec.cwd` when the entry cwd is unset, where `mcp_servers` cannot resolve).
+- Round 3 (tests): §5.7 pass-through parametrisation over the three
+  MCP backends in `test_mcp_integration.py`; the HOME-redirect path test now
+  relocates `USERPROFILE` alongside `HOME` (Windows `Path.home()` order).
+- Round 4: the merge **prunes** owned keys absent from the current run's
+  owned set (stale `autoswe_inline_comment`), foreign keys never touched
+  (`test_merge_prunes_stale_owned_inline_entry`).
+- Round 5: concurrency safety of the global file is the **lock-serialised
+  read-modify-write** (advisory exclusive lock on sibling `<file>.lock`,
+  `fcntl.flock`/`msvcrt.locking`, best-effort) — NOT "concurrent runs write
+  identical bytes, benign": once the prune exists, concurrent runs' owned
+  sets legitimately differ, so the earlier stable-bytes argument no longer
+  covers interleavings (`test_merge_serialises_under_sibling_lockfile`,
+  `test_merge_proceeds_unlocked_when_lock_fails`,
+  `test_merge_proceeds_unlocked_when_lockfile_unusable`). The backend's owned
+  primary entry is now seeded from `build_antigravity_mcp_config`, making
+  the spec-mandated builder load-bearing (pinned by
+  `test_subprocess_entry_matches_mcp_config_builder`).
+- Round 6: the merge's read arm catches `(OSError, UnicodeDecodeError)` —
+  an undecodable config (e.g. PowerShell `>`-redirected UTF-16LE) is a
+  `ValueError` that previously escaped as a hard task FAILED instead of the
+  documented log-and-rewrite degrade (`test_merge_recovers_from_undecodable_config`);
+  the final write is same-dir temp + `os.replace()` so the lock-free `agy`
+  child never sees a truncated file mid-rewrite
+  (`test_merge_writes_atomically_via_os_replace`).
+  **Out-of-scope follow-up (Phase 6):** `pi.py:_write_pi_mcp_json` has the
+  identical `UnicodeDecodeError` read-arm gap — same one-line fix applies,
+  left untouched here by scope decision.
