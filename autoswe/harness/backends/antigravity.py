@@ -124,6 +124,104 @@ _STDERR_TAIL_BYTES = 64 * 1024
 # the CLI itself is wedged.
 _HARD_TIMEOUT_SLACK = 30
 
+# Pinned CLI version floor (Phase 6 §6.2): the exact version the Phase 0 spike
+# validated (docs/autoswe/spike-antigravity.md: ``agy --version`` → 1.5.11,
+# one line, no prefix).  Kept in lockstep with tests/test_agy_cli_version.py,
+# which imports this constant; bumping the floor is a one-line change here plus
+# the version quoted in docs/autoswe/harnesses.md, docs/autoswe/config.md and
+# docs/autoswe/debugging.md.  The installed CLI is
+# checked once per process (below) and a too-old CLI only warns — a version
+# drift must not fail a run whose stream still parses; the offline stream
+# fixtures are the behavioural contract.
+MIN_AGY_VERSION = "1.5.11"
+
+# Once-per-process guard for _warn_if_below_floor: the flag flips once the
+# probe completes, regardless of outcome — a timed-out or otherwise
+# unqueryable probe silences the warn for that process by design (re-probing
+# on every run would make a persistently wedged CLI charge the 15 s timeout
+# to every run, which is worse).  The bound is per-run-that-started-
+# pre-completion, not one spawn ever: each run reaching the check while the
+# first probe is still in flight also awaits its own probe, so with
+# MAX_CONCURRENT = N racing first runs, up to N spawns (each off the event
+# loop via asyncio.to_thread, each bounded by the 15 s timeout) — warn-only
+# either way.  No run starting after the flag flips pays anything.
+_agy_version_checked = False
+
+
+def _agy_version_tuple(version: str) -> tuple[int, ...]:
+    """Parse a dotted version into a comparable integer tuple.
+
+    ``"1.5.12"`` → ``(1, 5, 12)``.  Stdlib-only numeric run, same approach as
+    tests/test_cli_version.py's ``_vtuple``: no ``packaging`` dependency, and
+    ordering is by component, not lexical (1.5.9 < 1.5.11).
+    """
+    return tuple(int(part) for part in re.findall(r"\d+", version.split("(")[0]))
+
+
+def _query_agy_version(argv: list[str]) -> str | None:
+    """Return the ``--version`` output of a full argv invocation, or None if unqueryable.
+
+    Takes the complete invocation, not a bare exe: on a shimmed Windows host
+    ``_resolve_agy_executable`` returns ``("cmd", ["/c", path])`` and the real
+    path rides in the prefix — probing ``cmd --version`` would open an
+    interactive prompt instead of the CLI.
+    """
+    try:
+        # 15 s here vs 30 s (_VERSION_TIMEOUT_S) in tests/test_agy_cli_version.py:
+        # intentional.  The run path runs this probe OFF the event loop
+        # (asyncio.to_thread in _warn_if_below_floor), so a hung CLI delays at
+        # most the one run awaiting it — it never stalls concurrent runs.  The
+        # offline guard tolerates slower CI boxes.  Both swallow failures silently.
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        # UnicodeDecodeError is a ValueError raised by the strict-UTF-8 decode
+        # inside subprocess.run(text=True) on a pathological CLI response —
+        # same gap class as the pi.py _write_pi_mcp_json read arm.  Swallowed
+        # to keep this function's "never raises" contract.
+        return None
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or proc.stderr or "").strip() or None
+
+
+async def _warn_if_below_floor(
+    exe: str, prefix_argv: list[str] | tuple[str, ...] = ()
+) -> None:
+    """Log ``[WARN]`` once per process when the installed agy is below the floor.
+
+    Best-effort by design (Phase 6 §6.2): an unqueryable CLI (missing flag on
+    some shim, timeout, unparseable output) is silently skipped — the floor is
+    operator guidance, and tests/test_agy_cli_version.py is the enforcement
+    point.  ``prefix_argv`` is the shim prefix from ``_resolve_agy_executable``
+    (``["/c", path]`` for ``.cmd``/``.bat``, the powershell arms for ``.ps1``):
+    the probe must run the *full* invocation, or a shimmed host would get a
+    bare ``cmd --version`` — an interactive prompt, not the CLI's version.
+    The blocking ``subprocess.run`` is awaited via ``asyncio.to_thread`` so a
+    wedged CLI never stalls the event loop (and thus concurrent runs); the
+    guard flag flips only after the probe completes.  Never raises, never
+    fails the run.
+    """
+    global _agy_version_checked
+    if _agy_version_checked:
+        return
+    reported = await asyncio.to_thread(
+        _query_agy_version, [exe, *prefix_argv, "--version"]
+    )
+    _agy_version_checked = True
+    if reported is None:
+        return
+    parts = _agy_version_tuple(reported)
+    if not parts:
+        return
+    if parts < _agy_version_tuple(MIN_AGY_VERSION):
+        invocation = " ".join([exe, *prefix_argv])
+        log(
+            f"[WARN][ANTIGRAVITY] installed agy CLI {reported!r} (resolved to {invocation}) is "
+            f"below the pinned floor {MIN_AGY_VERSION} (docs/autoswe/harnesses.md); "
+            "the CLI self-updates on interactive launch — run `agy` once to update, "
+            "or reinstall from the Antigravity installer."
+        )
+
 # Statuses the CLI may stamp on a terminal ``result`` event.  RUNNING should
 # never reach a result line; it is included defensively so an unexpected
 # status maps to a sane subtype instead of falling through the mapping.
@@ -1652,6 +1750,15 @@ class AntigravityBackend:
         exe, prefix_argv = _resolve_agy_executable(
             str(spec.cli_path or harness_cfg.get("cli_path") or "").strip()
         )
+        # Phase 6 §6.2: warn once per process when the installed CLI is below
+        # MIN_AGY_VERSION — guidance only, the run proceeds regardless.  The
+        # full invocation (exe + shim prefix) must be threaded: a `.cmd`/`.ps1`
+        # shim resolves to exe="cmd"/"powershell" with the real path in
+        # prefix_argv, so probing the bare exe would stall on an interactive
+        # prompt and the floor could never warn on a shimmed host.  Awaited
+        # off-loop (asyncio.to_thread inside) — a wedged CLI must never stall
+        # the event loop and the concurrent runs sharing it.
+        await _warn_if_below_floor(exe, prefix_argv)
         argv = [
             exe, *prefix_argv,
             *_build_argv(spec, harness_cfg, schema_path, settings_args),

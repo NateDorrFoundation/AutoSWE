@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1884,3 +1885,165 @@ def test_subprocess_entry_matches_mcp_config_builder(agy_config_path):
     assert written["mcpServers"]["autoswe_comment"] == antigravity_comment_server(
         sys.executable, str(autoswe_repo_root())
     )
+
+
+# --- CLI version floor (Phase 6 §6.2) --------------------------------------
+
+
+def _reset_version_guard(monkeypatch):
+    monkeypatch.setattr(agy_mod, "_agy_version_checked", False)
+
+
+@pytest.mark.parametrize(
+    "reported,expected",
+    [
+        ("1.5.12", (1, 5, 12)),
+        ("  1.5.11\n", (1, 5, 11)),
+        ("1.10.2 (antigravity)", (1, 10, 2)),
+    ],
+)
+def test_agy_version_tuple_parses_cli_output(reported, expected):
+    assert agy_mod._agy_version_tuple(reported) == expected
+
+
+def test_agy_version_tuple_orders_by_component_not_lexically():
+    """1.5.9 < 1.5.11 — the trap a string comparison would fall into."""
+    assert agy_mod._agy_version_tuple("1.5.9") < agy_mod._agy_version_tuple("1.5.11")
+    assert agy_mod._agy_version_tuple("1.6.0") > agy_mod._agy_version_tuple("1.5.99")
+
+
+def test_warn_fires_once_per_process_below_floor(monkeypatch):
+    _reset_version_guard(monkeypatch)
+    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda argv: "1.5.10")
+    with patch.object(agy_mod, "log") as mock_log:
+        asyncio.run(agy_mod._warn_if_below_floor("/usr/local/bin/agy"))
+        asyncio.run(agy_mod._warn_if_below_floor("/usr/local/bin/agy"))
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    warns = [m for m in msgs if "[WARN]" in m and "below the pinned floor" in m]
+    assert len(warns) == 1, "warn must fire exactly once per process"
+
+
+def test_no_warn_at_or_above_floor(monkeypatch):
+    _reset_version_guard(monkeypatch)
+    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda argv: agy_mod.MIN_AGY_VERSION)
+    with patch.object(agy_mod, "log") as mock_log:
+        asyncio.run(agy_mod._warn_if_below_floor("/usr/local/bin/agy"))
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert not [m for m in msgs if "[WARN]" in m]
+    # And a newer CLI is equally silent.
+    monkeypatch.setattr(agy_mod, "_agy_version_checked", False)
+    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda argv: "99.0.1")
+    with patch.object(agy_mod, "log") as mock_log:
+        asyncio.run(agy_mod._warn_if_below_floor("/usr/local/bin/agy"))
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert not [m for m in msgs if "[WARN]" in m]
+
+
+def test_unqueryable_version_is_silent(monkeypatch):
+    """A CLI that cannot be queried never warns and never raises — enforcement
+    lives in tests/test_agy_cli_version.py, not in the run path."""
+    _reset_version_guard(monkeypatch)
+    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda argv: None)
+    with patch.object(agy_mod, "log") as mock_log:
+        asyncio.run(agy_mod._warn_if_below_floor("/usr/local/bin/agy"))  # must not raise
+    assert not [
+        c for c in mock_log.call_args_list if "[WARN]" in str(c.args[0] if c.args else "")
+    ]
+
+
+def test_version_probe_runs_off_the_event_loop(monkeypatch):
+    """The blocking probe must never starve the event loop (review E MEDIUM).
+
+    A synchronous ``subprocess.run`` on the async run path stalled every
+    concurrent task for up to the 15 s timeout — once per poll cycle, since
+    cron launches a fresh process each time.  Pinned by running the guard
+    concurrently with a ticking coroutine: the tick must keep advancing while
+    the (sleeping) probe is in flight, proving ``asyncio.to_thread`` offload.
+    """
+    _reset_version_guard(monkeypatch)
+    state = {"ticks": 0, "at_probe_completion": None}
+
+    def slow_query(argv):
+        time.sleep(0.2)
+        # Runs in the to_thread worker: snapshot loop liveness at the exact
+        # moment the probe finishes.  A loop-blocking probe would give 0 —
+        # the ticker could not have run during the sleep.
+        state["at_probe_completion"] = state["ticks"]
+        return agy_mod.MIN_AGY_VERSION
+
+    monkeypatch.setattr(agy_mod, "_query_agy_version", slow_query)
+
+    async def scenario():
+        stop = asyncio.Event()
+
+        async def ticker():
+            while not stop.is_set():
+                await asyncio.sleep(0.01)
+                state["ticks"] += 1
+
+        task = asyncio.create_task(ticker())
+        await agy_mod._warn_if_below_floor("/usr/bin/agy")
+        stop.set()
+        await task
+
+    asyncio.run(scenario())
+    assert state["at_probe_completion"] is not None
+    assert state["at_probe_completion"] > 0, (
+        "the event loop must stay live while the version probe is in flight"
+    )
+
+
+@pytest.mark.parametrize(
+    "resolved,prefix",
+    [
+        # Plain binary: the probe is the bare invocation.
+        ("/usr/local/bin/agy", []),
+        # npm/pnpm .cmd shim on Windows: exe is the host, the real path rides
+        # in prefix_argv.  A probe of bare `cmd --version` opens an interactive
+        # prompt — 15 s stall, silent None, the floor can never warn.
+        ("cmd", ["/c", r"C:\Users\op\AppData\Roaming\npm\agy.cmd"]),
+    ],
+    ids=["plain-exe", "cmd-shim"],
+)
+def test_run_path_checks_version_once_with_resolved_exe(monkeypatch, resolved, prefix):
+    """The wiring: every run consults the guard exactly once, threading the
+    *full* resolved invocation — exe plus any shim prefix — to the probe."""
+    seen: list[list[str]] = []
+
+    def probe(argv):
+        seen.append(list(argv))
+        return agy_mod.MIN_AGY_VERSION  # at the floor: guard stays silent
+
+    _reset_version_guard(monkeypatch)
+    monkeypatch.setattr(agy_mod, "_query_agy_version", probe)
+    monkeypatch.setattr(
+        agy_mod, "_resolve_agy_executable", lambda cli_path: (resolved, list(prefix))
+    )
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    _full_run(_spec(), proc)
+    assert len(seen) == 1, "the probe must run exactly once per run-path call"
+    assert seen[0] == [resolved, *prefix, "--version"], (
+        "the probe must receive the full invocation, not bare `cmd --version` on a shim"
+    )
+
+
+def test_query_agy_version_swallows_missing_binary(tmp_path):
+    assert agy_mod._query_agy_version([str(tmp_path / "nope-agy"), "--version"]) is None
+
+
+def test_query_agy_version_swallows_undecodable_output(monkeypatch):
+    """A strict-UTF-8 decode failure (a ValueError, not an OSError) must not escape.
+
+    Same gap class as ``pi.py::_write_pi_mcp_json``'s read arm: ``text=True``
+    decodes with strict UTF-8, so a pathological CLI response raises
+    ``UnicodeDecodeError`` from inside ``subprocess.run`` itself — outside the
+    ``OSError``/``SubprocessError`` tuple.  Swallowed to an unqueryable ``None``
+    to honour ``_warn_if_below_floor``'s documented "never raises, never fails
+    the run" contract.
+    """
+
+    def boom(*args, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(agy_mod.subprocess, "run", boom)
+    assert agy_mod._query_agy_version(["/usr/bin/agy", "--version"]) is None

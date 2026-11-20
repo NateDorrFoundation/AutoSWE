@@ -404,7 +404,7 @@ The fakes monkeypatch these internal functions:
 | `_gh_request` | `autoswe.tracking.api` | `GitHubFake` |
 | `_ado_request` | `autoswe.providers.azure.api` | `AzureFake` |
 | `runner.run` | `autoswe.harness.runner` | `ClaudeFake` |
-| `asyncio.create_subprocess_exec` | `asyncio` | `CodexFake` / `PiFake` |
+| `asyncio.create_subprocess_exec` | `asyncio` | `CodexFake` / `PiFake` / `AntigravityFake` |
 | `worktree.*` | `autoswe.vcs.worktree` | `GitFake` |
 | `gh_post_comment` | `autoswe.tracking.api` + import sites | harness |
 
@@ -484,18 +484,41 @@ fake.script_response("", session_id="s1",
 
 **Fidelity guard:** `tests/test_pi_fake.py` feeds PiFake `--mode json` lines through the real `PiBackend` and asserts the resulting `RunResult` — including the direct + proxy `tool_execution_start` fixtures above (the plan/question/progress flags must come out of the genuine parser, not the fake). This pins the fake to the real parser — if the pi stream shape changes, the fidelity test fails before transitions do.
 
+### AntigravityFake — Subprocess-Level Fake
+
+`tests/fakes/antigravity_fake.py` replaces `asyncio.create_subprocess_exec` with a stub returning a `FakeProcess` that feeds canonical `agy` `--output-format stream-json` event lines (`init` → `step_update`* → `result`, with shapes derived from the committed fixtures in `tests/fixtures/antigravity/` — nothing hand-invented). Like CodexFake and PiFake, it lets the **real** factory → `AntigravityBackend` → stream parser → `RunResult` path run unmodified — the same fidelity contract.
+
+**Builder API** (mirrors `ClaudeFake`/`CodexFake`/`PiFake` so existing transition-row response dicts work verbatim):
+
+```python
+fake = AntigravityFake()
+fake.script_response("text", session_id="s1", subtype="success")
+fake.script_plan("1. Fix it", session_id="s-plan")
+fake.script_questions("What?", session_id="s-plan")
+fake.script_fix("DONE_SUMMARY\t...\t<sha>", session_id="s-fix")
+fake.script_fail(session_id="s-err", error_msg="timeout")
+fake.script_killed(session_id="s-kill")
+fake.script_structured({"verdict": "Approved"}, session_id="s-rev")
+```
+
+**MCP comment steps (Phase 5 of `docs/autoswe/PLAN-antigravity-backend/`).** `script_plan(..., mcp=True)` / `script_questions(..., mcp=True)` emit the eager `mcp_autoswe_comment_*` tool-step pair; `mcp="lazy"` emits the `call_mcp_tool` proxy shape. The eager spellings are imported from the backend's `ANTIGRAVITY_COMMENT_TOOL_NAMES`, not copied, so the fake emits exactly what the real stream classifier (`antigravity.py:_classify_mcp_comment_call`) matches.
+
+**`.calls` tracking:** Each agy command is parsed and recorded as `{argv fields (model, conversation, json_schema_path, skip_permissions, …), cwd, env, stdin_events}` for `assert_antigravity_calls` — e.g. the always-present `--disable-slash-commands`, the per-run `--settings` read-only block, and the prompt delivered as a single stdin `{"event":"user",…}` line.
+
+**Fidelity guard:** `tests/test_antigravity_fake.py` feeds AntigravityFake stream-json lines through the real `AntigravityBackend` and asserts the resulting `RunResult` (including the MCP plan/question/progress flags, which must come out of the genuine parser, not the fake), pins every emitted line's key set to the union of keys seen in the `tests/fixtures/antigravity/` fixtures per `event`/`step_type`, and golden-replays every committed fixture without warnings. This pins the fake to the real parser — if the agy stream shape changes, the fidelity test fails before transitions do.
+
 ### Backend Axis in Scenario Harness
 
-The `patched_world()` context manager accepts a `backend` parameter (`"claude_code"`, `"codex"`, or `"pi"`). When set to `"codex"` or `"pi"`:
+The `patched_world()` context manager accepts a `backend` parameter (`"claude_code"`, `"codex"`, `"pi"`, or `"antigravity"`). When set to `"codex"`, `"pi"`, or `"antigravity"`:
 
-- A `CodexFake` / `PiFake` (not `ClaudeFake`) is created and patched at the subprocess level (both patch `asyncio.create_subprocess_exec` so the real CLI backend runs end-to-end).
-- `config/harnesses.json` is written with a `"codex"` / `"pi"` profile (pi, like codex, requires a `model`).
+- A `CodexFake` / `PiFake` / `AntigravityFake` (not `ClaudeFake`) is created and patched at the subprocess level (all three patch `asyncio.create_subprocess_exec` so the real CLI backend runs end-to-end).
+- `config/harnesses.json` is written with a `"codex"` / `"pi"` / `"antigravity"` profile (antigravity, like codex and pi, requires a `model`).
 - Config `PLAN_HARNESS`, `FIX_HARNESS`, `REVIEW_HARNESS` are set to that backend so `resolve_harness()` returns the matching backend for all phases.
 - The `_harnesses_config` cache is cleared to pick up the test-specific config.
 
-The `HarnessWorld` exposes `hw.codex` / `hw.pi` (the fake instance) and `hw.backend`. Use `assert_codex_calls(hw.codex, [{"sandbox": "read-only"}])` / `assert_pi_calls(hw.pi, [...])` for per-backend assertions.
+The `HarnessWorld` exposes `hw.codex` / `hw.pi` / `hw.antigravity` (the fake instance) and `hw.backend`. Use `assert_codex_calls(hw.codex, [{"sandbox": "read-only"}])` / `assert_pi_calls(hw.pi, [...])` / `assert_antigravity_calls(hw.antigravity, [...])` for per-backend assertions.
 
-The transition test suite runs `CODEX_TRANSITIONS` (a curated subset of `TRANSITIONS`) against the Codex backend via `test_transition_codex`, and `PI_TRANSITIONS` (a curated subset that exercises the paths where pi diverges from codex — plan/review **with** read-only enforcement, and a `/retry` that forks from a checkpoint) against the pi backend via `test_transition_pi`. Azure is excluded (GitHub-only) to keep the matrix manageable.
+The transition test suite runs `CODEX_TRANSITIONS` (a curated subset of `TRANSITIONS`) against the Codex backend via `test_transition_codex`, and `PI_TRANSITIONS` (a curated subset that exercises the paths where pi diverges from codex — plan/review **with** read-only enforcement, and a `/retry` that forks from a checkpoint) against the pi backend via `test_transition_pi`. Azure is excluded from both (GitHub-only) to keep the matrix manageable. `ANTIGRAVITY_TRANSITIONS` (a curated subset that exercises the paths where antigravity diverges from both — read-only enforcement via the staged per-run `--settings` block, `--conversation` resume-in-place with **no** session fork even on a matching-provenance `/retry`, and MCP comment posting through the eager `mcp_autoswe_comment_*` names) runs against the antigravity backend via `test_transition_antigravity`. Unlike the codex/pi axes, the antigravity axis is parametrised over **both providers** (github and azure): the agy divergence surface is provider-independent, so the azure conversion of these rows is itself part of the coverage.
 
 ## Three-Layer Test Fixtures
 

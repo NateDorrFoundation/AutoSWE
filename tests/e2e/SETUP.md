@@ -119,6 +119,31 @@ the repo entry, resolved against `config/harnesses.json`. See
 Pick the combination for the pass you are running from [`MATRIX.md`](MATRIX.md), set it before
 seeding the issues, and do not change it mid-pass.
 
+### Pass E: the `agy-live` profile
+
+Pass E binds all three phases to the `agy-live` profile — set `plan_harness`, `fix_harness`
+and `review_harness` to `agy-live` before seeding, and leave them for the whole pass. The
+profile lives in the box's gitignored `config/harnesses.json`; author it like:
+
+```json
+"agy-live": {
+  "_comment": "Antigravity CLI headless (agy) on the Linux box. Auth: run `agy` once interactively first (BYOK bridge on this box; headless dispatch reuses that session). Set useG1Credits=false in ~/.gemini/antigravity-cli/settings.json. cli_path and log_dir absolute: agy is not on the default non-login PATH, so under cron `which agy` fails.",
+  "backend": "antigravity",
+  "model": "<the model in the host's ~/.gemini/antigravity-cli/settings.json>",
+  "cli_path": "/home/megibot/.local/bin/agy",
+  "log_dir": "/home/megibot/.autoswe/agy-logs"
+}
+```
+
+`cli_path` **must** be absolute — `agy` is not on the default non-login PATH, so a bare
+`agy` (or `~/.local/bin/agy`) fails to resolve under cron. The `model` must match the host's
+`~/.gemini/antigravity-cli/settings.json` — there is no profile default.
+
+One-time prerequisite: run `agy` interactively once on the box to authenticate (the BYOK
+bridge on this box; headless dispatch reuses that session afterwards). `useG1Credits=false`
+is recommended in the host settings to avoid overage billing. No warm-up step is needed —
+unlike pi, an agy cold start needs nothing pre-seeded.
+
 ---
 
 ## 4. Pre-flight
