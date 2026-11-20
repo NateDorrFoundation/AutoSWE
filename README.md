@@ -186,7 +186,7 @@ Run plan on Claude and fix on Codex, go all-Codex to drop the Anthropic dependen
 
 - Python 3.10+
 - Git
-- A coding backend: **Claude Code CLI** (ships with autoSWE, needs an Anthropic API key) and/or the **Codex CLI** (`npm i -g @openai/codex`, needs an OpenAI/Codex key — or a local provider)
+- A coding backend: **Claude Code CLI** (ships with autoSWE, needs an Anthropic API key), and/or the **Codex CLI** (`npm i -g @openai/codex`, needs an OpenAI/Codex key — or a local provider), and optionally the **pi CLI** (`npm i -g @earendil-works/pi-coding-agent`) or the **Antigravity CLI** (`agy`, user-level install with one-time interactive auth — see [docs/autoswe/harnesses.md](docs/autoswe/harnesses.md))
 - GitHub PAT with `repo` scope (or Azure DevOps PAT)
 
 ## Configuration

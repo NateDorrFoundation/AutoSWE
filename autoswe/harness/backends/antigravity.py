@@ -159,7 +159,11 @@ def _query_agy_version(exe: str) -> str | None:
         proc = subprocess.run(
             [exe, "--version"], capture_output=True, text=True, timeout=15
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        # UnicodeDecodeError is a ValueError raised by the strict-UTF-8 decode
+        # inside subprocess.run(text=True) on a pathological CLI response —
+        # same gap class as the pi.py _write_pi_mcp_json read arm.  Swallowed
+        # to keep this function's "never raises" contract.
         return None
     if proc.returncode != 0:
         return None

@@ -1962,3 +1962,21 @@ def test_run_path_checks_version_once_with_resolved_exe(monkeypatch):
 
 def test_query_agy_version_swallows_missing_binary(tmp_path):
     assert agy_mod._query_agy_version(str(tmp_path / "nope-agy")) is None
+
+
+def test_query_agy_version_swallows_undecodable_output(monkeypatch):
+    """A strict-UTF-8 decode failure (a ValueError, not an OSError) must not escape.
+
+    Same gap class as ``pi.py::_write_pi_mcp_json``'s read arm: ``text=True``
+    decodes with strict UTF-8, so a pathological CLI response raises
+    ``UnicodeDecodeError`` from inside ``subprocess.run`` itself — outside the
+    ``OSError``/``SubprocessError`` tuple.  Swallowed to an unqueryable ``None``
+    to honour ``_warn_if_below_floor``'s documented "never raises, never fails
+    the run" contract.
+    """
+
+    def boom(*args, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(agy_mod.subprocess, "run", boom)
+    assert agy_mod._query_agy_version("/usr/bin/agy") is None
