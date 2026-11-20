@@ -1659,6 +1659,38 @@ def test_merge_preserves_foreign_servers_and_top_level_keys(agy_config_path):
     assert written["mcpServers"]["autoswe_comment"]["command"] != "STALE"
 
 
+def test_merge_prunes_stale_owned_inline_entry(agy_config_path):
+    """A GitHub fix run writes autoswe_inline_comment; the global file keeps it
+    for later runs.  A run whose spec has NO inline entry (plan/review, or an
+    Azure fix) must prune that stale autoSWE-owned entry — the agent must not
+    see an inline server that can only fail server-side — while the owned
+    autoswe_comment entry is refreshed and foreign keys are untouched."""
+    seeded = {
+        "mcpServers": {
+            "operator_server": {"command": "npx", "args": ["-y", "something"]},
+            "autoswe_comment": {"command": "STALE", "args": []},
+            "autoswe_inline_comment": {
+                "command": "/usr/bin/python3",
+                "args": ["-m", "mcp_servers.autoswe_inline_comment_server"],
+                "cwd": "/old/checkout",
+            },
+        },
+    }
+    agy_config_path.parent.mkdir(parents=True)
+    agy_config_path.write_text(json.dumps(seeded, indent=2) + "\n", encoding="utf-8")
+
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    # _mcp_spec()'s default carries autoswe_comment only — no inline, the
+    # read_only/Azure shape from the finding.
+    _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
+
+    written = json.loads(agy_config_path.read_text(encoding="utf-8"))
+    assert written["mcpServers"]["autoswe_comment"]["command"] != "STALE"
+    assert "autoswe_inline_comment" not in written["mcpServers"]
+    # Foreign servers are never pruned — ownership covers autoSWE keys only.
+    assert written["mcpServers"]["operator_server"] == seeded["mcpServers"]["operator_server"]
+
+
 def test_merge_is_idempotent_compare_before_write(agy_config_path):
     proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
     spec = _mcp_spec(agy_config_path.parent.parent)

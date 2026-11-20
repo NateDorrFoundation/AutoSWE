@@ -289,6 +289,15 @@ def _mcp_comment_active(spec: RunSpec) -> bool:
     return isinstance(cfg, dict)
 
 
+# The only keys autoSWE ever writes into the global mcpServers map.  An owned
+# key present on disk but absent from the current run's owned set is a stale
+# autoSWE entry — e.g. an ``autoswe_inline_comment`` left behind by a GitHub
+# fix run now facing a review/Azure run with no inline spec — and is pruned,
+# so the agent never sees a registered server that can only fail server-side.
+# Foreign keys are never in this tuple and are therefore never touched.
+_OWNED_MCP_KEYS = ("autoswe_comment", "autoswe_inline_comment")
+
+
 def _merge_antigravity_mcp_config(owned_entries: dict[str, dict]) -> None:
     """Entry-scoped merge of autoSWE's servers into the agy global mcp_config.
 
@@ -296,10 +305,12 @@ def _merge_antigravity_mcp_config(owned_entries: dict[str, dict]) -> None:
     autoSWE owns **only** the keys in *owned_entries* (``autoswe_comment`` and
     optionally ``autoswe_inline_comment``) — every other server and top-level
     key an operator put in the file is preserved, exactly like
-    ``pi.py:_write_pi_mcp_json``.  The file carries stable values only (per-
-    task env rides the subprocess env, M3), so the serialized bytes are equal
-    for every task: **compare before writing** and skip the write when the
-    file already matches (the host-stable file is written once).
+    ``pi.py:_write_pi_mcp_json``.  Owned keys present on disk but absent from
+    *owned_entries* are stale and pruned (see ``_OWNED_MCP_KEYS``).  The file
+    carries stable values only (per-task env rides the subprocess env, M3),
+    so the serialized bytes are equal for every task: **compare before
+    writing** and skip the write when the file already matches (the
+    host-stable file is written once).
 
     Best-effort: a corrupt/unreadable file is rewritten fresh; any OSError
     (read-only home, …) is logged, never raised — the run degrades to the
@@ -330,6 +341,9 @@ def _merge_antigravity_mcp_config(owned_entries: dict[str, dict]) -> None:
     if not isinstance(servers, dict):
         servers = {}
     servers.update(owned_entries)
+    for key in _OWNED_MCP_KEYS:
+        if key not in owned_entries:
+            servers.pop(key, None)
     existing["mcpServers"] = servers
 
     payload = json.dumps(existing, indent=2) + "\n"
