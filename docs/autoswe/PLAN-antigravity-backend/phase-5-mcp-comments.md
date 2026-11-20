@@ -135,4 +135,41 @@ Otherwise write "no warm-up needed (eager registration)" in the spike doc and sk
 
 - [ ] Live: `/plan` on the test project posts the plan through MCP (sticky comment finalized
       in place, no `<AUTOSWE_PLAN>` scraping in the log), on GitHub **and** Azure
-- [ ] Gate green
+- [x] Gate green (2026-11-20, issue #322: `pytest -q -m "not live"` + `ruff check autoswe tests scripts` clean)
+
+## Completion record (2026-11-20, issue #322)
+
+Implemented exactly as specified above, on the `autoswe/issue-322` branch off
+`antigravity`:
+
+- `mcp_config.py`: `comment_server_launch` (shared launch triple with pi),
+  `antigravity_comment_server` (timeoutSeconds + three `eager: true` tools),
+  `build_antigravity_mcp_config`, `antigravity_mcp_config_path` (home resolved
+  at call time). Phase 4 Option C means the global file is the only surface
+  (M4: unshadowable), so §5.1's Option-A run-dir variant does not apply.
+- `antigravity.py`: `_mcp_comment_active` trigger; entry-scoped
+  `_merge_antigravity_mcp_config` (foreign servers preserved, compare-before-
+  write, OSError → log + text fallback, never raise); per-task env routed to
+  the agy subprocess env only (M3), inline entry written verbatim-minus-`env`;
+  `_classify_mcp_comment_call` (eager names incl. string-`Arguments` lazy
+  proxy fallback); ACTIVE-classify with DONE/ERROR `tool_info.error` un-set
+  (§5.3) over per-role call counts — an earlier successful post keeps its
+  flag when a later one fails; `mcp` capability + `ANTIGRAVITY_COMMENT_TOOL_NAMES`.
+  §5.4 needed no production change (Phase 4 already allowed
+  `mcp(autoswe_comment/*)` / `mcp(autoswe_inline_comment/*)`); §5.5 SKIPPED
+  per M5 — no warm-up, `cli.py:_cmd_warmup` untouched.
+- Tests: `test_antigravity_backend.py` (classifier, merge semantics, env
+  routing incl. never-in-file bytes, flag semantics incl. the Risks edge),
+  `test_config.py` (builders/path), `test_backend_capabilities.py`,
+  `test_backend_parity.py` (name + capability parity), `test_prompts.py`
+  (agy eager names render), `test_planner_returns.py` (has_mcp branch on the
+  agy axis), `AntigravityFake` (`mcp=True/"lazy"/mcp_error` scripting),
+  scenario feeder (`mcp_tool` → eager tool pair), and two new
+  `ANTIGRAVITY_TRANSITIONS` rows (`agy_plan_mcp_post_plan`,
+  `agy_plan_mcp_post_question`); `fresh_plan_command` is the kept
+  text-fallback row (mcp advertised, tool never called).
+
+**Gate:** green (offline suite + ruff).
+**Live exit criterion:** NOT yet checked — requires a host with the `agy`
+binary (absent here). The two live boxes above stay open for the Phase 6
+dedicated-box pass.

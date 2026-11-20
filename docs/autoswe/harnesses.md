@@ -548,7 +548,7 @@ endpoints — see its README for the ToC and refresh commands). Start with
 `cli-headless.md`, `cli-reference.md`, then `sdk-overview.md`, `sdk-tools.md`, `sdk-mcp.md`.
 
 **Implementation plan:** `docs/autoswe/PLAN-antigravity-backend/` (README + Phases 0–7,
-proposed 2026-11-18; Phases 0–4 complete).
+proposed 2026-11-18; Phases 0–5 complete — Phase 5 MCP comment posting is issue #322).
 
 **Resolved by the Phase 0 spike** (go/no-go table in `spike-antigravity.md`):
 headless print mode **does** emit a usable streaming protocol — `init →
@@ -655,10 +655,54 @@ boundary into the `FAILED:` comment (transition row
 are logged at **info** level on a read-only run — there they are the deny
 block *working* — and at `[WARN]` elsewhere.
 
-**Capabilities (not yet supported):** `mcp` (Phase 5 wires the comment-posting
-server through `--settings`), `session_fork` (agy resumes in place via
+**Capabilities (not yet supported):** `session_fork` (agy resumes in place via
 `--conversation`; `/retry` degrades to a fresh run), and the Claude-only SDK
 levers `can_use_tool`/`plan_permission`/`plan_file`.
+
+**MCP comment posting (Phase 5, issue #322 — `mcp` is advertised).** When a
+run's `spec.mcp_servers` names `autoswe_comment`
+(`antigravity.py:_mcp_comment_active`, the same trigger as pi):
+
+- **Global `~/.gemini/config/mcp_config.json`, entry-scoped merge.**
+  `antigravity.py:_merge_antigravity_mcp_config` (path helper
+  `mcp_config.antigravity_mcp_config_path()`, home resolved at call time)
+  merges ONLY autoSWE's owned keys (`autoswe_comment`, optionally
+  `autoswe_inline_comment`) into the operator's file: foreign servers and
+  top-level keys are preserved, the payload is compared before writing (the
+  file carries stable values, so it is written at most once per host), and
+  any `OSError` is logged and never raised — the run degrades to the text
+  fallback. A workspace `.agents/mcp_config.json` can never shadow the global
+  `autoswe_comment` entry (spike M4), which is what makes the global file
+  safe under Phase 4's Option C (`--settings`) instead of a run dir.
+- **Eager registration.** The entry (
+  `mcp_config.antigravity_comment_server`, shared launch triple with pi via
+  `comment_server_launch`) marks `post_plan`/`post_question`/
+  `update_progress` `"eager": true`, making them first-class stream steps
+  named `mcp_autoswe_comment_<tool>` — single underscores; M2 pinned
+  `mcp_autoswe_comment_post_plan` on the live binary. The lazy
+  `call_mcp_tool` proxy shape (`{ServerName, ToolName, Arguments}`,
+  `Arguments` possibly a JSON string) is still parsed as a fallback by
+  `antigravity.py:_classify_mcp_comment_call`. The names the prompt renders
+  (`comment_tool_names()`) are exactly the names the parser keys on.
+- **Per-task env rides the subprocess env only** (M3): the server entry's
+  `env` block (comment id, PAT, provider, …) is merged into the `agy`
+  process env and NEVER into the config file. Never write a worktree
+  `.agents/mcp_config.json`.
+- **ACTIVE-classify + DONE/ERROR un-set (§5.3, stricter than pi).** Flags
+  are set optimistically on the ACTIVE step; the paired terminal step (same
+  `step_index`) carrying `tool_info.error` un-sets them, so an
+  answered-but-failed post never suppresses the planner's text fallback.
+  Per-role call counts keep an earlier successful post's flag set when a
+  later one fails. `post_question` then `post_plan` in one run: the plan is
+  ignored (question-terminal, issue #230). `update_progress` feeds the live
+  progress callback with its body.
+- With `mcp` advertised the planner's `has_mcp` branch engages for agy:
+  `plan_posted` → PLAN_READY (plus the #241 sticky re-push of
+  `plan_posted_body`), `question_posted` → WAITING. Text/structured capture
+  still works when the tool was never called — `fresh_plan_command` is the
+  kept text-fallback row on this axis; transition rows
+  `agy_plan_mcp_post_plan` / `agy_plan_mcp_post_question` pin the MCP path
+  end-to-end.
 
 ### Shared RunSpec → RunResult contract (backends/base.py)
 

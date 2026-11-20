@@ -352,12 +352,32 @@ def test_pi_backend_fresh_run_mints_session_id():
 
 def test_antigravity_backend_capabilities_exact():
     """AntigravityBackend advertises resume + progress_stream +
-    structured_output (Phase 1 §1.8) + mode (Phase 4 §4.5).  mcp (Phase 5),
-    session_fork (no primitive), can_use_tool and plan_file are absent."""
+    structured_output (Phase 1 §1.8) + mode (Phase 4 §4.5) + mcp (Phase 5
+    §5.3).  session_fork (no primitive), can_use_tool and plan_file are
+    absent."""
     from autoswe.harness.backends.antigravity import AntigravityBackend
 
     caps = AntigravityBackend.capabilities()
-    assert caps == {"resume", "progress_stream", "structured_output", "mode"}
+    assert caps == {"resume", "progress_stream", "structured_output", "mode", "mcp"}
+
+
+def test_antigravity_backend_has_mcp_capability():
+    """Phase 5: agy advertises 'mcp' so the planner's has_mcp branch engages —
+    but ONLY because the stream parser sets plan_posted/question_posted from
+    real tool steps (§5.3), not as an empty advertisement."""
+    from autoswe.harness.backends.antigravity import (
+        ANTIGRAVITY_COMMENT_TOOL_NAMES,
+        AntigravityBackend,
+    )
+
+    assert "mcp" in AntigravityBackend.capabilities()
+    # The advertised names are the eager stream names the parser classifies.
+    names = set(ANTIGRAVITY_COMMENT_TOOL_NAMES.values())
+    assert names == {
+        "mcp_autoswe_comment_post_plan",
+        "mcp_autoswe_comment_post_question",
+        "mcp_autoswe_comment_update_progress",
+    }
 
 
 def test_antigravity_backend_no_session_fork_capability():

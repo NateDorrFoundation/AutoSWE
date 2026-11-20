@@ -421,16 +421,37 @@ def patched_world(
         #   permission_mode   - pin the init attestation (skip the spawn-time
         #                       derivation from the flags) — scripts the §4.4
         #                       read-only self-check mismatch row
+        # Beyond those, a dict may carry an ``"mcp_tool"`` key naming one of
+        # the autoswe_comment tools ("post_plan" / "post_question") so a
+        # transition row can script the eager ``mcp_autoswe_comment_*`` tool
+        # pair (ACTIVE+DONE sharing a step_index, §5.3); the row's "text" is
+        # then the tag-free assistant text that accompanied the tool call (the
+        # plan/question is on the thread via MCP, not in the text).
         for resp in claude_responses:
-            ag_fake.script_response(
-                resp["text"],
-                session_id=resp.get("session_id", "s1"),
-                subtype=resp.get("subtype", "success"),
-                structured_output=resp.get("structured_output"),
-                error=resp.get("error"),
-                status=resp.get("status"),
-                permission_mode=resp.get("permission_mode"),
-            )
+            mcp_tool = resp.get("mcp_tool")
+            if mcp_tool:
+                # The script_mcp_* builders are success-only (the MCP tool
+                # call is the whole point of the row), so no subtype is
+                # threaded.  plan_posted_body threads the same body the claude
+                # axis scripts (issue #241 parity); fall back to the text.
+                scripter = {
+                    "post_plan": ag_fake.script_mcp_plan,
+                    "post_question": ag_fake.script_mcp_question,
+                }[mcp_tool]
+                scripter(
+                    resp.get("plan_posted_body") or resp["text"],
+                    session_id=resp.get("session_id", "s1"),
+                )
+            else:
+                ag_fake.script_response(
+                    resp["text"],
+                    session_id=resp.get("session_id", "s1"),
+                    subtype=resp.get("subtype", "success"),
+                    structured_output=resp.get("structured_output"),
+                    error=resp.get("error"),
+                    status=resp.get("status"),
+                    permission_mode=resp.get("permission_mode"),
+                )
     elif backend == "pi":
         cx_fake = None
         pi_fake = PiFake()
@@ -516,6 +537,20 @@ def patched_world(
             pm.patch_pi(pi_fake)
         elif backend == "antigravity":
             pm.patch_antigravity(ag_fake)
+            # Phase 5: an agy run with a sticky comment carries mcp_servers, so
+            # the backend merges its entry into the GLOBAL
+            # ~/.gemini/config/mcp_config.json. Redirect that into the
+            # isolated dir — the test host's real agy config must never be
+            # touched (and the merge stays observable for assertions).
+            import autoswe.harness.backends.antigravity as agy_mod
+
+            agy_orig_path = agy_mod.antigravity_mcp_config_path
+            agy_mod.antigravity_mcp_config_path = lambda: (
+                isolated_dir / ".gemini-config" / "mcp_config.json"
+            )
+            pm.add(lambda: setattr(
+                agy_mod, "antigravity_mcp_config_path", agy_orig_path
+            ))
         else:
             pm.patch_claude(cl_fake)
 

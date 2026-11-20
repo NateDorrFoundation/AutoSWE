@@ -25,6 +25,10 @@ import asyncio
 import json
 from typing import Any
 
+# The eager MCP spellings are imported from the backend, not copied — the fake
+# must emit exactly the names the real stream classifier matches (Phase 5).
+from autoswe.harness.backends.antigravity import ANTIGRAVITY_COMMENT_TOOL_NAMES
+
 # Capture the real function at import time — before any test can patch.
 # This is the only reference to the genuine function; patch/unpatch use it
 # so the value is stable regardless of how many times the attribute is
@@ -134,6 +138,40 @@ def _step_tool_done(cid: str, index: int, tool_name: str,
         "tool_name": tool_name,
         "tool_info": tool_info,
     }}
+
+
+def _mcp_comment_steps(cid: str, index: int, tool: str, body: str,
+                       *, lazy: bool = False,
+                       error: dict | None = None,
+                       arguments_as_string: bool = False) -> list[dict]:
+    """ACTIVE + terminal step pair for one autoswe_comment tool call.
+
+    Fixture-confirmed (tool_error_recovered.jsonl): a tool call's ACTIVE and
+    DONE/ERROR steps **share the step_index** — the backend's DONE-step
+    un-set logic keys off it, so the pair must use the same index here.
+    *tool* is the bare role ("post_plan" / "post_question" /
+    "update_progress"); *lazy* switches from the eager name
+    (``mcp_autoswe_comment_<tool>``) to the ``call_mcp_tool`` proxy shape
+    ``{ServerName, ToolName, Arguments}`` (mcp.md "lazy vs eager" step 3);
+    *arguments_as_string* scripts ``Arguments`` as a JSON string, which the
+    real CLI also produces.  *error* is the tool_error_recovered error dict
+    carried on the terminal step (the §5.3 failed-post shape).
+    """
+    if lazy:
+        name = "call_mcp_tool"
+        arguments: dict | str = {"body": body}
+        if arguments_as_string:
+            arguments = json.dumps(arguments)
+        params = {"ServerName": "autoswe_comment", "ToolName": tool,
+                  "Arguments": arguments}
+    else:
+        name = ANTIGRAVITY_COMMENT_TOOL_NAMES[tool]
+        params = {"body": body}
+    return [
+        _step_tool_active(cid, index, name, params),
+        _step_tool_done(cid, index, name,
+                        output=None if error else "ok", error=error),
+    ]
 
 
 def _result_line(cid: str, status: str, response: str = "",
@@ -624,37 +662,95 @@ class AntigravityFake:
         else:
             raise ValueError(f"unknown scripted stream kind: {kind!r}")
 
-    def script_plan(self, plan_md: str, session_id: str = "s1") -> None:
+    def script_plan(self, plan_md: str, session_id: str = "s1", *,
+                    mcp: bool | str = False,
+                    mcp_body: str | None = None,
+                    mcp_error: bool = False) -> None:
         """Add a plan-phase response.
 
-        Wraps the plan in ``<AUTOSWE_PLAN>`` tags in the assistant response —
-        the planner's tag parsing must keep working (agy has no plan file and
-        no MCP yet, so text-pattern plan capture is the Phase 3 path; the
-        structured-output path is ``script_structured``).
+        Default (``mcp=False``): wraps the plan in ``<AUTOSWE_PLAN>`` tags in
+        the assistant response — the planner's text-pattern fallback must keep
+        working (this is the "mcp advertised but the agent never called the
+        tool" path).  ``script_structured`` covers the structured-output path.
+
+        ``mcp=True``: emits the eager ``mcp_autoswe_comment_post_plan``
+        ACTIVE+DONE step pair (M2 spelling, imported from the backend) — the
+        plan body is on the thread via MCP, so the response text carries no
+        tags.  ``mcp="lazy"`` scripts the ``call_mcp_tool`` proxy shape
+        instead.  ``mcp_error=True`` makes the terminal step carry
+        ``tool_info.error`` — the §5.3 case where the backend must un-set
+        ``plan_posted`` so the planner's text fallback stays available.
         """
-        self.script_response(
-            f"<AUTOSWE_PLAN>{plan_md}</AUTOSWE_PLAN>", session_id=session_id)
+        if mcp:
+            self._add(_success_stream(
+                session_id, "",
+                tool_steps=_mcp_comment_steps(
+                    session_id, 1, "post_plan",
+                    mcp_body if mcp_body is not None else plan_md,
+                    lazy=(mcp == "lazy"),
+                    error=({"type": "mcp_tool_error", "message": "post_plan failed"}
+                           if mcp_error else None))))
+        else:
+            self.script_response(
+                f"<AUTOSWE_PLAN>{plan_md}</AUTOSWE_PLAN>", session_id=session_id)
 
     def script_questions(self, questions: str, session_id: str = "s1",
-                         *, mcp: bool = False,
-                         mcp_body: str | None = None) -> None:
-        """Add a plan-phase response with questions (text-pattern path).
+                         *, mcp: bool | str = False,
+                         mcp_body: str | None = None,
+                         mcp_error: bool = False) -> None:
+        """Add a plan-phase response with questions.
 
-        *mcp* is the Phase 5 switch and stays off for now: when enabled it
-        emits an eager ``mcp__autoswe_comment__post_question`` tool step (the
-        Claude-spelling name the backend's comment_tool_names advertises).
-        Note that without the "mcp" capability the real parser will NOT set
-        ``question_posted`` — the tags in the response text are what drive
-        WAITING through Phase 3/7.
+        Default: ``<AUTOSWE_QUESTIONS>`` tags (text-pattern path).  With
+        *mcp* (``True`` eager / ``"lazy"`` proxy) the question arrives as an
+        ``autoswe_comment post_question`` step pair instead — the parser's
+        ``question_posted`` flag (now that the backend advertises ``mcp``) is
+        what drives WAITING.  *mcp_error* scripts the failed post (§5.3).
         """
-        tool_steps = None
         if mcp:
-            tool_steps = [_step_tool_active(
-                session_id, 1, "mcp__autoswe_comment__post_question",
-                {"body": mcp_body if mcp_body is not None else questions})]
+            self._add(_success_stream(
+                session_id, "",
+                tool_steps=_mcp_comment_steps(
+                    session_id, 1, "post_question",
+                    mcp_body if mcp_body is not None else questions,
+                    lazy=(mcp == "lazy"),
+                    error=({"type": "mcp_tool_error", "message": "post_question failed"}
+                           if mcp_error else None))))
+        else:
+            self._add(_success_stream(
+                session_id,
+                f"<AUTOSWE_QUESTIONS>{questions}</AUTOSWE_QUESTIONS>"))
+
+    def script_mcp_plan(self, plan_body: str, session_id: str = "s1",
+                        *, proxy: str = "direct",
+                        text: str = "") -> None:
+        """Add a response that calls the autoswe_comment post_plan tool.
+
+        Mirrors ``PiFake.script_mcp_plan``: *proxy* selects the stream shape
+        (``"direct"`` = eager ``mcp_autoswe_comment_post_plan`` name,
+        ``"lazy"`` = the ``call_mcp_tool`` proxy); the plan body rides the
+        tool step, the assistant text may be empty.
+        """
         self._add(_success_stream(
-            session_id, f"<AUTOSWE_QUESTIONS>{questions}</AUTOSWE_QUESTIONS>",
-            tool_steps=tool_steps))
+            session_id, text,
+            tool_steps=_mcp_comment_steps(
+                session_id, 1, "post_plan", plan_body, lazy=(proxy == "lazy"))))
+
+    def script_mcp_question(self, question_body: str, session_id: str = "s1",
+                            *, proxy: str = "direct",
+                            text: str = "") -> None:
+        """Add a response that calls the autoswe_comment post_question tool."""
+        self._add(_success_stream(
+            session_id, text,
+            tool_steps=_mcp_comment_steps(
+                session_id, 1, "post_question", question_body,
+                lazy=(proxy == "lazy"))))
+
+    def script_mcp_update_progress(self, body: str, session_id: str = "s1",
+                                   text: str = "") -> None:
+        """Add a response that calls the autoswe_comment update_progress tool."""
+        self._add(_success_stream(
+            session_id, text,
+            tool_steps=_mcp_comment_steps(session_id, 1, "update_progress", body)))
 
     def script_fix(self, summary: str = "Changes applied.",
                    files: tuple[str, ...] = (),

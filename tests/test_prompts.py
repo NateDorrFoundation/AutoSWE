@@ -339,6 +339,40 @@ def test_bundled_plan_prompt_renders_stop_rule_for_backend_tool_name():
     assert "{{" not in prompt
 
 
+def test_bundled_plan_prompt_renders_antigravity_eager_names():
+    """Phase 5: the same template renders agy's eager single-underscore names.
+
+    The planner passes runner.comment_tool_names(agy cfg) into the prompt, so
+    the agent is told the exact stream step names the parser will classify.
+    """
+    from autoswe.harness.backends.antigravity import ANTIGRAVITY_COMMENT_TOOL_NAMES
+    from autoswe.harness.prompts import build_plan_prompt
+
+    task = {
+        "owner": "o",
+        "repo": "r",
+        "issue_number": 322,
+        "title": "T",
+        "body": "B",
+        "base_branch": "main",
+        "_token": "tok",
+    }
+    prompt = build_plan_prompt(
+        task,
+        comments=[],
+        repo_cfg={"plan_prompt": str(_bundled_plan_prompt_path())},
+        guidance=None,
+        tool_names=dict(ANTIGRAVITY_COMMENT_TOOL_NAMES),
+    )
+    assert prompt.count("mcp_autoswe_comment_post_question") >= 2
+    assert "mcp_autoswe_comment_post_plan" in prompt
+    # The eager names have NO double underscore — a Claude-shaped name here
+    # would name a tool that does not exist on the agy stream.
+    assert "mcp__" not in prompt
+    assert "STOP immediately and end your turn" in prompt
+    assert "{{" not in prompt
+
+
 def test_build_fix_prompt_uses_custom_template(isolated_autoswe_dir, monkeypatch):
     """build_fix_prompt should use a custom fix template from repo_cfg."""
     prompt_dir = isolated_autoswe_dir / "config" / "prompts"

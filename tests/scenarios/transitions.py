@@ -2108,6 +2108,78 @@ TRANSITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "agy_plan_mcp_post_plan",
+        "description": (
+            "Phase 5: fresh /plan where the agent posts through the comment MCP "
+            "server — the agy stream carries the eager post_plan pair "
+            "(ACTIVE+DONE sharing one step_index), the parser sets "
+            "plan_posted/plan_posted_body, and the planner's has_mcp branch "
+            "returns PLAN_READY with no text tag and no structured payload. "
+            "The captured body is re-pushed through the sticky progress "
+            "comment (issue #241). On the default claude_code axis ClaudeFake "
+            "honors the same plan_posted=True (mcp_tool is agy-feed-only), so "
+            "both axes reach planned with the same '## Plan' comment — only "
+            "the mechanism that observed the post differs."
+        ),
+        "meta": {"mcp_plan_posted": True},
+        "start": {
+            "issue": {"body": "/plan"},
+            "queue_task": None,
+        },
+        "claude_responses": [
+            {
+                "text": "Posted the plan to the issue.",  # tag-free on purpose
+                "session_id": "s-agy-plan-42",
+                "subtype": "success",
+                "plan_posted": True,
+                "mcp_tool": "post_plan",
+                "plan_posted_body": "Step 1: wire the stream parser.",
+            },
+        ],
+        "git_calls": ["create_worktree"],
+        "expect": {
+            "label_after": "autoswe:planned",
+            "autoswe_status": "planned",
+            "session_id": "s-agy-plan-42",
+            "pending_command": None,
+            # The plan lands on the thread via the sticky PATCH channel, not
+            # as a separate new comment from tag-scraping.
+            "comment_contains": ["## Plan", "Step 1: wire the stream parser."],
+            "claude_permission": "plan",
+        },
+    },
+    {
+        "name": "agy_plan_mcp_post_question",
+        "description": (
+            "Phase 5: fresh /plan where the agent asks through the comment MCP "
+            "server — the agy stream carries the eager post_question pair, the "
+            "parser sets question_posted, and the planner's has_mcp branch "
+            "returns WAITING: questions with tag-free text (question-terminal, "
+            "issue #230). The sticky freezes on the question; the task parks "
+            "in waiting on BOTH axes (ClaudeFake honors question_posted=True)."
+        ),
+        "start": {
+            "issue": {"body": "/plan"},
+            "queue_task": None,
+        },
+        "claude_responses": [
+            {
+                "text": "Asked the user which DB to target.",  # tag-free
+                "session_id": "s-agy-plan-42",
+                "subtype": "success",
+                "question_posted": True,
+                "mcp_tool": "post_question",
+            },
+        ],
+        "git_calls": ["create_worktree"],
+        "expect": {
+            "label_after": "autoswe:waiting",
+            "autoswe_status": "waiting",
+            "session_id": "s-agy-plan-42",
+            "claude_permission": "plan",
+        },
+    },
+    {
         "name": "agy_plan_permission_mode_mismatch",
         "description": (
             "antigravity-specific (Phase 4 §4.4): /plan whose init attests "
@@ -3616,9 +3688,11 @@ PI_TRANSITIONS: list[str] = [
 # azure conversion of these rows is itself part of the Phase 3 exit criteria.
 
 ANTIGRAVITY_TRANSITIONS: list[str] = [
-    "fresh_plan_command",                       # text-pattern plan + staged --settings enforcement (mode, no skip flag)
+    "fresh_plan_command",                       # text-pattern plan + staged --settings enforcement (mode, no skip flag); Phase 5: also the kept text-fallback row — mcp advertised, tool never called, planner falls through to tag parse
     "agy_plan_structured_output",               # --json-schema plan payload preferred over the tags
     "agy_plan_waiting_status",                  # result WAITING → planner parks the task in waiting
+    "agy_plan_mcp_post_plan",                   # Phase 5: eager post_plan tool pair → has_mcp PLAN_READY + #241 re-push
+    "agy_plan_mcp_post_question",               # Phase 5: eager post_question tool pair → has_mcp WAITING (question-terminal)
     "agy_plan_permission_mode_mismatch",        # §4.4: init attests always-proceed on a plan run → backend refuses → failed
     "fresh_fix_command",                        # Fix phase: fresh run, default --dangerously-skip-permissions
     "plan_ready_then_fix",                      # fix from planned → --conversation resumes the checkpoint

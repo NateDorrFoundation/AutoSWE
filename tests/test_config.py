@@ -94,6 +94,95 @@ def test_autoswe_repo_root_points_at_mcp_servers():
 
 
 # ---------------------------------------------------------------------------
+# agy mcp_config.json builder (autoswe.harness.mcp_config) — Phase 5 of
+# PLAN-antigravity-backend.md
+# ---------------------------------------------------------------------------
+
+
+def test_comment_server_launch_is_the_shared_triple():
+    """comment_server_launch is the launch bits pi and agy both spread."""
+    from autoswe.harness.mcp_config import (
+        antigravity_comment_server,
+        comment_server_launch,
+        pi_mcp_comment_server,
+    )
+
+    launch = comment_server_launch("/usr/bin/python3", "/opt/autoswe")
+    assert launch == {
+        "command": "/usr/bin/python3",
+        "args": ["-m", "mcp_servers.autoswe_comment_server"],
+        "cwd": "/opt/autoswe",
+    }
+    # Both backends start the server identically — the launch triple can never
+    # drift between the two configs.
+    for server in (antigravity_comment_server("/usr/bin/python3", "/opt/autoswe"),
+                   pi_mcp_comment_server("/usr/bin/python3", "/opt/autoswe")):
+        assert {k: server[k] for k in launch} == launch
+
+
+def test_antigravity_comment_server_entry():
+    """The agy entry adds exactly timeoutSeconds + eager tools per §5.1."""
+    from autoswe.harness.mcp_config import antigravity_comment_server
+
+    server = antigravity_comment_server("/usr/bin/python3", "/opt/autoswe")
+    assert server == {
+        "command": "/usr/bin/python3",
+        "args": ["-m", "mcp_servers.autoswe_comment_server"],
+        "cwd": "/opt/autoswe",
+        "timeoutSeconds": 120,
+        "tools": {
+            "post_plan": {"eager": True},
+            "post_question": {"eager": True},
+            "update_progress": {"eager": True},
+        },
+    }
+    # No per-task values bake into the file — stable bytes only.
+    assert "env" not in server
+    assert "AUTOSWE_TOKEN" not in str(server)
+
+
+def test_build_antigravity_mcp_config_shape():
+    from autoswe.harness.mcp_config import (
+        antigravity_comment_server,
+        build_antigravity_mcp_config,
+    )
+
+    cfg = build_antigravity_mcp_config("/usr/bin/python3", "/opt/autoswe")
+    assert set(cfg.keys()) == {"mcpServers"}
+    assert cfg["mcpServers"]["autoswe_comment"] == antigravity_comment_server(
+        "/usr/bin/python3", "/opt/autoswe"
+    )
+
+
+def test_antigravity_mcp_config_path_is_global_and_home_resolved_at_call():
+    """The global ~/.gemini/config/mcp_config.json — resolved at CALL time."""
+    from autoswe.harness.mcp_config import antigravity_mcp_config_path
+
+    p = antigravity_mcp_config_path()
+    assert p.name == "mcp_config.json"
+    assert p.parent.name == "config"
+    assert p.parent.parent.name == ".gemini"
+
+    # Home is NOT import-time frozen: a relocated HOME redirects it, which is
+    # how the merge tests (and a relocated deploy host) retarget the file.
+    import os
+    from pathlib import Path
+
+    from autoswe.harness import mcp_config
+
+    saved_home = os.environ.get("HOME")
+    try:
+        os.environ["HOME"] = "/relocated/home"
+        moved = mcp_config.antigravity_mcp_config_path()
+        assert moved == Path("/relocated/home/.gemini/config/mcp_config.json")
+    finally:
+        if saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved_home
+
+
+# ---------------------------------------------------------------------------
 # _as_bool helper (T7 DRY refactor)
 # ---------------------------------------------------------------------------
 
