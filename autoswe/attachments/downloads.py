@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib import error as url_error
 from urllib import request
+from urllib.parse import urlsplit
 
 _DOWNLOAD_TIMEOUT_SEC = 60.0
 _CHUNK = 64 * 1024
@@ -21,8 +22,9 @@ _CHUNK = 64 * 1024
 class DownloadError(Exception):
     """A failed attachment download.
 
-    ``code`` is one of ``"http_<status>"``, ``"too_large"``, or
-    ``"transport"`` (network failure / timeout / non-HTTP error).
+    ``code`` is one of ``"http_<status>"``, ``"too_large"``,
+    ``"bad_scheme"`` (non-http(s) URL rejected by the scheme allowlist), or
+    ``"transport"`` (network failure / timeout / malformed-response error).
     """
 
     url: str
@@ -67,7 +69,19 @@ def download_bytes(
     Raises :class:`DownloadError` — never returns partial data. The size cap
     is enforced while streaming so a file larger than *max_bytes* never
     occupies more than one chunk of memory and nothing is returned.
+
+    This is the single download sink, so the scheme allowlist lives here:
+    every URL — including Azure ``relations[]`` URLs handed over verbatim —
+    must be ``http``/``https`` before any opener touches it (urllib's default
+    opener carries a ``file://`` handler; a crafted relation would otherwise
+    read a local file into the temp dir and advertise it in the manifest).
     """
+    scheme = urlsplit(url or "").scheme.lower()
+    if scheme not in ("http", "https"):
+        raise DownloadError(
+            url, "bad_scheme",
+            f"scheme {scheme!r} not allowed (http/https only)",
+        )
     opener = opener or _build_opener()
     req = request.Request(url, headers=headers or {}, method="GET")
     try:
@@ -89,7 +103,12 @@ def download_bytes(
         raise DownloadError(url, f"http_{e.code}", f"HTTP {e.code}") from e
     except url_error.URLError as e:
         raise DownloadError(url, "transport", str(e.reason)) from e
-    except (TimeoutError, OSError) as e:
+    except Exception as e:
+        # The docstring's contract: *every* failure surfaces as
+        # DownloadError. Covers TimeoutError/OSError and urllib leaks that
+        # are neither — e.g. http.client.HTTPException (BadStatusLine /
+        # RemoteDisconnected on a malformed response) — so no raw error
+        # escapes this sink.
         raise DownloadError(url, "transport", str(e)) from e
 
 

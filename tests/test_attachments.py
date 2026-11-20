@@ -333,6 +333,62 @@ class TestDownloads:
             downloads.download_bytes("http://x/a", max_bytes=100)
         assert exc.value.code == "http_404"
 
+    def test_download_rejects_non_http_scheme(self):
+        """Trust boundary at the single download sink: urllib's default
+        opener ships a ``file://`` handler, so a non-http(s) URL — e.g. a
+        crafted Azure ``relations[]`` entry — would read a LOCAL file into
+        the temp dir. The scheme allowlist rejects it before any opener is
+        touched."""
+        from autoswe.attachments import downloads
+
+        class ExplodingOpener:
+            def open(self, req, timeout=None):
+                raise AssertionError("opener must not be touched for a bad scheme")
+
+        bad = [
+            "file:///etc/passwd",
+            "FILE:///etc/passwd",          # scheme case-insensitivity
+            "ftp://host/x",
+            "data:text/html,pwned",
+            "javascript:alert(1)",
+            "",                            # empty URL
+            "example.com/x",               # schemeless
+        ]
+        for url in bad:
+            with pytest.raises(downloads.DownloadError) as exc:
+                downloads.download_bytes(url, max_bytes=10, opener=ExplodingOpener())
+            assert exc.value.code == "bad_scheme", url
+
+    def test_download_accepts_https(self):
+        """The allowlist admits https (and http) untouched — guard is
+        scheme-based, not URL-content-based."""
+        from autoswe.attachments import downloads
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, _n=None):
+                data, self._payload = self._payload, b""
+                return data
+
+            _payload = b"ok"
+
+        opened = []
+
+        class FakeOpener:
+            def open(self, req, timeout=None):
+                opened.append(req.full_url)
+                return Resp()
+
+        assert downloads.download_bytes(
+            "https://x/y", max_bytes=10, opener=FakeOpener(),
+        ) == b"ok"
+        assert opened == ["https://x/y"]
+
 
 # ============================================================================
 # GitHub A -> B fallback
@@ -1145,6 +1201,49 @@ class TestIngestAzure:
             {"provider": "azure", "pat": "p"},
         )
         assert set_.items[0].content_type == "text/plain"
+        set_.remove()
+
+    def test_ingest_azure_file_scheme_relation_skipped(self):
+        """MEDIUM (scheme allowlist): an ``AttachedFile`` relation carrying a
+        non-http(s) URL (``file://``) must surface as a skipped asset — never
+        downloaded, never a manifest entry — while the well-formed https
+        relation alongside it lands normally. Driven through the real
+        download path (opener seam only); the opener asserts nothing
+        non-https is ever opened."""
+        from autoswe.attachments import ingest
+
+        csv = b"id\n1\n"
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, _n=None):
+                data, self._payload = self._payload, b""
+                return data
+
+            _payload = csv
+
+        class HttpsOnlyOpener:
+            def open(self, req, timeout=None):
+                assert req.full_url.startswith("https://"), req.full_url
+                return Resp()
+
+        refs = [
+            {"url": "file:///etc/passwd", "name": "passwd.csv"},
+            {"url": "https://x/aaa", "name": "data.csv"},
+        ]
+        set_ = ingest.ingest_task_attachments(
+            _StubTracker(refs=refs), 1, "", [],
+            {"ATTACHMENTS_ENABLED": True},
+            {"provider": "azure", "pat": "p"},
+            opener=HttpsOnlyOpener(),
+        )
+        assert set_ is not None
+        assert [a.name for a in set_.items] == ["data.csv"]
         set_.remove()
 
 
