@@ -1077,8 +1077,14 @@ def test_codex_timeout_kills_process_group(monkeypatch):
     mock_process.pid = 4242  # pretend group leader
 
     killpg_calls: list[tuple[int, int]] = []
+
+    def fake_killpg(pgid, sig):
+        killpg_calls.append((pgid, sig))
+        if sig == 0:
+            raise ProcessLookupError  # group empty: the child already exited
+
     monkeypatch.setattr(os, "getpgid", lambda pid: pid)
-    monkeypatch.setattr(os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+    monkeypatch.setattr(os, "killpg", fake_killpg)
 
     async def _run():
         mock_exec = AsyncMock(return_value=mock_process)
@@ -1091,8 +1097,9 @@ def test_codex_timeout_kills_process_group(monkeypatch):
     except asyncio.TimeoutError:
         pass  # expected
 
-    # The whole process group got SIGTERM (wait() returned → no SIGKILL needed)
-    assert killpg_calls == [(4242, signal.SIGTERM)]
+    # The whole process group got SIGTERM; wait() returned and the group
+    # re-check found it empty, so no SIGKILL was needed.
+    assert killpg_calls == [(4242, signal.SIGTERM), (4242, 0)]
     # ...and the bare shim-kill path was NOT the mechanism
     assert mock_process.killed is False
 

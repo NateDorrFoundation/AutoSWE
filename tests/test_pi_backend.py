@@ -1480,8 +1480,14 @@ def test_run_timeout_kills_process_group(monkeypatch):
     proc.stderr.read = AsyncMock(return_value=b"")
 
     killpg_calls: list[tuple[int, int]] = []
+
+    def fake_killpg(pgid, sig):
+        killpg_calls.append((pgid, sig))
+        if sig == 0:
+            raise ProcessLookupError  # group empty: the child already exited
+
     monkeypatch.setattr(os, "getpgid", lambda pid: pid)
-    monkeypatch.setattr(os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+    monkeypatch.setattr(os, "killpg", fake_killpg)
 
     async def _run():
         with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -1492,7 +1498,8 @@ def test_run_timeout_kills_process_group(monkeypatch):
         assert False, "Should have raised TimeoutError"
     except asyncio.TimeoutError:
         pass  # expected, as before
-    assert killpg_calls == [(4242, signal.SIGTERM)]  # wait() returned → no SIGKILL
+    # wait() returned and the group re-check found it empty → no SIGKILL
+    assert killpg_calls == [(4242, signal.SIGTERM), (4242, 0)]
     assert proc.killed is False  # bare process.kill() was NOT the mechanism
 
 

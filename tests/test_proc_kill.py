@@ -47,7 +47,11 @@ def test_kill_tree_sigterm_then_sigkill(monkeypatch):
 
     proc = _StubbornProcess()
     asyncio.run(kill_tree(proc, grace=0.05))
-    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    # SIGTERM first, then SIGKILL after the grace; the group-emptiness
+    # re-check follows with 0-probes and repeated SIGKILLs (0 == probe).
+    assert signals[0] == signal.SIGTERM
+    assert signal.SIGKILL in signals[1:]
+    assert all(sig in (signal.SIGKILL, 0) for sig in signals[1:])
     assert proc.killed is False  # the direct kill is not the POSIX mechanism
 
 
@@ -120,6 +124,58 @@ def test_kill_tree_kills_real_child_process():
     asyncio.run(_go())
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics (issue #327)")
+def test_kill_tree_sigkills_surviving_grandchild():
+    """Review finding (MEDIUM): the direct child dying during the grace does
+    not prove the group is empty.  Here the direct child exits on the group
+    SIGTERM while a grandchild that has trapped SIGTERM survives; kill_tree
+    must re-check the group and SIGKILL so that survivor dies too, not
+    orphan."""
+    async def _go():
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c",
+            "import signal, subprocess, time\n"
+            "got = []\n"
+            "signal.signal(signal.SIGUSR1, lambda *a: got.append(1))\n"
+            "child = subprocess.Popen(['sh', '-c',\n"
+            "    'trap : TERM; kill -USR1 $PPID; sleep 61'])\n"
+            # USR1 handshake: only report the grandchild once its trap is
+            # installed, so the group SIGTERM below cannot race the trap.
+            "while not got:\n"
+            "    time.sleep(0.05)\n"
+            "print(child.pid, flush=True)\n"
+            "time.sleep(61)\n",
+            stdout=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        child_pid = None
+        try:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=10)
+            child_pid = int(line.strip())
+            await kill_tree(proc, grace=1.0)
+            # The SIGTERM-trapping grandchild must be SIGKILLed and reaped:
+            # poll until ESRCH.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("SIGTERM-trapping grandchild survived the group SIGKILL")
+        finally:
+            for pid in (proc.pid, child_pid):
+                if pid is None:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    asyncio.run(_go())
+
+
 # ---------- Windows taskkill path ----------
 #
 # Cross-platform: os.name and subprocess.run are patched, so the Windows
@@ -153,7 +209,7 @@ class _SurvivorProcess:
 
 
 def _patch_nt(monkeypatch):
-    monkeypatch.setattr(_proc_kill.os, "name", "nt")
+    monkeypatch.setattr(_proc_kill, "_IS_NT", True)
 
 
 def test_kill_tree_windows_taskkill(monkeypatch):
@@ -167,7 +223,7 @@ def test_kill_tree_windows_taskkill(monkeypatch):
     )
 
     proc = _ExitableProcess()
-    asyncio.run(kill_tree(proc))
+    asyncio.run(kill_tree(proc, grace=0.05))
     assert runs == [["taskkill", "/T", "/F", "/PID", "4567"]]
     assert proc.killed is False  # the tree-kill landed; no direct kill
 
