@@ -978,7 +978,9 @@ def test_permissions_plan_and_read_only_share_the_read_only_profile():
         for tool in agy_mod._NEVER_ALLOWED_TOOL_RULES:
             assert tool in deny
         # Reads stay allowed alongside the deny block (P5 coexistence).
-        for tool in ("read_file", "view_file", "search", "list_dir"):
+        # Both grep spellings are carried (stream spelling unverified in
+        # fixtures; unmatched allow is a no-op — Phase 6 live pass picks).
+        for tool in ("read_file", "view_file", "search", "grep_search", "list_dir"):
             assert f"{tool}(/w/)" in perm["allow"]
         assert "mcp(autoswe_comment/*)" in perm["allow"]
 
@@ -1140,6 +1142,31 @@ def test_bad_base_settings_degrades_to_empty_not_crash(tmp_path):
     # Enforcement is never lost to a broken base file.
     assert "command(*)" in data["permissions"]["deny"]
     assert any("not valid JSON" in str(c.args[0]) for c in mock_log.call_args_list)
+
+
+def test_base_settings_string_rule_block_fails_loudly(tmp_path, monkeypatch):
+    # Review INFO: a bare string where deny/allow expect a LIST must raise
+    # loudly — the merge loop would otherwise iterate "command(*)"
+    # character-by-character into one-char rules ("c", "o", …).  Validation
+    # runs before mkdtemp, so a bad base file stages nothing to leak.
+    home = tmp_path / "cfg-home" / MODEL
+    home.mkdir(parents=True)
+    staged: list[str] = []
+    real_mkdtemp = agy_mod.tempfile.mkdtemp
+
+    def spy_mkdtemp(*args, **kwargs):
+        d = real_mkdtemp(*args, **kwargs)
+        staged.append(d)
+        return d
+
+    monkeypatch.setattr(agy_mod.tempfile, "mkdtemp", spy_mkdtemp)
+    for key in ("deny", "allow"):
+        (home / "base-settings.json").write_text(
+            json.dumps({"permissions": {key: "command(*)"}}), encoding="utf-8")
+        with pytest.raises(agy_mod.AgyConfigError, match=rf"permissions\.{key}"):
+            agy_mod._stage_run_config(
+                _spec(mode="plan"), {"config_home": str(tmp_path / "cfg-home")})
+    assert staged == []  # validated before anything was staged
 
 
 def test_run_stages_settings_in_argv_and_reclaims_on_success():

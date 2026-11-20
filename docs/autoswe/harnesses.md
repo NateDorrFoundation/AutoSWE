@@ -608,7 +608,7 @@ trailing slash — globs silently do NOT match, spike P2):**
 
 | `RunSpec.mode` | `permissions.deny` | `permissions.allow` |
 |---|---|---|
-| `plan` / `read_only` | every mutating tool (`write_file`/`replace_file_content`/`multi_replace_file_content`/`sed_file`/`notebook_edit`) against the worktree, `write_file(<cwd>/.git/)`, `command(*)`, the three `ask_*` | `read_file`/`view_file`/`search`/`list_dir` against the worktree, `mcp(autoswe_comment/*)` (+ `read_only` also `mcp(autoswe_inline_comment/*)`); `read_only` also gets no `--mode` flag, `plan` gets the advisory `--mode plan` |
+| `plan` / `read_only` | every mutating tool (`write_file`/`replace_file_content`/`multi_replace_file_content`/`sed_file`/`notebook_edit`) against the worktree, `write_file(<cwd>/.git/)`, `command(*)`, the three `ask_*` | `read_file`/`view_file`/`search` + `grep_search`/`list_dir` against the worktree, `mcp(autoswe_comment/*)` (+ `read_only` also `mcp(autoswe_inline_comment/*)`); `read_only` also gets no `--mode` flag, `plan` gets the advisory `--mode plan` |
 | `read_write` / unset | `write_file(<cwd>/.git/)` belt-and-braces, the three `ask_*` | *(none — default posture)* |
 
 `ask_question`/`ask_permission`/`ask_custom_permission` are denied in **every**
@@ -620,6 +620,18 @@ also never receive `--dangerously-skip-permissions`. `spec.disallowed_tools_over
 maps to the equivalent agy rule (`Bash→command(*)`, `Write→write_file(<cwd>/)`,
 `mcp__server__tool→mcp(server/tool)`); names without a clean equivalent are
 logged and ignored, pi-style.
+
+**Live-pass checklist (Phase 6).** Remaining rows the dedicated box must
+confirm before the mechanism is called fully live-verified:
+
+- **Grep allow-rule stream spelling** — the read-only allow list carries
+  BOTH `search(<cwd>/)` and `grep_search(<cwd>/)`. No committed fixture
+  stream pins the search tool's stream name (`grep_search` appears only in
+  the `init.tools` *registry* — a different namespace, and the rules key off
+  stream names per P2's lesson). An unmatched ALLOW entry is a no-op under
+  deny>ask>allow, so carrying both is functionally free and the planner
+  cannot silently lose grep; the live check should confirm which spelling
+  the matcher honors and drop the dead one.
 
 **The `permission_mode` self-check (§4.4).** After `init`, the CLI-attested
 `init.permission_mode` is compared against the posture the run asked for

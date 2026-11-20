@@ -214,6 +214,11 @@ _NEVER_ALLOWED_TOOL_RULES = (
 #                          permissions.deny; headless never pauses anyway)
 #   mcp(server/tool)       wildcard target → §0.3 P5 (MCP allow coexists with
 #                          the write/command deny profile in one run)
+#   search(<dir>/) and     BOTH spellings allowed: the grep stream spelling is
+#   grep_search(<dir>/)    the one rule shape no fixture row pins (see
+#                          _permissions_for_mode); unmatched allow = no-op, so
+#                          the dual spelling is free — live pass decides which
+#                          one is real (harnesses.md Phase 6 live-pass row)
 
 # ``spec.extra_tools`` / ``spec.disallowed_tools_override`` carry Claude-style
 # names today.  Map the ones with a clean agy rule equivalent (stream names);
@@ -526,7 +531,17 @@ def _permissions_for_mode(mode: str, cwd_prefix: str) -> dict:
         allow = [
             f"read_file({cwd_prefix})",
             f"view_file({cwd_prefix})",
+            # BOTH grep spellings, deliberately: no committed fixture stream
+            # pins the search tool's stream name (fixtures carry stream names
+            # only for run_command/write_file/read_file; the init.tools
+            # registry spells it ``grep_search``, the rules want stream
+            # names — unverified which one the matcher recognizes).  An
+            # unmatched ALLOW entry is a no-op under deny>ask>allow, so
+            # carrying both costs nothing and the planner cannot silently
+            # lose grep.  Which spelling is live is a Phase 6 live-pass row
+            # (harnesses.md); then drop the dead one.
             f"search({cwd_prefix})",
+            f"grep_search({cwd_prefix})",
             f"list_dir({cwd_prefix})",
             "mcp(autoswe_comment/*)",
         ]
@@ -581,6 +596,17 @@ def _apply_tool_overrides(spec: RunSpec, deny: list[str], allow: list[str]) -> N
             allow.append(rule)
 
 
+class AgyConfigError(RuntimeError):
+    """Operator-authored agy profile config is malformed — fail loud.
+
+    Deliberately outside ``retryable_exceptions()``: a bad
+    ``base-settings.json`` does not fix itself on retry, and coercing it
+    anyway (e.g. iterating a bare string ``"command(*)"`` character-by-
+    character into one-char rules ``"c"``, ``"o"``, …) would stage wrong
+    permissions instead of failing the run.
+    """
+
+
 def _resolve_config_home(harness_cfg: dict, model: str | None) -> os.PathLike:
     """Base-settings home for this profile (profile ``config_home`` field).
 
@@ -608,6 +634,12 @@ def _resolve_config_home(harness_cfg: dict, model: str | None) -> os.PathLike:
 def _load_base_settings(harness_cfg: dict, model: str | None) -> dict:
     """``<config_home>/base-settings.json`` (``{}`` when absent/unreadable).
 
+    Raises :class:`AgyConfigError` on a malformed ``permissions`` block
+    (a bare string where ``deny``/``allow`` expect a list of rules): a
+    degraded ``{}`` is right for an unreadable file — enforcement still
+    comes from the mode block — but a wrong-SHAPE rule would merge
+    char-by-char into one-char rules and silently mis-enforce.
+
     An OPTIONAL per-profile override layer, NOT a required rescue: ``--settings``
     is live-verified (dedicated-box experiment, isolated HOME + provider-only
     global settings) to LAYER over the host-global settings file, never
@@ -631,7 +663,19 @@ def _load_base_settings(harness_cfg: dict, model: str | None) -> dict:
     except json.JSONDecodeError as e:
         log(f"[WARN][ANTIGRAVITY] {base_file} is not valid JSON ({e}) — staging from {{}}")
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    base_perm = data.get("permissions")
+    if isinstance(base_perm, dict):
+        for key in ("deny", "allow"):
+            if isinstance(base_perm.get(key), str):
+                raise AgyConfigError(
+                    f"{base_file}: permissions.{key} must be a list of rule "
+                    f"strings, not a bare string {base_perm[key]!r} (merging "
+                    "a bare string would iterate it character-by-character "
+                    "into one-char rules)"
+                )
+    return data
 
 
 def _stage_run_config(spec: RunSpec, harness_cfg: dict) -> tuple[list[str], dict, object]:
@@ -659,11 +703,15 @@ def _stage_run_config(spec: RunSpec, harness_cfg: dict) -> tuple[list[str], dict
     mode = str(spec.mode or "read_write")
     permissions = _permissions_for_mode(mode, _rule_prefix(spec.cwd))
     _apply_tool_overrides(spec, permissions["deny"], permissions["allow"])
+    # Load/validate the profile base BEFORE staging anything: a malformed
+    # base raises AgyConfigError here, so no staged dir can leak (the
+    # round-3 leak invariant: everything failure-capable either precedes
+    # mkdtemp or lives under the block whose finally reclaims the dir).
+    base = _load_base_settings(harness_cfg, spec.model)
 
     run_dir = tempfile.mkdtemp(prefix="autoswe-agy-run-")
     settings_path = os.path.join(run_dir, "settings.json")
     try:
-        base = _load_base_settings(harness_cfg, spec.model)
         settings = dict(base)
         base_perm = base.get("permissions") if isinstance(base.get("permissions"), dict) else {}
         merged_perm = dict(base_perm)
