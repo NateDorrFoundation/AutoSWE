@@ -20,9 +20,6 @@ from dataclasses import dataclass
 from urllib import request
 
 from autoswe.attachments import downloads
-from autoswe.core.logging_utils import get_debug_logger
-
-dbg = get_debug_logger()
 
 
 @dataclass

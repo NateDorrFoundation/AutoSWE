@@ -386,6 +386,55 @@ class TestGithubFallback:
         )
         assert data == png
 
+    def test_mechanism_b_forwards_injected_opener_to_html_fetch(self):
+        """Round-2 MEDIUM: the injected opener must honor the html+json
+        re-fetch too (symmetric seam). Drives the WHOLE A→404→B flow with
+        only an opener — no ``fetch_html_body``/``download_bytes`` patches —
+        asserting the api.github.com request carried the html+json media type
+        and the signed URL came back through the same opener."""
+        import json
+        from urllib import error as url_error
+
+        from autoswe.attachments import github as gh
+
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        signed = f"https://private-user-images.githubusercontent.com/1/555-{_UUID}.png?jwt=tok"
+        accepts = []
+
+        class Resp:
+            def __init__(self, payload):
+                self._remaining = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, _n=None):
+                chunk, self._remaining = self._remaining, b""
+                return chunk
+
+        class RoutingOpener:
+            def open(self, req, timeout=None):
+                url = req.full_url
+                accepts.append(req.get_header("Accept"))
+                if url.startswith("https://api.github.com"):
+                    html = json.dumps({"body_html": f'<img src="{signed}" />'})
+                    return Resp(html.encode())
+                if url.startswith("https://private-user-images."):
+                    return Resp(png)
+                raise url_error.HTTPError(url, 404, "Not Found", {}, None)
+
+        ctx = gh.AssetContext(url=_ASSET_URL, source="issue", body=_ASSET_URL)
+        data = gh.download_github_asset(
+            _ASSET_URL, owner="o", repo="r", issue_num=1, token="t", max_bytes=1024,
+            context=ctx, opener=RoutingOpener(),
+        )
+        assert data == png
+        # The html+json refetch went through the SAME injected opener.
+        assert "application/vnd.github.html+json" in accepts
+
     def test_mechanism_b_no_signed_url_warns(self, monkeypatch):
         """Plain-link on a private repo -> no signed URL -> no_signed_url error."""
         from autoswe.attachments import downloads
@@ -786,24 +835,42 @@ class TestIngestGithub:
         # No exception raised; empty result (nothing ingested).
         assert set_ is None
 
-    def test_ingest_per_file_cap_enforced(self, monkeypatch):
-        from autoswe.attachments import github as gh
+    def test_ingest_per_file_cap_enforced(self):
+        """The per-file cap is enforced *while streaming* inside
+        ``download_bytes`` (which raises ``too_large`` and never returns
+        oversize data); the ingest warns + skips. Driven end-to-end through
+        the opener seam with the real download path — no monkeypatch."""
         from autoswe.attachments import ingest
 
-        big = b"\x00" * 300
-        monkeypatch.setattr(
-            gh.downloads, "download_bytes",
-            lambda url, **k: big,
-        )
+        class BigResp:
+            """A response that streams 300 bytes in one read, then EOF."""
+
+            def __init__(self):
+                self._remaining = b"\x00" * 300
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, _n=None):
+                chunk, self._remaining = self._remaining, b""
+                return chunk
+
+        class BigOpener:
+            def open(self, req, timeout=None):
+                return BigResp()
+
         body = f"see {_ASSET_URL}"
         set_ = ingest.ingest_task_attachments(
             _StubTracker(), 1, body, [],
             {"ATTACHMENTS_ENABLED": True, "ATTACHMENT_MAX_SIZE_BYTES": 100},
             {"provider": "github", "owner": "o", "repo": "r", "pat": "t"},
+            opener=BigOpener(),
         )
-        # The download itself is capped at max_size by download_bytes; here
-        # the stub returns 300 bytes regardless, so the ingest-level cap
-        # skips it. Result: nothing ingested.
+        # 300 streamed bytes > the 100-byte cap: download_bytes raises
+        # too_large, ingest skips the asset, nothing is ingested.
         assert set_ is None
 
     def test_ingest_total_cap_enforced(self, monkeypatch):

@@ -38,8 +38,9 @@ ASSET_URL_RE = re.compile(GITHUB_ASSET_URL_REGEX)
 # Mechanism B: signed private-image URL rendered into body_html. Slashes are
 # allowed — the ``?jwt=*** query segment is base64url and may contain
 # ``/``; truncating there yields a 404 on download. The real delimiters are
-# quotes, whitespace, angle brackets, and backslashes (GitHub emits these in
-# the surrounding HTML).
+# quotes, whitespace, and angle brackets (GitHub emits these in the
+# surrounding HTML); a literal backslash never survives ``json.loads`` into
+# the rendered string, so it needs no place in the class.
 _SIGNED_URL_RE = re.compile(
     r"https://private-user-images\.githubusercontent\.com/[^\"'\s<>]+"
 )
@@ -201,7 +202,12 @@ def download_github_asset(
     if html_body_cache is not None and key in html_body_cache:
         html_body = html_body_cache[key]
     else:
-        html_body = fetch_html_body(owner, repo, issue_num, context.comment_id, token)
+        # Forward the injected opener so the html+json re-fetch honors the
+        # same test seam as the downloads (OpenerDirector.open accepts the
+        # ``timeout`` kwarg, matching fetch_html_body's call convention).
+        html_body = fetch_html_body(
+            owner, repo, issue_num, context.comment_id, token, opener=opener.open,
+        )
         if html_body_cache is not None:
             # Cache the result — including an empty body (a failed re-fetch
             # will not succeed again inside this ingest window, so caching

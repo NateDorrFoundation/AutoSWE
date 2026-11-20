@@ -104,11 +104,9 @@ def _store(
     """
     from autoswe.attachments.naming import guess_content_type
 
+    # Trailing-dot names are owned by ``pick_filename`` (naming.py strips a
+    # trailing "." before returning), so the name here never ends in ".".
     name = pick_filename(preferred_name, data, used, index)
-    # Guard against a trailing dot leaking in ("data.csv.") — prefer the
-    # provider name without it so the extension map / content-type fallback
-    # resolves on the real extension (Requirement 3).
-    name = name.rstrip(".") or name
     ext = name.rsplit(".", 1)[-1] if "." in name else ""
     ext_ct = guess_content_type(ext) if ext else ""
     sniff_ext, sniff_ct = sniff_content(data)
@@ -187,10 +185,10 @@ def ingest_task_attachments(
                         html_body_cache=html_body_cache,
                     )
                 except Exception as e:
+                    # Covers per-file size too: ``download_bytes`` enforces
+                    # ``max_bytes`` while streaming and raises ``too_large``
+                    # rather than ever returning oversize data.
                     dbg.warning("attachments: GitHub asset %s failed: %s", ctx.url, e)
-                    continue
-                if len(data) > acfg["max_size_bytes"]:
-                    dbg.warning("attachments: GitHub asset exceeds cap: %s", ctx.url)
                     continue
                 if total_state["total"] + len(data) > acfg["max_total_bytes"]:
                     dbg.warning("attachments: total cap reached; skipping %s", ctx.url)
@@ -220,10 +218,10 @@ def ingest_task_attachments(
                         ref.url, pat, max_bytes=acfg["max_size_bytes"], opener=opener,
                     )
                 except Exception as e:
+                    # Per-file size is enforced by the streaming cap inside
+                    # ``download_bytes`` (raises ``too_large``; never returns
+                    # oversize data).
                     dbg.warning("attachments: Azure asset %s failed: %s", ref.url, e)
-                    continue
-                if len(data) > acfg["max_size_bytes"]:
-                    dbg.warning("attachments: Azure asset exceeds cap: %s", ref.url)
                     continue
                 if total_state["total"] + len(data) > acfg["max_total_bytes"]:
                     dbg.warning("attachments: total cap reached; skipping %s", ref.url)
