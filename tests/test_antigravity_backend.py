@@ -1913,7 +1913,7 @@ def test_agy_version_tuple_orders_by_component_not_lexically():
 
 def test_warn_fires_once_per_process_below_floor(monkeypatch):
     _reset_version_guard(monkeypatch)
-    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda exe: "1.5.10")
+    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda argv: "1.5.10")
     with patch.object(agy_mod, "log") as mock_log:
         agy_mod._warn_if_below_floor("/usr/local/bin/agy")
         agy_mod._warn_if_below_floor("/usr/local/bin/agy")
@@ -1924,14 +1924,14 @@ def test_warn_fires_once_per_process_below_floor(monkeypatch):
 
 def test_no_warn_at_or_above_floor(monkeypatch):
     _reset_version_guard(monkeypatch)
-    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda exe: agy_mod.MIN_AGY_VERSION)
+    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda argv: agy_mod.MIN_AGY_VERSION)
     with patch.object(agy_mod, "log") as mock_log:
         agy_mod._warn_if_below_floor("/usr/local/bin/agy")
     msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
     assert not [m for m in msgs if "[WARN]" in m]
     # And a newer CLI is equally silent.
     monkeypatch.setattr(agy_mod, "_agy_version_checked", False)
-    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda exe: "99.0.1")
+    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda argv: "99.0.1")
     with patch.object(agy_mod, "log") as mock_log:
         agy_mod._warn_if_below_floor("/usr/local/bin/agy")
     msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
@@ -1942,7 +1942,7 @@ def test_unqueryable_version_is_silent(monkeypatch):
     """A CLI that cannot be queried never warns and never raises — enforcement
     lives in tests/test_agy_cli_version.py, not in the run path."""
     _reset_version_guard(monkeypatch)
-    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda exe: None)
+    monkeypatch.setattr(agy_mod, "_query_agy_version", lambda argv: None)
     with patch.object(agy_mod, "log") as mock_log:
         agy_mod._warn_if_below_floor("/usr/local/bin/agy")  # must not raise
     assert not [
@@ -1950,18 +1950,42 @@ def test_unqueryable_version_is_silent(monkeypatch):
     ]
 
 
-def test_run_path_checks_version_once_with_resolved_exe(monkeypatch):
-    """The wiring: every run consults the guard exactly once, with the resolved
-    executable (the probe itself is guarded process-wide inside it)."""
-    seen = []
-    monkeypatch.setattr(agy_mod, "_warn_if_below_floor", lambda exe: seen.append(exe))
+@pytest.mark.parametrize(
+    "resolved,prefix",
+    [
+        # Plain binary: the probe is the bare invocation.
+        ("/usr/local/bin/agy", []),
+        # npm/pnpm .cmd shim on Windows: exe is the host, the real path rides
+        # in prefix_argv.  A probe of bare `cmd --version` opens an interactive
+        # prompt — 15 s stall, silent None, the floor can never warn.
+        ("cmd", ["/c", r"C:\Users\op\AppData\Roaming\npm\agy.cmd"]),
+    ],
+    ids=["plain-exe", "cmd-shim"],
+)
+def test_run_path_checks_version_once_with_resolved_exe(monkeypatch, resolved, prefix):
+    """The wiring: every run consults the guard exactly once, threading the
+    *full* resolved invocation — exe plus any shim prefix — to the probe."""
+    seen: list[list[str]] = []
+
+    def probe(argv):
+        seen.append(list(argv))
+        return agy_mod.MIN_AGY_VERSION  # at the floor: guard stays silent
+
+    _reset_version_guard(monkeypatch)
+    monkeypatch.setattr(agy_mod, "_query_agy_version", probe)
+    monkeypatch.setattr(
+        agy_mod, "_resolve_agy_executable", lambda cli_path: (resolved, list(prefix))
+    )
     proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
     _full_run(_spec(), proc)
-    assert len(seen) == 1
+    assert len(seen) == 1, "the probe must run exactly once per run-path call"
+    assert seen[0] == [resolved, *prefix, "--version"], (
+        "the probe must receive the full invocation, not bare `cmd --version` on a shim"
+    )
 
 
 def test_query_agy_version_swallows_missing_binary(tmp_path):
-    assert agy_mod._query_agy_version(str(tmp_path / "nope-agy")) is None
+    assert agy_mod._query_agy_version([str(tmp_path / "nope-agy"), "--version"]) is None
 
 
 def test_query_agy_version_swallows_undecodable_output(monkeypatch):
@@ -1979,4 +2003,4 @@ def test_query_agy_version_swallows_undecodable_output(monkeypatch):
         raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
 
     monkeypatch.setattr(agy_mod.subprocess, "run", boom)
-    assert agy_mod._query_agy_version("/usr/bin/agy") is None
+    assert agy_mod._query_agy_version(["/usr/bin/agy", "--version"]) is None

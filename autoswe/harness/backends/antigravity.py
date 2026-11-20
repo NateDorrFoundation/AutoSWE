@@ -128,7 +128,8 @@ _HARD_TIMEOUT_SLACK = 30
 # validated (docs/autoswe/spike-antigravity.md: ``agy --version`` → 1.5.11,
 # one line, no prefix).  Kept in lockstep with tests/test_agy_cli_version.py,
 # which imports this constant; bumping the floor is a one-line change here plus
-# the version quoted in docs/autoswe/harnesses.md.  The installed CLI is
+# the version quoted in docs/autoswe/harnesses.md, docs/autoswe/config.md and
+# docs/autoswe/debugging.md.  The installed CLI is
 # checked once per process (below) and a too-old CLI only warns — a version
 # drift must not fail a run whose stream still parses; the offline stream
 # fixtures are the behavioural contract.
@@ -149,16 +150,20 @@ def _agy_version_tuple(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in re.findall(r"\d+", version.split("(")[0]))
 
 
-def _query_agy_version(exe: str) -> str | None:
-    """Return ``agy --version`` output, or None if it cannot be queried."""
+def _query_agy_version(argv: list[str]) -> str | None:
+    """Return the ``--version`` output of a full argv invocation, or None if unqueryable.
+
+    Takes the complete invocation, not a bare exe: on a shimmed Windows host
+    ``_resolve_agy_executable`` returns ``("cmd", ["/c", path])`` and the real
+    path rides in the prefix — probing ``cmd --version`` would open an
+    interactive prompt instead of the CLI.
+    """
     try:
         # 15 s here vs 30 s (_VERSION_TIMEOUT_S) in tests/test_agy_cli_version.py:
         # intentional.  This probe runs on the async run path — a hung CLI must
         # stall the first run at most a few seconds — while the offline guard
         # tolerates slower CI boxes.  Both swallow any query failure silently.
-        proc = subprocess.run(
-            [exe, "--version"], capture_output=True, text=True, timeout=15
-        )
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         # UnicodeDecodeError is a ValueError raised by the strict-UTF-8 decode
         # inside subprocess.run(text=True) on a pathological CLI response —
@@ -170,27 +175,34 @@ def _query_agy_version(exe: str) -> str | None:
     return (proc.stdout or proc.stderr or "").strip() or None
 
 
-def _warn_if_below_floor(exe: str) -> None:
+def _warn_if_below_floor(
+    exe: str, prefix_argv: list[str] | tuple[str, ...] = ()
+) -> None:
     """Log ``[WARN]`` once per process when the installed agy is below the floor.
 
     Best-effort by design (Phase 6 §6.2): an unqueryable CLI (missing flag on
     some shim, timeout, unparseable output) is silently skipped — the floor is
     operator guidance, and tests/test_agy_cli_version.py is the enforcement
-    point.  Never raises, never fails the run.
+    point.  ``prefix_argv`` is the shim prefix from ``_resolve_agy_executable``
+    (``["/c", path]`` for ``.cmd``/``.bat``, the powershell arms for ``.ps1``):
+    the probe must run the *full* invocation, or a shimmed host would get a
+    bare ``cmd --version`` — an interactive prompt, not the CLI's version.
+    Never raises, never fails the run.
     """
     global _agy_version_checked
     if _agy_version_checked:
         return
     _agy_version_checked = True
-    reported = _query_agy_version(exe)
+    reported = _query_agy_version([exe, *prefix_argv, "--version"])
     if reported is None:
         return
     parts = _agy_version_tuple(reported)
     if not parts:
         return
     if parts < _agy_version_tuple(MIN_AGY_VERSION):
+        invocation = " ".join([exe, *prefix_argv])
         log(
-            f"[WARN][ANTIGRAVITY] installed agy CLI {reported!r} (resolved to {exe}) is "
+            f"[WARN][ANTIGRAVITY] installed agy CLI {reported!r} (resolved to {invocation}) is "
             f"below the pinned floor {MIN_AGY_VERSION} (docs/autoswe/harnesses.md); "
             "the CLI self-updates on interactive launch — run `agy` once to update, "
             "or reinstall from the Antigravity installer."
@@ -1725,8 +1737,12 @@ class AntigravityBackend:
             str(spec.cli_path or harness_cfg.get("cli_path") or "").strip()
         )
         # Phase 6 §6.2: warn once per process when the installed CLI is below
-        # MIN_AGY_VERSION — guidance only, the run proceeds regardless.
-        _warn_if_below_floor(exe)
+        # MIN_AGY_VERSION — guidance only, the run proceeds regardless.  The
+        # full invocation (exe + shim prefix) must be threaded: a `.cmd`/`.ps1`
+        # shim resolves to exe="cmd"/"powershell" with the real path in
+        # prefix_argv, so probing the bare exe would stall on an interactive
+        # prompt and the floor could never warn on a shimmed host.
+        _warn_if_below_floor(exe, prefix_argv)
         argv = [
             exe, *prefix_argv,
             *_build_argv(spec, harness_cfg, schema_path, settings_args),
