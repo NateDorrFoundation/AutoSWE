@@ -135,14 +135,16 @@ _HARD_TIMEOUT_SLACK = 30
 # fixtures are the behavioural contract.
 MIN_AGY_VERSION = "1.5.11"
 
-# Once-per-process guard for _warn_if_below_floor: the probe costs a
-# subprocess spawn, so at most ONE probe attempt per poll-cycle process, ever.
-# The flag flips once the probe completes, regardless of outcome — a timed-out
-# or otherwise unqueryable first probe silences the warn for that process by
-# design (re-probing on every run would make a persistently wedged CLI charge
-# the 15 s timeout to every run, which is worse).  Two runs racing through the
-# check pre-completion may both probe: warn-only, worst case one duplicated
-# spawn.
+# Once-per-process guard for _warn_if_below_floor: the flag flips once the
+# probe completes, regardless of outcome — a timed-out or otherwise
+# unqueryable probe silences the warn for that process by design (re-probing
+# on every run would make a persistently wedged CLI charge the 15 s timeout
+# to every run, which is worse).  The bound is per-run-that-started-
+# pre-completion, not one spawn ever: each run reaching the check while the
+# first probe is still in flight also awaits its own probe, so with
+# MAX_CONCURRENT = N racing first runs, up to N spawns (each off the event
+# loop via asyncio.to_thread, each bounded by the 15 s timeout) — warn-only
+# either way.  No run starting after the flag flips pays anything.
 _agy_version_checked = False
 
 

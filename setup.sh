@@ -46,6 +46,8 @@ try:
         data = json.load(f)
 except Exception:
     data = {}
+if not isinstance(data, dict):
+    data = {}
 for prof in data.values():
     if isinstance(prof, dict) and str(prof.get("backend", "")).lower() == "antigravity":
         cp = str(prof.get("cli_path") or "").strip()
