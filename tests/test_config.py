@@ -171,8 +171,14 @@ def test_antigravity_mcp_config_path_is_global_and_home_resolved_at_call():
     from autoswe.harness import mcp_config
 
     saved_home = os.environ.get("HOME")
+    saved_profile = os.environ.get("USERPROFILE")
     try:
         os.environ["HOME"] = "/relocated/home"
+        if saved_profile is not None:
+            # Path.home() on Windows resolves USERPROFILE before HOME, so
+            # relocate both when USERPROFILE is set — keeps this green on a
+            # Windows dev box (CLAUDE.md documents Windows as supported).
+            os.environ["USERPROFILE"] = "/relocated/home"
         moved = mcp_config.antigravity_mcp_config_path()
         assert moved == Path("/relocated/home/.gemini/config/mcp_config.json")
     finally:
@@ -180,6 +186,10 @@ def test_antigravity_mcp_config_path_is_global_and_home_resolved_at_call():
             os.environ.pop("HOME", None)
         else:
             os.environ["HOME"] = saved_home
+        if saved_profile is None:
+            os.environ.pop("USERPROFILE", None)
+        else:
+            os.environ["USERPROFILE"] = saved_profile
 
 
 # ---------------------------------------------------------------------------
