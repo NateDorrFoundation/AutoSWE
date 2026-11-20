@@ -1691,6 +1691,60 @@ def test_merge_prunes_stale_owned_inline_entry(agy_config_path):
     assert written["mcpServers"]["operator_server"] == seeded["mcpServers"]["operator_server"]
 
 
+def test_merge_serialises_under_sibling_lockfile(agy_config_path):
+    """Round-4 MEDIUM: the prune makes concurrent runs' owned sets differ, so
+    the whole read-modify-write is serialised under an advisory lock on the
+    sibling <file>.lock — exercise it end-to-end through _full_run."""
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    taken = []
+    real = agy_mod._lock_file_exclusive
+
+    def spy(f):
+        taken.append(f.name)
+        return real(f)
+
+    with patch.object(agy_mod, "_lock_file_exclusive", side_effect=spy):
+        _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
+
+    assert taken == [str(agy_config_path.parent / (agy_config_path.name + ".lock"))]
+    assert (agy_config_path.parent / (agy_config_path.name + ".lock")).exists()
+    # ...and it's the sibling of the GLOBAL config, never a worktree path.
+    assert all("/tmp/repo" not in name for name in taken)
+
+
+def test_merge_proceeds_unlocked_when_lockfile_unusable(tmp_path, monkeypatch):
+    """The mkdir/open arm of the best-effort lock: with a directory squatting
+    on the lock path, opening it raises, the merge logs and proceeds, and the
+    config still lands."""
+    cfg_dir = tmp_path / "cfg"
+    (cfg_dir / "mcp_config.json.lock").mkdir(parents=True)  # a directory where the lock file belongs
+    path = cfg_dir / "mcp_config.json"
+    monkeypatch.setattr(agy_mod, "antigravity_mcp_config_path", lambda: path)
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    with patch.object(agy_mod, "log") as mock_log:
+        result, _ = _full_run(_mcp_spec(tmp_path), proc)
+    assert result.subtype == "success"
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert any("merging unlocked" in m for m in msgs)
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["mcpServers"]["autoswe_comment"]["tools"]["post_plan"]["eager"] is True
+
+
+def test_merge_proceeds_unlocked_when_lock_fails(agy_config_path):
+    """Locking is best-effort like the rest of the merge: an OSError from the
+    platform lock logs a warning and the merge still lands — a wedged holder
+    must never fail the run."""
+    proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
+    with patch.object(agy_mod, "_lock_file_exclusive", side_effect=OSError("locked")):
+        with patch.object(agy_mod, "log") as mock_log:
+            result, _ = _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
+    assert result.subtype == "success"
+    msgs = [str(c.args[0]) for c in mock_log.call_args_list if c.args]
+    assert any("merging unlocked" in m for m in msgs)
+    written = json.loads(agy_config_path.read_text(encoding="utf-8"))
+    assert written["mcpServers"]["autoswe_comment"]["tools"]["post_plan"]["eager"] is True
+
+
 def test_merge_is_idempotent_compare_before_write(agy_config_path):
     proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
     spec = _mcp_spec(agy_config_path.parent.parent)
@@ -1769,13 +1823,24 @@ def test_inline_entry_written_without_env_but_env_routes(agy_config_path):
 
 
 def test_subprocess_entry_matches_mcp_config_builder(agy_config_path):
-    """The file entry is exactly mcp_config.antigravity_comment_server output —
-    no drift between the builder and what the backend writes."""
-    from autoswe.harness.mcp_config import antigravity_comment_server, autoswe_repo_root
+    """The file entry is exactly mcp_config.build_antigravity_mcp_config output.
+
+    The backend seeds its owned entry from the builder (round-4 review
+    suggestion), so the spec-mandated builder is load-bearing and this pins
+    that neither it nor antigravity_comment_server can drift from what the
+    backend writes."""
+    from autoswe.harness.mcp_config import (
+        antigravity_comment_server,
+        autoswe_repo_root,
+        build_antigravity_mcp_config,
+    )
 
     proc = _MockProcess(stdout=_fixture_text("basic_success").encode())
     _full_run(_mcp_spec(agy_config_path.parent.parent), proc)
     written = json.loads(agy_config_path.read_text(encoding="utf-8"))
+    assert written["mcpServers"]["autoswe_comment"] == build_antigravity_mcp_config(
+        sys.executable, str(autoswe_repo_root())
+    )["mcpServers"]["autoswe_comment"]
     assert written["mcpServers"]["autoswe_comment"] == antigravity_comment_server(
-        sys.executable, autoswe_repo_root()
+        sys.executable, str(autoswe_repo_root())
     )

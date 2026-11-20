@@ -668,15 +668,24 @@ run's `spec.mcp_servers` names `autoswe_comment`
   `mcp_config.antigravity_mcp_config_path()`, home resolved at call time)
   merges ONLY autoSWE's owned keys (`autoswe_comment`, optionally
   `autoswe_inline_comment`) into the operator's file: foreign servers and
-  top-level keys are preserved, the payload is compared before writing (the
-  file carries stable values, so it is written at most once per host), and
-  any `OSError` is logged and never raised — the run degrades to the text
-  fallback. A workspace `.agents/mcp_config.json` can never shadow the global
-  `autoswe_comment` entry (spike M4), which is what makes the global file
-  safe under Phase 4's Option C (`--settings`) instead of a run dir.
-- **Eager registration.** The entry (
+  top-level keys are preserved, owned keys absent from the current run's
+  owned set are pruned as stale (e.g. an `autoswe_inline_comment` left by a
+  GitHub fix run now facing a plan/Azure run), the payload is compared
+  before writing, and any `OSError` is logged and never raised — the run
+  degrades to the text fallback. The whole read-modify-write (read, merge,
+  prune, write) is serialised under an **advisory exclusive lock on a
+  sibling `<file>.lock`** (`fcntl.flock` / `msvcrt.locking`, best-effort: a
+  lock failure logs and proceeds). The prune makes concurrent runs' owned
+  sets differ, so identical-bytes last-writer-wins is not a safety argument
+  here — the lock is. A workspace `.agents/mcp_config.json` can never shadow
+  the global `autoswe_comment` entry (spike M4), which is what makes the
+  global file safe under Phase 4's Option C (`--settings`) instead of a run
+  dir.
+- **Eager registration.** The entry is seeded from the spec-mandated builder
+  `mcp_config.build_antigravity_mcp_config` (which wraps
   `mcp_config.antigravity_comment_server`, shared launch triple with pi via
-  `comment_server_launch`) marks `post_plan`/`post_question`/
+  `comment_server_launch`) so builder and backend cannot drift; it marks
+  `post_plan`/`post_question`/
   `update_progress` `"eager": true`, making them first-class stream steps
   named `mcp_autoswe_comment_<tool>` — single underscores; M2 pinned
   `mcp_autoswe_comment_post_plan` on the live binary. The lazy

@@ -92,15 +92,16 @@ import tempfile
 import time
 import uuid
 from collections.abc import Awaitable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from autoswe.core.logging_utils import get_debug_logger, log
 from autoswe.harness.backends.base import RunResult, RunSpec
 from autoswe.harness.mcp_config import (
-    antigravity_comment_server,
     antigravity_mcp_config_path,
     autoswe_repo_root,
+    build_antigravity_mcp_config,
 )
 
 # Internal diagnostics (forward-compat skips) go to the debug logger only —
@@ -298,6 +299,70 @@ def _mcp_comment_active(spec: RunSpec) -> bool:
 _OWNED_MCP_KEYS = ("autoswe_comment", "autoswe_inline_comment")
 
 
+if sys.platform == "win32":  # pragma: no cover - exercised on Windows hosts
+    import msvcrt
+
+    def _lock_file_exclusive(f) -> None:
+        # LK_LOCK blocks in ~1/8 s steps for up to 10 s, then raises OSError —
+        # bounded on purpose so a wedged holder can never stall a run forever.
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+
+    def _unlock_file(f) -> None:
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _lock_file_exclusive(f) -> None:
+        # Advisory to any other flock() user — every autoSWE writer of this
+        # file takes the same lock, which is the whole race class we own.
+        fcntl.flock(f, fcntl.LOCK_EX)
+
+    def _unlock_file(f) -> None:
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _unlock_file_safely(f) -> None:
+    # Best-effort, and closing the fd right after releases the lock anyway.
+    try:
+        _unlock_file(f)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _advisory_mcp_lock(config_path: Path):
+    """Hold an advisory exclusive lock on the sibling ``<config>.lock``.
+
+    Best-effort: a failed mkdir/open logs and the body runs unlocked; a
+    failed lock (wedged holder past the bounded Windows wait) likewise logs
+    and proceeds — the merge must never fail on lock problems.  ``yielded``
+    flips immediately before the first yield, so an OSError raised *by the
+    body* re-raises instead of falling into the acquisition-failure arm —
+    the generator yields exactly once on every path.
+    """
+    lock_path = config_path.with_name(config_path.name + ".lock")
+    yielded = False
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+b") as f:
+            try:
+                _lock_file_exclusive(f)
+            except OSError as e:
+                log(f"[WARN][ANTIGRAVITY] could not lock {lock_path} ({e}); merging unlocked")
+            yielded = True
+            try:
+                yield
+            finally:
+                _unlock_file_safely(f)
+    except OSError as e:
+        if yielded:
+            raise
+        log(f"[WARN][ANTIGRAVITY] could not lock {lock_path} ({e}); merging unlocked")
+        yield
+
+
 def _merge_antigravity_mcp_config(owned_entries: dict[str, dict]) -> None:
     """Entry-scoped merge of autoSWE's servers into the agy global mcp_config.
 
@@ -312,12 +377,25 @@ def _merge_antigravity_mcp_config(owned_entries: dict[str, dict]) -> None:
     writing** and skip the write when the file already matches (the
     host-stable file is written once).
 
-    Best-effort: a corrupt/unreadable file is rewritten fresh; any OSError
-    (read-only home, …) is logged, never raised — the run degrades to the
-    text fallback (the prompt still asks for the tool; the missing-tool case
-    is what the no-MCP path already handles).
+    The whole read-modify-write (read, merge, prune, write) is serialised
+    under an advisory exclusive lock on a sibling ``<file>.lock``.  The prune
+    makes the owned-entry sets differ between concurrent runs (a GitHub fix
+    run owns ``autoswe_inline_comment``; a concurrent plan/Azure run prunes
+    it), so last-writer-wins is NOT benign — without the lock a run's agy
+    child could load a config that another run already pruned a live entry
+    out of.  Locking is best-effort like everything else here: any OSError
+    (uncreatable lock file, wedged holder past the bounded wait) logs and
+    proceeds unlocked rather than failing the run.
     """
     path = antigravity_mcp_config_path()
+    with _advisory_mcp_lock(path):
+        _merge_antigravity_mcp_config_locked(owned_entries, path)
+
+
+def _merge_antigravity_mcp_config_locked(
+    owned_entries: dict[str, dict], path: Path
+) -> None:
+    """Read-merge-prune-write core, called under ``_lock_file_exclusive``."""
     existing: dict = {}
     raw: str | None = None
     try:
@@ -1589,13 +1667,16 @@ class AntigravityBackend:
             comment_cfg = mcp_servers.get("autoswe_comment")
             inline_cfg = mcp_servers.get("autoswe_inline_comment") \
                 if isinstance(mcp_servers, dict) else None
-            owned: dict[str, dict] = {
-                # cwd is the autoSWE checkout root (where the mcp_servers
-                # package lives), not spec.cwd (the target worktree).
-                "autoswe_comment": antigravity_comment_server(
-                    sys.executable, autoswe_repo_root()
-                ),
-            }
+            # Seeded from the spec-mandated builder so the backend and
+            # ``build_antigravity_mcp_config`` can never drift (the builder
+            # owns the launch triple, timeoutSeconds and the eager tools;
+            # cwd is its autoSWE-checkout-root, not spec.cwd — the builder
+            # already pins that).
+            owned: dict[str, dict] = dict(
+                build_antigravity_mcp_config(
+                    sys.executable, str(autoswe_repo_root())
+                )["mcpServers"]
+            )
             if isinstance(inline_cfg, dict):
                 # Verbatim launch bits (no eager ``tools`` block — lazy is
                 # fine for the review-only inline server).  ``env`` is

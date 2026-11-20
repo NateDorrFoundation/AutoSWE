@@ -173,3 +173,27 @@ Implemented exactly as specified above, on the `autoswe/issue-322` branch off
 **Live exit criterion:** NOT yet checked — requires a host with the `agy`
 binary (absent here). The two live boxes above stay open for the Phase 6
 dedicated-box pass.
+
+**Review-round follow-ups (rounds 2–5, same branch):**
+- Round 2: `_comment_steps` registers only calls that were *counted*, so a
+  question-terminal-ignored `post_plan` can never have its error-DONE wipe a
+  successful plan's flag (`test_ignored_plan_error_done_cannot_wipe_successful_plan`);
+  the owned inline entry carries `cwd=autoswe_repo_root()` (agy inherits
+  `spec.cwd` when the entry cwd is unset, where `mcp_servers` cannot resolve).
+- Round 3 (tests): §5.7 pass-through parametrisation over the three
+  MCP backends in `test_mcp_integration.py`; the HOME-redirect path test now
+  relocates `USERPROFILE` alongside `HOME` (Windows `Path.home()` order).
+- Round 4: the merge **prunes** owned keys absent from the current run's
+  owned set (stale `autoswe_inline_comment`), foreign keys never touched
+  (`test_merge_prunes_stale_owned_inline_entry`).
+- Round 5: concurrency safety of the global file is the **lock-serialised
+  read-modify-write** (advisory exclusive lock on sibling `<file>.lock`,
+  `fcntl.flock`/`msvcrt.locking`, best-effort) — NOT "concurrent runs write
+  identical bytes, benign": once the prune exists, concurrent runs' owned
+  sets legitimately differ, so the earlier stable-bytes argument no longer
+  covers interleavings (`test_merge_serialises_under_sibling_lockfile`,
+  `test_merge_proceeds_unlocked_when_lock_fails`,
+  `test_merge_proceeds_unlocked_when_lockfile_unusable`). The backend's owned
+  primary entry is now seeded from `build_antigravity_mcp_config`, making
+  the spec-mandated builder load-bearing (pinned by
+  `test_subprocess_entry_matches_mcp_config_builder`).
