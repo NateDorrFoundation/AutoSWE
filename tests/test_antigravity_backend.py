@@ -1512,6 +1512,41 @@ def test_second_plan_error_preserves_first_success():
     assert acc.plan_posted_body == "second"
 
 
+def test_ignored_plan_error_done_cannot_wipe_successful_plan():
+    """Review regression (issue #322 round 2): the full unmasked chain —
+    post_plan SUCCEEDS → post_question ACTIVE → second post_plan is IGNORED
+    (question-terminal, so never counted) and must also never be tracked →
+    the ignored call's ERROR terminal → question also ERRORs.  Before the
+    fix the ignored call sat in ``_comment_steps`` un-counted, so its
+    error-DONE decremented ``_plan_calls`` 1→0 and wiped the *successful*
+    plan's flag/body.  Now only counted calls are tracked: plan_posted
+    stays True with the original body; only the question is un-set."""
+    from tests.fakes.antigravity_fake import (
+        _mcp_comment_steps,
+        _step_tool_active,
+        _step_tool_done,
+        _success_stream,
+    )
+
+    question_name = ANTIGRAVITY_COMMENT_TOOL_NAMES["post_question"]
+    err = {"type": "mcp_tool_error", "message": "post failed"}
+    steps = [
+        *_mcp_comment_steps("s1", 1, "post_plan", "P"),                 # success
+        _step_tool_active("s1", 2, question_name, {"body": "?"}),        # question in flight
+        *_mcp_comment_steps("s1", 3, "post_plan", "ignored", error=err),  # ignored ACTIVE + ERROR
+        _step_tool_done("s1", 2, question_name, error=err),              # question fails too
+    ]
+    stream = _success_stream("s1", "tag-free text", tool_steps=steps)
+    proc = _MockProcess(stdout=("\n".join(stream) + "\n").encode())
+
+    result, _ = _full_run(_spec(), proc)
+
+    assert result.subtype == "success"
+    assert result.plan_posted is True
+    assert result.plan_posted_body == "P"
+    assert result.question_posted is False
+
+
 def test_question_terminal_precedence_and_risk_edge():
     """The Risks-test: question ACTIVE -> plan ACTIVE (must be ignored) ->
     question DONE WITH error -> NEITHER flag set -> text fallback stays live."""
@@ -1683,10 +1718,18 @@ def test_inline_entry_written_without_env_but_env_routes(agy_config_path):
     )
     _, captured = _full_run(spec, proc)
 
+    from autoswe.harness.mcp_config import autoswe_repo_root
+
     written = json.loads(agy_config_path.read_text(encoding="utf-8"))
     inline = written["mcpServers"]["autoswe_inline_comment"]
     assert inline["args"] == ["-m", "mcp_servers.autoswe_inline_comment_server"]
     assert "env" not in inline
+    # Review round-2: the inline entry must carry the SAME stable cwd as the
+    # primary — the mcp_servers package only resolves from the autoSWE
+    # checkout root, never from spec.cwd (the target worktree the agy
+    # subprocess runs in, which the entry would otherwise inherit).
+    assert inline["cwd"] == str(autoswe_repo_root())
+    assert inline["cwd"] != "/tmp/repo"
     raw = agy_config_path.read_text(encoding="utf-8")
     assert "deadbeef" not in raw and "AUTOSWE_PR_NUMBER" not in raw
     assert captured["env"]["AUTOSWE_PR_NUMBER"] == "77"

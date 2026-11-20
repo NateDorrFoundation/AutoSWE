@@ -1098,6 +1098,10 @@ def _parse_line(line: str, acc: _AgyAccumulator, callback) -> None:
                             # run already asked the user, so a post_plan that
                             # follows must NOT flip the outcome back to a
                             # posted plan — same rule and log shape as pi.
+                            # Deliberately NOT counted and NOT tracked: this
+                            # call never entered _plan_calls, so a later
+                            # error-DONE for it must not decrement the count
+                            # and wipe an earlier successful plan's flag.
                             log("[ANTIGRAVITY] post_plan ignored — post_question already observed in this run (question-terminal)")
                         else:
                             acc._plan_calls += 1
@@ -1108,17 +1112,17 @@ def _parse_line(line: str, acc: _AgyAccumulator, callback) -> None:
                             if body:
                                 acc.plan_posted_body = body
                             log(f"[ANTIGRAVITY] autoswe_comment post_plan (body {len(body)} chars)")
+                            acc._comment_steps[index] = role
                     elif role == "question":
                         acc._question_calls += 1
                         acc.question_posted = True
                         log(f"[ANTIGRAVITY] autoswe_comment post_question (body {len(body)} chars)")
+                        acc._comment_steps[index] = role
                     elif role == "progress":
                         # update_progress drives the live progress callback
                         # with its body so the operator sees the status line.
                         if callback and body:
                             callback(body[:200])
-                    if role in ("plan", "question"):
-                        acc._comment_steps[index] = role
                 if callback:
                     callback(f"Tool: {_tool_label(step)}")
             elif state in ("DONE", "ERROR"):
@@ -1581,9 +1585,17 @@ class AntigravityBackend:
             if isinstance(inline_cfg, dict):
                 # Verbatim launch bits (no eager ``tools`` block — lazy is
                 # fine for the review-only inline server).  ``env`` is
-                # stripped: it must never reach the file.
+                # stripped: it must never reach the file.  ``cwd`` is added
+                # even though ``build_mcp_inline_comment_server`` omits it:
+                # agy spawns with cwd=spec.cwd (the target worktree) and the
+                # entry's cwd defaults to that when unset
+                # (docs/antigravity/mcp.md), where
+                # ``python -m mcp_servers.autoswe_inline_comment_server``
+                # cannot resolve — the mcp_servers package lives at the
+                # autoSWE checkout root, same lever as the primary entry.
                 owned["autoswe_inline_comment"] = {
-                    k: v for k, v in inline_cfg.items() if k != "env"
+                    **{k: v for k, v in inline_cfg.items() if k != "env"},
+                    "cwd": str(autoswe_repo_root()),
                 }
                 inline_env = inline_cfg.get("env")
                 if isinstance(inline_env, dict):
