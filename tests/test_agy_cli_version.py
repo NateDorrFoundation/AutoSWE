@@ -78,7 +78,12 @@ def _installed_version(agy: str) -> str | None:
             text=True,
             timeout=_VERSION_TIMEOUT_S,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        # UnicodeDecodeError is a ValueError raised by the strict-UTF-8 decode
+        # inside subprocess.run(text=True) on a pathological CLI response —
+        # same gap class as antigravity.py::_query_agy_version and pi.py's
+        # _write_pi_mcp_json read arm.  Treat it as unqueryable (skip), never
+        # error, so the guard's "unqueryable → CI stays green" contract holds.
         return None
     if proc.returncode != 0:
         return None
@@ -163,6 +168,22 @@ def test_guard_skips_when_version_cannot_be_queried(monkeypatch):
     monkeypatch.setattr(_self(), "_installed_version", lambda agy: None)
     with pytest.raises(pytest.skip.Exception):
         test_agy_cli_meets_pinned_floor()
+
+
+def test_installed_version_treats_undecodable_output_as_unqueryable(monkeypatch):
+    """A strict-UTF-8 decode failure (ValueError, not OSError) must not error.
+
+    ``text=True`` decodes inside ``subprocess.run`` itself, so a pathological
+    ``agy --version`` response raises ``UnicodeDecodeError`` — the same gap class
+    fixed in ``antigravity.py::_query_agy_version`` and ``pi.py``'s
+    ``_write_pi_mcp_json`` read arm.  Treated as unqueryable: skip, CI green.
+    """
+
+    def boom(*args, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert _installed_version("/usr/local/bin/agy") is None
 
 
 def test_pinned_profile_cli_path_wins_over_path(monkeypatch):

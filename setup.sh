@@ -62,5 +62,5 @@ PY
     else
         echo "  antigravity backend: no agy binary found (PATH or profile cli_path) — install the Antigravity CLI first"
     fi
-    echo "  antigravity backend: run \`agy\` interactively once to authenticate (headless dispatch reuses that session; see docs/autoswe/harnesses.md)"
+    echo '  antigravity backend: run `agy` interactively once to authenticate (headless dispatch reuses that session; see docs/autoswe/harnesses.md)'
 fi
