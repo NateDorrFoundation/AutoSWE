@@ -31,8 +31,9 @@ from burying an issue in progress comments.
 After an `/abort` mid-`fix`, or after killing the dispatcher mid-antigravity-run, no `agy`
 processes may survive — on Linux check the process group with `pgrep -g <pgid>` (the backend's
 `_kill_tree` kills the whole tree, and the CLI's own children must die with it). Record the
-`pgrep` output in the finding log. Note that `/abort` mid-fix has no dedicated numbered case:
-OOB-1's kill shape and the `/abort` parking rules ([E2E-14](E2E-14.md)) together cover it.
+`pgrep` output in the finding log. Note that `/abort` mid-fix has no dedicated numbered case,
+and this orphan assertion is **new coverage in this note** (OOB-1's kill shape) —
+[E2E-14](E2E-14.md) covers `/abort` only from `planned`, not mid-fix.
 
 ---
 

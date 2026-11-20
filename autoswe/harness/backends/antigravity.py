@@ -152,6 +152,10 @@ def _agy_version_tuple(version: str) -> tuple[int, ...]:
 def _query_agy_version(exe: str) -> str | None:
     """Return ``agy --version`` output, or None if it cannot be queried."""
     try:
+        # 15 s here vs 30 s (_VERSION_TIMEOUT_S) in tests/test_agy_cli_version.py:
+        # intentional.  This probe runs on the async run path — a hung CLI must
+        # stall the first run at most a few seconds — while the offline guard
+        # tolerates slower CI boxes.  Both swallow any query failure silently.
         proc = subprocess.run(
             [exe, "--version"], capture_output=True, text=True, timeout=15
         )

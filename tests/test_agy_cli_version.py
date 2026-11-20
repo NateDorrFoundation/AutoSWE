@@ -57,7 +57,10 @@ def _resolve_agy() -> str | None:
         from autoswe.core.config import load_harnesses_config
 
         for profile in load_harnesses_config().values():
-            if profile.get("backend") == "antigravity":
+            # Case-insensitive to mirror production (factory.py lowercases the
+            # backend name); a profile written "Antigravity" must not make the
+            # guard vacuously skip.
+            if str(profile.get("backend", "")).lower() == "antigravity":
                 pinned = str(profile.get("cli_path") or "").strip()
                 if pinned:
                     return pinned
@@ -169,6 +172,21 @@ def test_pinned_profile_cli_path_wins_over_path(monkeypatch):
         lambda: {"agy-live": {"backend": "antigravity", "cli_path": "/opt/pinned/agy"}},
     )
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/agy")
+    assert _resolve_agy() == "/opt/pinned/agy"
+
+
+def test_backend_match_is_case_insensitive(monkeypatch):
+    """Production resolves the backend case-insensitively (factory.py lowercases) — so must the guard.
+
+    A profile written ``"backend": "Antigravity"`` gets an AntigravityBackend in
+    production; the guard matching the literal lowercase name only would
+    silently skip it (false green).
+    """
+    monkeypatch.setattr(
+        "autoswe.core.config.load_harnesses_config",
+        lambda: {"agy-live": {"backend": "Antigravity", "cli_path": "/opt/pinned/agy"}},
+    )
+    monkeypatch.setattr(shutil, "which", lambda name: None)
     assert _resolve_agy() == "/opt/pinned/agy"
 
 

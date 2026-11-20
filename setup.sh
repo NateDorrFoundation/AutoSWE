@@ -37,7 +37,7 @@ fi
 # install that needs interactive auth once. Warn-only: never fails setup. There
 # is deliberately no warm-up call for agy (spike M5: eager MCP tools work on a
 # cold cache; unlike pi, no warm-up is needed).
-if grep -Eq '"backend"[[:space:]]*:[[:space:]]*"antigravity"' "$AUTOSWE_DIR/config/harnesses.json" 2>/dev/null; then
+if grep -Eiq '"backend"[[:space:]]*:[[:space:]]*"antigravity"' "$AUTOSWE_DIR/config/harnesses.json" 2>/dev/null; then
     AGY_BIN="$("$PYTHON" - <<'PY'
 import json, os, shutil
 p = os.path.join(os.environ["AUTOSWE_DIR"], "config", "harnesses.json")
