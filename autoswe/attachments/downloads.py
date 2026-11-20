@@ -52,9 +52,73 @@ def _safe_url(url: str) -> str:
     return (url or "").split("?", 1)[0]
 
 
+_ALLOWED_SCHEMES = ("http", "https")
+
+
+def _bad_scheme_target(newurl: str) -> str | None:
+    """Return the offending scheme when a *redirect target* is not
+    http/https, else ``None``. An empty scheme (relative ``Location``)
+    resolves against the http(s) base and is fine."""
+    scheme = urlsplit(str(newurl).strip()).scheme.lower()
+    if scheme and scheme not in _ALLOWED_SCHEMES:
+        return scheme
+    return None
+
+
+class _SchemeSafeRedirectHandler(request.HTTPRedirectHandler):
+    """Follows redirects only to http/https targets.
+
+    urllib's stock handler would let a ``Location: file:///etc/passwd`` hop
+    read a LOCAL file through this sink. The check lives in ``http_error_302``
+    (the single dispatch entry the 301/302/303/307/308 aliases share), not in
+    ``redirect_request``, because CPython ≥3.10.12 pre-checks the target there
+    and raises its own ``HTTPError`` (surfacing here as ``http_302``, not
+    ``bad_scheme``) while still allowing ``ftp://`` targets through to
+    ``redirect_request``. Overriding the dispatch entry keeps the sink's
+    ``bad_scheme`` contract deterministic across versions.
+
+    A raised :class:`DownloadError` propagates out of ``OpenerDirector.open``
+    (urllib only swallows ``HTTPError`` in this path), so callers see exactly
+    the same failure shape as the initial-URL guard.
+    """
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        target = None
+        if "location" in headers:
+            target = headers["location"]
+        elif "uri" in headers:
+            target = headers["uri"]
+        if target:
+            bad = _bad_scheme_target(target)
+            if bad is not None:
+                raise DownloadError(
+                    req.full_url, "bad_scheme",
+                    f"redirect target scheme {bad!r} not allowed (http/https only)",
+                )
+        return super().http_error_302(req, fp, code, msg, headers)
+
+
+# Every redirect code the base class dispatches must go through the hardened
+# override. 308 handling only exists on newer CPythons — alias only if present
+# so this never *adds* redirect support a base Python does not have.
+for _code in (301, 303, 307, 308):
+    if hasattr(request.HTTPRedirectHandler, f"http_error_{_code}"):
+        setattr(
+            _SchemeSafeRedirectHandler, f"http_error_{_code}",
+            _SchemeSafeRedirectHandler.http_error_302,
+        )
+
+
 def _build_opener() -> request.OpenerDirector:
-    """Opener that follows redirects but sends no cookies (fresh per call)."""
-    return request.build_opener()
+    """Opener that follows redirects (http/https targets only) but sends no
+    cookies (fresh per call).
+
+    Passing a *subclass instance* of ``HTTPRedirectHandler`` makes
+    ``build_opener`` skip the stock redirect handler entirely (it removes any
+    default whose class the passed instance is an instance of), so the scheme
+    check cannot be shadowed by a second handler in the dispatch chain.
+    """
+    return request.build_opener(_SchemeSafeRedirectHandler())
 
 
 def download_bytes(
@@ -70,14 +134,16 @@ def download_bytes(
     is enforced while streaming so a file larger than *max_bytes* never
     occupies more than one chunk of memory and nothing is returned.
 
-    This is the single download sink, so the scheme allowlist lives here:
-    every URL — including Azure ``relations[]`` URLs handed over verbatim —
-    must be ``http``/``https`` before any opener touches it (urllib's default
-    opener carries a ``file://`` handler; a crafted relation would otherwise
-    read a local file into the temp dir and advertise it in the manifest).
+    This is the single download sink, so the scheme allowlist lives here —
+    for the initial URL *and*, via :func:`_build_opener`, for every redirect
+    target: any URL — including Azure ``relations[]`` URLs handed over
+    verbatim — must stay ``http``/``https`` end to end (urllib's default
+    opener carries a ``file://`` handler; a crafted relation or a crafted
+    ``Location:`` hop would otherwise read a local file into the temp dir
+    and advertise it in the manifest).
     """
     scheme = urlsplit(url or "").scheme.lower()
-    if scheme not in ("http", "https"):
+    if scheme not in _ALLOWED_SCHEMES:
         raise DownloadError(
             url, "bad_scheme",
             f"scheme {scheme!r} not allowed (http/https only)",

@@ -389,6 +389,126 @@ class TestDownloads:
         ) == b"ok"
         assert opened == ["https://x/y"]
 
+    def test_download_rejects_file_scheme_via_redirect(self, monkeypatch):
+        """Round-5 MEDIUM: the scheme allowlist must survive a redirect hop.
+        A 302 whose ``Location:`` is ``file:///etc/passwd``, driven
+        end-to-end through ``download_bytes`` with the DEFAULT opener, must
+        surface as ``DownloadError(bad_scheme)`` — never a local read. The
+        transport is stubbed below the opener (HTTPSHandler.https_open), so
+        the real redirect-dispatch machinery runs, including the hardened
+        ``_SchemeSafeRedirectHandler`` wired in by ``_build_opener``."""
+        from autoswe.attachments import downloads
+
+        opened = []
+
+        class Resp302:
+            # urllib's HTTPErrorProcessor reads .code/.msg/.info() to dispatch
+            # 3xx errors; .info() feeds the Location lookup in the redirect
+            # handler. A plain dict supports the ``in`` + [] access both use.
+            code = 302
+            msg = "Found"
+
+            def __init__(self, url):
+                self.url = url
+                self.headers = {"location": "file:///etc/passwd"}
+
+            def info(self):
+                return self.headers
+
+            def read(self, _n=-1):
+                return b""
+
+            def close(self):
+                pass
+
+            def getcode(self):
+                return self.code
+
+        def fake_open(self, req):
+            opened.append(req.full_url)
+            return Resp302(req.full_url)
+
+        monkeypatch.setattr(
+            downloads.request.HTTPSHandler, "https_open", fake_open,
+        )
+
+        with pytest.raises(downloads.DownloadError) as exc:
+            downloads.download_bytes("https://x.example/a", max_bytes=100)
+        assert exc.value.code == "bad_scheme"
+        # The error carries the ORIGINAL url (correlation), not the target.
+        assert exc.value.url == "https://x.example/a"
+        # Only the initial request was ever opened; file:// was not.
+        assert opened == ["https://x.example/a"]
+
+    def test_download_allows_https_to_https_redirect(self, monkeypatch):
+        """The redirect guard must not break legitimate redirects: an
+        https -> https hop still resolves and the payload downloads."""
+        from autoswe.attachments import downloads
+
+        payload = b"redirected-bytes"
+        opened = []
+
+        class Resp302:
+            code = 302
+            msg = "Found"
+
+            def __init__(self, url):
+                self.url = url
+                self.headers = {"location": "https://cdn.example/x.png"}
+
+            def info(self):
+                return self.headers
+
+            def read(self, _n=-1):
+                return b""
+
+            def close(self):
+                pass
+
+            def getcode(self):
+                return self.code
+
+        class Resp200:
+            code = 200
+            msg = "OK"
+
+            def __init__(self, url):
+                self.url = url
+                self.headers = {}
+                self._left = payload
+
+            def info(self):
+                return self.headers
+
+            def read(self, _n=-1):
+                out, self._left = self._left, b""
+                return out
+
+            def close(self):
+                pass
+
+            def getcode(self):
+                return self.code
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        def fake_open(self, req):
+            opened.append(req.full_url)
+            if req.full_url == "https://x.example/a":
+                return Resp302(req.full_url)
+            return Resp200(req.full_url)
+
+        monkeypatch.setattr(
+            downloads.request.HTTPSHandler, "https_open", fake_open,
+        )
+
+        assert downloads.download_bytes("https://x.example/a", max_bytes=100) == payload
+        assert opened == ["https://x.example/a", "https://cdn.example/x.png"]
+
 
 # ============================================================================
 # GitHub A -> B fallback
