@@ -918,11 +918,35 @@ def test_rule_prefix_absolute_trailing_slash_and_normalized():
     # globs and slash-less prefixes silently do NOT match.
     assert agy_mod._rule_prefix("/tmp/repo") == "/tmp/repo/"
     assert agy_mod._rule_prefix("/tmp/repo/") == "/tmp/repo/"
-    assert agy_mod._rule_prefix("C:\\work\\wt") == os.path.abspath(
-        "C:\\work\\wt"
-    ).replace("\\", "/").rstrip("/") + "/"
-    # A relative cwd is absolutized, never leaked into a rule as-is.
-    assert os.path.isabs(agy_mod._rule_prefix("relative/wt"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive-letter abspath is Windows semantics")
+def test_rule_prefix_windows_drive_letter_normalized():
+    # Pinned literal (not a re-derivation of the implementation): backslash
+    # rule targets ride the same forward-slash shape as Linux.
+    assert agy_mod._rule_prefix("C:\\work\\wt") == "C:/work/wt/"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX abspath semantics under test")
+def test_rule_prefix_relative_cwd_absolutized(tmp_path, monkeypatch):
+    # A relative cwd is absolutized against the process cwd, never leaked
+    # into a rule as-is.  chdir to a known dir so the expectation is a
+    # literal, not the same expression _rule_prefix computes.
+    monkeypatch.chdir(tmp_path)
+    expected = str(tmp_path) + "/relative/wt/"
+    assert agy_mod._rule_prefix("relative/wt") == expected
+
+
+def test_rule_prefix_rejects_empty_cwd():
+    # Fail-loud (review round-4): abspath("") would silently anchor every
+    # deny rule to the poller's cwd — a mis-plumbed spec must not enforce
+    # nothing while looking enforced.
+    for empty in ("", None):
+        with pytest.raises(ValueError, match=r"spec\.cwd"):
+            agy_mod._rule_prefix(empty)
+    # And the seam fails before staging anything.
+    with pytest.raises(ValueError, match=r"spec\.cwd"):
+        agy_mod._stage_run_config(_spec(mode="plan", cwd=""), {})
 
 
 def test_permissions_plan_and_read_only_share_the_read_only_profile():

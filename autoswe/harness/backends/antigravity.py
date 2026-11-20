@@ -192,6 +192,18 @@ _NEVER_ALLOWED_TOOL_RULES = (
     "ask_custom_permission",
 )
 
+# Rule SHAPE → spike evidence (a wrong shape fails SILENTLY — that is P2's
+# whole lesson, so each spelling below is pinned to the §0.3 row that proved
+# it, not to taste):
+#   write_file(<dir>/) …   directory-prefix target, TRAILING SLASH REQUIRED
+#                          → §0.3 P2 (glob ``<repo>/*`` did not match; slash-
+#                          less prefix matched only the bare path)
+#   command(*)             wildcard target → §0.3 P2 (``command(ls)`` denied)
+#   ask_question (et al.)  BARE name, no target → §0.3 T10 (deniable via
+#                          permissions.deny; headless never pauses anyway)
+#   mcp(server/tool)       wildcard target → §0.3 P5 (MCP allow coexists with
+#                          the write/command deny profile in one run)
+
 # ``spec.extra_tools`` / ``spec.disallowed_tools_override`` carry Claude-style
 # names today.  Map the ones with a clean agy rule equivalent (stream names);
 # everything else is log-and-ignore'd, same table convention as pi.py's
@@ -448,8 +460,17 @@ def _rule_prefix(cwd: str) -> str:
     to forward slashes so one rule shape works on both platforms (rule
     semantics verified on Linux, spike §0.3; Windows path rules ride the
     Phase 6 parity pass).
+
+    Raises on a falsy cwd: falling back to ``abspath("")`` would silently
+    anchor every deny rule to the *poller's* cwd — a mis-plumbed spec must
+    fail loudly instead of enforcing nothing.
     """
-    path = os.path.abspath(str(cwd or "")).replace("\\", "/").rstrip("/")
+    if not cwd:
+        raise ValueError(
+            "antigravity permission rules require an explicit spec.cwd; "
+            "refusing to target deny rules at the poller's working directory"
+        )
+    path = os.path.abspath(str(cwd)).replace("\\", "/").rstrip("/")
     return path + "/"
 
 
@@ -549,6 +570,14 @@ def _resolve_config_home(harness_cfg: dict, model: str | None) -> os.PathLike:
     is not threaded into the resolved harness dict, so the model stands in as
     the stable per-profile key.  Only ``base-settings.json`` is ever read
     from here; per-run staged files land in a private temp dir.
+
+    The directory is OPTIONAL by design: live-verified on the dedicated box,
+    ``--settings`` LAYERS over the host-global ``~/.gemini/antigravity-cli/
+    settings.json`` rather than replacing it (an isolated HOME whose global
+    settings carried only the model-provider config resolved its custom model
+    under a ``--settings`` file containing only a permissions block — matching
+    the flag text "for this session only, never saved").  So an absent
+    config_home loses nothing; the CLI still sees its host-global config.
     """
     from autoswe.core.config import AUTOSWE_DIR  # lazy: config pulls in the factory
 
@@ -561,10 +590,15 @@ def _resolve_config_home(harness_cfg: dict, model: str | None) -> os.PathLike:
 def _load_base_settings(harness_cfg: dict, model: str | None) -> dict:
     """``<config_home>/base-settings.json`` (``{}`` when absent/unreadable).
 
-    Stable per-profile keys (useG1Credits, modelProvider/customModelsConfig,
-    and the Phase 5 MCP registration) live here and are copied into every
-    staged file so the staged run sees the same config the unsandboxed CLI
-    would, PLUS the mode block.
+    An OPTIONAL per-profile override layer, NOT a required rescue: ``--settings``
+    is live-verified (dedicated-box experiment, isolated HOME + provider-only
+    global settings) to LAYER over the host-global settings file, never
+    replace it — so a bare ``{}`` base keeps every host-global key
+    (useG1Credits, modelProvider/customModels, …) exactly as the unsandboxed
+    CLI sees them.  Author this file only to OVERRIDE host config for one
+    profile, or to park per-profile state (the Phase 5 MCP registration).
+    Do NOT auto-seed it by copying the host-global file: under layering that
+    buys nothing and would freeze a stale snapshot.
     """
     base_file = Path(_resolve_config_home(harness_cfg, model)) / "base-settings.json"
     try:
@@ -597,8 +631,10 @@ def _stage_run_config(spec: RunSpec, harness_cfg: dict) -> tuple[list[str], dict
     Mechanics: private temp dir (``mkdtemp`` — distinct per concurrent run,
     so two parallel plan/fix sessions never share a settings file,
     race-free under ``MAX_CONCURRENT > 1``) holding ``settings.json`` = the
-    profile's ``base-settings.json`` (or ``{}``) merged with the mode block
-    (§4.3) + mapped tool overrides.  ``cleanup`` deletes the run dir; the
+    profile's OPTIONAL ``base-settings.json`` (or ``{}``) merged with the mode
+    block (§4.3) + mapped tool overrides.  The CLI layers this file OVER the
+    host-global settings (live-verified — see _load_base_settings), so a bare
+    ``{}`` base loses no host config.  ``cleanup`` deletes the run dir; the
     caller runs it in a ``finally``, so success, failure, kill and cancel all
     reclaim it.  The host-global settings file is NEVER opened for writing.
     """

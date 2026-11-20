@@ -582,6 +582,19 @@ only as the backstop it always was. Two facts shape the mechanism:
   **never** written: it is shared, so per-run writes there would race a
   concurrent `/fix` under `MAX_CONCURRENT > 1` and leak a lockdown on crash.
   Distinct temp dirs make concurrent runs race-free by construction.
+- **`--settings` LAYERS over the host-global file — it never replaces it**
+  (live-verified on the dedicated box: an isolated `HOME` whose global
+  settings carried only the model-provider config resolved that custom model
+  normally under a `--settings` file containing *only* a permissions block —
+  consistent with the flag text "for this session only, never saved").
+  Consequently `config_home/base-settings.json` is an **optional per-profile
+  override layer, not a required seed**: a fresh install with no such file
+  loses nothing — `/plan` and `/fix` keep whatever the unsandboxed CLI has
+  (`useG1Credits`, `modelProvider`/custom models, …). Author it only to
+  override host config for one profile or to park per-profile state (the
+  Phase 5 MCP registration). Do **not** auto-copy the host-global file into
+  `config_home` — under layering that buys nothing and would freeze a stale
+  snapshot the host later changes.
 
 **Mode → permissions mapping (deny targets are directory prefixes WITH a
 trailing slash — globs silently do NOT match, spike P2):**
