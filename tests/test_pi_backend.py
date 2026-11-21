@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -1453,21 +1455,39 @@ def test_run_returncode_read_via_wait_not_attribute():
     assert result.text == "ok"
 
 
-# ---------- Timeout / kill ----------
+# ---------- Timeout / kill (process-tree, issue #327) ----------
 
 
-def test_run_timeout_kills_and_raises():
-    """asyncio.TimeoutError propagates after killing the process."""
+@pytest.mark.skipif(os.name == "nt", reason="POSIX killpg path (Windows covered in tests/test_proc_kill.py)")
+def test_run_timeout_kills_process_group(monkeypatch):
+    """Timeout must kill the process GROUP, not just the direct child/shim.
+
+    A bare ``process.kill()`` orphans pi's children — on Windows the real
+    node process sits under the ``cmd /c`` shim.  The fix spawns with
+    ``start_new_session=True`` and kills via ``_proc_kill.kill_tree``
+    (SIGTERM first; the SIGKILL escalation and the Windows taskkill path are
+    covered in ``tests/test_proc_kill.py``).
+    """
     spec = _spec(timeout=0.05)
 
     proc = _mock_process(stdout="", returncode=-9)
-    proc.killed = False
+    proc.pid = 4242  # pretend group leader
 
     async def blocking_read():
         await asyncio.sleep(999)
 
     proc.stdout.readline = blocking_read
     proc.stderr.read = AsyncMock(return_value=b"")
+
+    killpg_calls: list[tuple[int, int]] = []
+
+    def fake_killpg(pgid, sig):
+        killpg_calls.append((pgid, sig))
+        if sig == 0:
+            raise ProcessLookupError  # group empty: the child already exited
+
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(os, "killpg", fake_killpg)
 
     async def _run():
         with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -1477,8 +1497,40 @@ def test_run_timeout_kills_and_raises():
         asyncio.run(_run())
         assert False, "Should have raised TimeoutError"
     except asyncio.TimeoutError:
-        pass
-    assert proc.killed is True
+        pass  # expected, as before
+    # wait() returned and the group re-check found it empty → no SIGKILL
+    assert killpg_calls == [(4242, signal.SIGTERM), (4242, 0)]
+    assert proc.killed is False  # bare process.kill() was NOT the mechanism
+
+
+def test_run_spawn_uses_own_process_group():
+    """pi must spawn with start_new_session so _proc_kill.kill_tree can
+    reach the whole tree on the timeout path (issue #327)."""
+    spec = _spec()
+    stream = _jsonl(
+        {"type": "session", "id": "pi-sess", "version": 3},
+        {"type": "agent_end"},
+    )
+    mock_exec = AsyncMock(return_value=_mock_process(stdout=stream, returncode=0))
+    with patch("asyncio.create_subprocess_exec", mock_exec):
+        _run(PiBackend(), spec)
+    kwargs = mock_exec.await_args.kwargs
+    # POSIX: own session/group.  Windows: flag unused (taskkill /T walks the
+    # tree from the shim instead), so the backend only sets it off-nt.
+    assert kwargs["start_new_session"] is (os.name != "nt")
+
+
+def test_warm_up_spawn_uses_own_process_group(tmp_path):
+    """warm_up_mcp_cache spawns pi in its own process group too (issue #327):
+    its timeout kill goes through the same kill_tree, so a hung warm-up must
+    not orphan the node child under the cmd /c shim."""
+    mock_exec = AsyncMock(return_value=_mock_process(stdout="", returncode=0))
+    harness_cfg = {"agent_dir": str(tmp_path), "model": MODEL}
+    with patch("asyncio.create_subprocess_exec", mock_exec):
+        asyncio.run(_pi_mod.warm_up_mcp_cache(harness_cfg, timeout=5))
+    assert mock_exec.await_count == 1
+    kwargs = mock_exec.await_args.kwargs
+    assert kwargs["start_new_session"] is (os.name != "nt")
 
 
 # ---------- Stream-size bounding ----------

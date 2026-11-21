@@ -57,6 +57,7 @@ from collections.abc import Awaitable
 from dataclasses import dataclass, field
 
 from autoswe.core.logging_utils import log
+from autoswe.harness.backends._proc_kill import kill_tree
 from autoswe.harness.backends.base import RunResult, RunSpec
 from autoswe.harness.mcp_config import (
     autoswe_repo_root,
@@ -385,6 +386,10 @@ async def warm_up_mcp_cache(harness_cfg: dict, *, timeout: float = 60.0) -> bool
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=autoswe_repo_root(),
+            # Own process group so a warm-up timeout can kill the whole tree
+            # (issue #327) — a bare kill would orphan the node child under the
+            # cmd /c shim on Windows.
+            start_new_session=(os.name != "nt"),
             # Same StreamReader limit as a real run: the warm-up drains both
             # pipes (chunked read() only, no readline), but keeping the
             # "every pipe we read from has an oversized limit" invariant means
@@ -441,7 +446,7 @@ async def warm_up_mcp_cache(harness_cfg: dict, *, timeout: float = 60.0) -> bool
         # well before a long LLM turn would finish; a hang on the turn is not a
         # warm-up failure. Kill and check the cache anyway.
         log(f"[PI-WARMUP] pi did not finish within {timeout:.0f}s; killing (MCP connect may already be complete)")
-        process.kill()
+        await kill_tree(process)
         await process.wait()
 
     warm = _pi_mcp_cache_warm(agent_dir)
@@ -1119,6 +1124,11 @@ class PiBackend:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=spec.cwd,
+                # Own the process group so _proc_kill.kill_tree can reach the
+                # whole tree on the timeout path (issue #327): pi spawns children,
+                # and on Windows the real node process sits under the
+                # cmd /c shim, which a bare process.kill() would orphan.
+                start_new_session=(os.name != "nt"),
                 # StreamReader limit threads to BOTH stdout and stderr pipes.
                 # Default is 64 KiB: a single JSON event larger than that makes
                 # readline() raise ValueError, which is not a retryable
@@ -1266,9 +1276,9 @@ class PiBackend:
             # coroutines both return None).
             stderr_bytes = _gather_results[1] if len(_gather_results) > 1 else b""
         except asyncio.TimeoutError:
-            process.kill()
+            await kill_tree(process)
             await process.wait()
-            log(f"[PI] timeout after {spec.timeout}s — killed process")
+            log(f"[PI] timeout after {spec.timeout}s — killed process tree")
             raise
 
         # Reap the process so `returncode` is set. On the Windows proactor

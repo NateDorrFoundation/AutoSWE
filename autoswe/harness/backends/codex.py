@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from autoswe.core.logging_utils import log
+from autoswe.harness.backends._proc_kill import kill_tree
 from autoswe.harness.backends.base import CLAUDE_COMMENT_TOOL_NAMES, RunResult, RunSpec
 from autoswe.harness.backends.codex_pricing import estimate_cost
 
@@ -672,6 +673,10 @@ class CodexBackend:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=spec.cwd,
+                # Own the process group so _proc_kill.kill_tree can reach
+                # the whole tree on the timeout path (issue #327): codex
+                # spawns children, and a bare process.kill() would orphan them.
+                start_new_session=(os.name != "nt"),
                 # StreamReader limit threads to BOTH stdout and stderr pipes.
                 # Default is 64 KiB: a single JSONL line larger than that makes
                 # readline() raise ValueError, which is not in retryable
@@ -811,9 +816,9 @@ class CodexBackend:
                 timeout=spec.timeout,
             )
         except asyncio.TimeoutError:
-            process.kill()
+            await kill_tree(process)
             await process.wait()
-            log(f"[CODEX] timeout after {spec.timeout}s — killed process")
+            log(f"[CODEX] timeout after {spec.timeout}s — killed process tree")
             raise
 
         # Reap the process so `returncode` is set. On the Windows proactor
