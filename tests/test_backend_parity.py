@@ -31,9 +31,10 @@ from autoswe.harness.backends.base import CodingBackend, RunResult, RunSpec
 # 1. Protocol conformance
 # ---------------------------------------------------------------------------
 
-# The three backends held to the same contract. codex/pi are CLI backends that
-# require a model in the profile; claude_code is SDK-based and takes none.
-BACKENDS = ("claude_code", "codex", "pi")
+# All four backends held to the same contract. codex/pi/antigravity are CLI
+# backends that require a model in the profile; claude_code is SDK-based and
+# takes none.
+BACKENDS = ("claude_code", "codex", "pi", "antigravity")
 
 
 def _harness_cfg(backend: str) -> dict:
@@ -42,6 +43,8 @@ def _harness_cfg(backend: str) -> dict:
         return {"backend": "codex", "model": "gpt-5.6-terra"}
     if backend == "pi":
         return {"backend": "pi", "model": "claude-sonnet-4-5"}
+    if backend == "antigravity":
+        return {"backend": "antigravity", "model": "gemini-test"}
     return {"backend": "claude_code"}
 
 
@@ -55,6 +58,10 @@ def _backend_class(backend: str):
         from autoswe.harness.backends.pi import PiBackend
 
         return PiBackend
+    if backend == "antigravity":
+        from autoswe.harness.backends.antigravity import AntigravityBackend
+
+        return AntigravityBackend
     from autoswe.harness.backends.claude_code import ClaudeCodeBackend
 
     return ClaudeCodeBackend
@@ -88,6 +95,15 @@ class TestProtocolConformance:
         backend = PiBackend()
         assert isinstance(backend, CodingBackend), (
             "PiBackend should satisfy CodingBackend Protocol"
+        )
+
+    def test_antigravity_is_coding_backend(self):
+        """AntigravityBackend satisfies runtime_checkable CodingBackend."""
+        from autoswe.harness.backends.antigravity import AntigravityBackend
+
+        backend = AntigravityBackend()
+        assert isinstance(backend, CodingBackend), (
+            "AntigravityBackend should satisfy CodingBackend Protocol"
         )
 
     @pytest.mark.parametrize("backend", BACKENDS)
@@ -255,6 +271,28 @@ class TestCommentToolNamesParity:
 
         assert CodexBackend.comment_tool_names() == CLAUDE_COMMENT_TOOL_NAMES
 
+    def test_antigravity_eager_single_underscore_names(self):
+        """Phase 5: agy's eager registration names the tools
+        ``mcp_<server>_<tool>`` — single underscores throughout (M2 pinned
+        ``mcp_autoswe_comment_post_plan`` on the real binary)."""
+        from autoswe.harness.backends.antigravity import AntigravityBackend
+
+        names = AntigravityBackend.comment_tool_names()
+        assert names == {
+            "post_plan": "mcp_autoswe_comment_post_plan",
+            "post_question": "mcp_autoswe_comment_post_question",
+            "update_progress": "mcp_autoswe_comment_update_progress",
+        }
+        # The issue's parity requirement stated as an explicit key assertion.
+        assert {"post_plan", "post_question", "update_progress"} <= set(names)
+        # Distinct from Claude (double underscore) AND from pi (the adapter's
+        # toolPrefix shape keeps a double underscore before the server name).
+        from autoswe.harness.backends.claude_code import ClaudeCodeBackend
+        from autoswe.harness.backends.pi import PiBackend
+
+        assert names != ClaudeCodeBackend.comment_tool_names()
+        assert names != PiBackend.comment_tool_names()
+
     def test_pi_names_differ_from_claude(self):
         """The whole point of Phase 3: pi and Claude spell the names differently."""
         from autoswe.harness.backends.claude_code import ClaudeCodeBackend
@@ -268,11 +306,18 @@ class TestCommentToolNamesParity:
         Guards against the returned dict drifting from the allowlist constant the
         parser/allowlist actually use (the two must stay in lockstep).
         """
+        from autoswe.harness.backends.antigravity import (
+            _ROLE_BY_EAGER_TOOL,
+            AntigravityBackend,
+        )
         from autoswe.harness.backends.claude_code import _MCP_COMMENT_TOOLS, ClaudeCodeBackend
         from autoswe.harness.backends.pi import _MCP_COMMENT_TOOL_NAMES, PiBackend
 
         assert set(ClaudeCodeBackend.comment_tool_names().values()) == set(_MCP_COMMENT_TOOLS)
         assert set(PiBackend.comment_tool_names().values()) == set(_MCP_COMMENT_TOOL_NAMES)
+        # agy: the names the prompt renders are exactly the eager names the
+        # stream classifier keys on.
+        assert set(AntigravityBackend.comment_tool_names().values()) == set(_ROLE_BY_EAGER_TOOL)
 
     def test_runner_dispatch_returns_backend_names(self):
         """runner.comment_tool_names() resolves through the factory per backend."""
@@ -284,6 +329,9 @@ class TestCommentToolNamesParity:
         assert comment_tool_names(
             {"backend": "pi", "model": "claude-sonnet-4-5"}
         )["post_plan"] == "mcp__autoswe_comment_post_plan"
+        assert comment_tool_names(
+            {"backend": "antigravity", "model": "gemini-test"}
+        )["post_plan"] == "mcp_autoswe_comment_post_plan"
 
     def test_runner_dispatch_defaults_to_claude(self):
         """With no harness cfg, runner.comment_tool_names() gives the Claude default."""
@@ -566,6 +614,31 @@ class TestCapabilityHonesty:
             "Update this test when Codex gains the capability."
         )
 
+    def test_antigravity_lacks_claude_exclusives(self):
+        """Antigravity must NOT advertise capabilities it doesn't support.
+
+        Phase 1 gained resume + progress_stream + structured_output; Phase 4
+        added "mode" (per-run ``--settings`` deny enforcement, so the planner
+        no longer loudly degrades for agy); Phase 5 added "mcp" (eager
+        autoswe_comment tools, stream-parsed posted flags).  Still out:
+        "session_fork" (agy resumes in place — no fork primitive), "plan_file",
+        and the Claude-only SDK levers "can_use_tool"/"plan_permission".
+        """
+        from autoswe.harness.backends.antigravity import AntigravityBackend
+
+        caps = AntigravityBackend.capabilities()
+        assert "mode" in caps, "Phase 4: agy must advertise mode read-only enforcement"
+        assert "mcp" in caps, "Phase 5: agy must advertise MCP comment posting"
+        unsupported = {
+            "can_use_tool", "plan_permission",
+            "plan_file", "session_fork",
+        }
+        overlap = caps & unsupported
+        assert not overlap, (
+            f"AntigravityBackend advertises unsupported capabilities: {overlap}. "
+            "Update this test when agy gains the capability."
+        )
+
     @pytest.mark.parametrize("backend", BACKENDS)
     def test_share_resume_and_progress(self, backend):
         """Every backend shares at least resume + progress_stream."""
@@ -636,6 +709,30 @@ class TestRetryableSubtypesParity:
             f"PiBackend.retryable_subtypes() changed: got {result}"
         )
 
+    def test_antigravity_retryable_subtypes(self):
+        """AntigravityBackend.retryable_subtypes() returns {'error', 'killed'}.
+
+        Same CLI-subprocess failure surface as Codex/pi — plus agy's
+        in-stream ERROR / interrupted results, which the parser maps onto
+        exactly these two retryable subtypes (config_error stays out).
+        """
+        from autoswe.harness.backends.antigravity import AntigravityBackend
+
+        result = AntigravityBackend.retryable_subtypes()
+        assert result == {"error", "killed"}, (
+            f"AntigravityBackend.retryable_subtypes() changed: got {result}"
+        )
+
+    def test_antigravity_retryable_exceptions(self):
+        """agy retries on the subprocess surface (TimeoutError, OSError)."""
+        import asyncio
+
+        from autoswe.harness.backends.antigravity import AntigravityBackend
+
+        exc = AntigravityBackend.retryable_exceptions()
+        assert asyncio.TimeoutError in exc
+        assert OSError in exc
+
     @pytest.mark.parametrize("backend", BACKENDS)
     def test_retryable_subtypes_returns_copy(self, backend):
         """retryable_subtypes() must return a copy so callers can't mutate state."""
@@ -674,6 +771,15 @@ class TestFactoryParity:
         from autoswe.harness.backends.factory import get_backend
 
         backend = get_backend({"backend": "pi", "model": "claude-sonnet-4-5"})
+        assert isinstance(backend, CodingBackend)
+
+    def test_factory_antigravity_is_backend(self):
+        """Factory antigravity backend satisfies CodingBackend."""
+        from autoswe.harness.backends.antigravity import AntigravityBackend
+        from autoswe.harness.backends.factory import get_backend
+
+        backend = get_backend({"backend": "antigravity", "model": "gemini-test"})
+        assert isinstance(backend, AntigravityBackend)
         assert isinstance(backend, CodingBackend)
 
     def test_factory_default_is_claude_code(self):
@@ -747,6 +853,28 @@ class TestRunnerDispatcherParity:
         assert not backend_has_capability(harness, "plan_permission")
         assert not backend_has_capability(harness, "plan_file")
         assert not backend_has_capability(harness, "structured_output")
+
+    def test_runner_backend_has_capability_antigravity(self):
+        """backend_has_capability returns correct values for an agy profile.
+
+        Phase 1: resume + progress_stream + structured_output; Phase 4 added
+        mode (plan/review are now ENFORCED via the staged --settings deny
+        block, no loud-degrade); Phase 5 added mcp (the planner's has_mcp
+        branch engages).  Still out: session_fork (/retry degrades to a fresh
+        run), can_use_tool/plan_file.
+        """
+        from autoswe.harness.runner import backend_has_capability
+
+        harness = {"backend": "antigravity", "model": "gemini-test"}
+        assert backend_has_capability(harness, "resume")
+        assert backend_has_capability(harness, "progress_stream")
+        assert backend_has_capability(harness, "structured_output")
+        assert backend_has_capability(harness, "mode")
+        assert backend_has_capability(harness, "mcp")
+        assert not backend_has_capability(harness, "session_fork")
+        assert not backend_has_capability(harness, "can_use_tool")
+        assert not backend_has_capability(harness, "plan_permission")
+        assert not backend_has_capability(harness, "plan_file")
 
     def test_runner_backend_has_capability_unknown(self):
         """backend_has_capability handles unknown capability gracefully."""
@@ -900,7 +1028,7 @@ class TestReadOnlyBehavioralParity:
     runs regardless of which backend performed the (unforced) read-only phase.
     """
 
-    @pytest.mark.parametrize("backend", ["codex", "claude_code", "pi"])
+    @pytest.mark.parametrize("backend", ["codex", "claude_code", "pi", "antigravity"])
     def test_plan_run_cannot_write_to_worktree(self, backend, tmp_path, mock_gh_post_comment):
         """A mode="plan" run must not leave the worktree dirty, on either backend.
 
@@ -932,6 +1060,8 @@ class TestReadOnlyBehavioralParity:
             harness = {"backend": "codex", "model": "gpt-5.6-terra"}
         elif backend == "pi":
             harness = {"backend": "pi", "model": "claude-sonnet-4-5"}
+        elif backend == "antigravity":
+            harness = {"backend": "antigravity", "model": "gemini-test"}
         else:
             harness = {"backend": "claude_code"}
 

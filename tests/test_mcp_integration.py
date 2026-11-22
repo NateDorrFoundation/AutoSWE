@@ -4,6 +4,8 @@ import sys
 from contextlib import contextmanager
 from unittest.mock import patch
 
+import pytest
+
 from autoswe.harness.runner import RunResult
 
 
@@ -84,8 +86,25 @@ def test_build_mcp_servers_azure_provider():
 # run_plan passes MCP servers to runner
 # ---------------------------------------------------------------------------
 
-def test_run_plan_passes_mcp_servers(tmp_path, mock_gh_post_comment):
-    """run_plan should pass mcp_servers to runner.run when comment_id is set."""
+# Issue #322 §5.7: the three MCP-advertising backends.  The plan/fix handlers
+# attach mcp_servers backend-agnostically (planner.py / coder.py); this axis
+# pins the pass-through for every backend that could consume it.  Each profile
+# carries a model because the factory fails fast without one for pi/antigravity.
+MCP_BACKENDS = [
+    ("claude_code", "claude-sonnet-4-5"),
+    ("pi", "anthropic/claude-sonnet-4-5"),
+    ("antigravity", "gemini-4-neon-high"),
+]
+
+
+@pytest.mark.parametrize("backend,model", MCP_BACKENDS)
+def test_run_plan_passes_mcp_servers(tmp_path, mock_gh_post_comment, backend, model):
+    """run_plan should pass mcp_servers to runner.run when comment_id is set.
+
+    Parametrised over every MCP-advertising backend (issue §5.7): the handler
+    builds the server config backend-agnostically, so each resolved harness —
+    including antigravity's eager-name one — must receive it unchanged.
+    """
     run_calls = []
 
     def fake_run(prompt, **kwargs):
@@ -96,14 +115,20 @@ def test_run_plan_passes_mcp_servers(tmp_path, mock_gh_post_comment):
 
     with patch("autoswe.harness.planner.create_worktree", return_value=tmp_path):
         with patch("autoswe.harness.planner._find_latest_plan_file", return_value=None):
-            with FETCH_COMMENTS_PATCH:
-                with patch("autoswe.harness.runner.run", side_effect=fake_run):
-                    from autoswe.harness.planner import run_plan
-                    run_plan(task, {}, {"GITHUB_TOKEN": "tok"})
+            with patch(
+                "autoswe.harness.planner.resolve_harness",
+                return_value={"backend": backend, "model": model},
+            ):
+                with FETCH_COMMENTS_PATCH:
+                    with patch("autoswe.harness.runner.run", side_effect=fake_run):
+                        from autoswe.harness.planner import run_plan
+                        run_plan(task, {}, {"GITHUB_TOKEN": "tok"})
 
     assert "mcp_servers" in run_calls[0]
     assert run_calls[0]["mcp_servers"] is not None
     assert "autoswe_comment" in run_calls[0]["mcp_servers"]
+    # The parametrised harness actually reached the runner (the axis is real).
+    assert run_calls[0]["harness_cfg"]["backend"] == backend
 
 
 def test_run_plan_no_mcp_servers_without_comment_id(tmp_path, mock_gh_post_comment):
@@ -162,8 +187,13 @@ def test_coder_build_mcp_servers_none_without_comment_id():
     assert result is None
 
 
-def test_run_fix_passes_mcp_servers(tmp_path):
-    """run_fix should pass mcp_servers to runner when comment_id is set."""
+@pytest.mark.parametrize("backend,model", MCP_BACKENDS)
+def test_run_fix_passes_mcp_servers(tmp_path, backend, model):
+    """run_fix should pass mcp_servers to runner when comment_id is set.
+
+    Parametrised over every MCP-advertising backend (issue §5.7) — the fix
+    handler attaches the server config the same backend-agnostic way.
+    """
     run_calls = []
 
     def fake_run(prompt, **kwargs):
@@ -174,14 +204,20 @@ def test_run_fix_passes_mcp_servers(tmp_path):
     FAKE_COMMIT = {"committed": True, "commit_sha": "abc", "branch": "autoswe/issue-1"}
 
     with patch("autoswe.harness.coder.create_worktree", return_value=tmp_path):
-        with FETCH_COMMENTS_PATCH:
-            with patch("autoswe.harness.runner.run", side_effect=fake_run):
-                with patch("autoswe.harness.coder.commit_and_push", return_value=FAKE_COMMIT):
-                    from autoswe.harness.coder import run_fix
-                    run_fix(task, cfg={})
+        with patch(
+            "autoswe.harness.coder.resolve_harness",
+            return_value={"backend": backend, "model": model},
+        ):
+            with FETCH_COMMENTS_PATCH:
+                with patch("autoswe.harness.runner.run", side_effect=fake_run):
+                    with patch("autoswe.harness.coder.commit_and_push", return_value=FAKE_COMMIT):
+                        from autoswe.harness.coder import run_fix
+                        run_fix(task, cfg={})
 
     assert run_calls[0]["mcp_servers"] is not None
     assert "autoswe_comment" in run_calls[0]["mcp_servers"]
+    # The parametrised harness actually reached the runner (the axis is real).
+    assert run_calls[0]["harness_cfg"]["backend"] == backend
 
 
 # ---------------------------------------------------------------------------

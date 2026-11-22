@@ -347,6 +347,103 @@ def test_pi_backend_fresh_run_mints_session_id():
     assert result.session_id
 
 
+# ---------- antigravity backend capabilities (Phase 1 honest set) ----------
+
+
+def test_antigravity_backend_capabilities_exact():
+    """AntigravityBackend advertises resume + progress_stream +
+    structured_output (Phase 1 §1.8) + mode (Phase 4 §4.5) + mcp (Phase 5
+    §5.3).  session_fork (no primitive), can_use_tool and plan_file are
+    absent."""
+    from autoswe.harness.backends.antigravity import AntigravityBackend
+
+    caps = AntigravityBackend.capabilities()
+    assert caps == {"resume", "progress_stream", "structured_output", "mode", "mcp"}
+
+
+def test_antigravity_backend_has_mcp_capability():
+    """Phase 5: agy advertises 'mcp' so the planner's has_mcp branch engages —
+    but ONLY because the stream parser sets plan_posted/question_posted from
+    real tool steps (§5.3), not as an empty advertisement."""
+    from autoswe.harness.backends.antigravity import (
+        ANTIGRAVITY_COMMENT_TOOL_NAMES,
+        AntigravityBackend,
+    )
+
+    assert "mcp" in AntigravityBackend.capabilities()
+    # The advertised names are the eager stream names the parser classifies.
+    names = set(ANTIGRAVITY_COMMENT_TOOL_NAMES.values())
+    assert names == {
+        "mcp_autoswe_comment_post_plan",
+        "mcp_autoswe_comment_post_question",
+        "mcp_autoswe_comment_update_progress",
+    }
+
+
+def test_antigravity_backend_no_session_fork_capability():
+    """agy must NOT advertise 'session_fork' — --conversation resumes in
+    place; there is no fork primitive, so the /retry provenance gate always
+    degrades an agy checkpoint to a fresh run."""
+    from autoswe.harness.backends.antigravity import AntigravityBackend
+
+    assert "session_fork" not in AntigravityBackend.capabilities()
+
+
+def test_antigravity_backend_no_plan_file_capability():
+    """agy must NOT advertise 'plan_file' — plan capture is text-pattern /
+    structured-output driven, not a plan file."""
+    from autoswe.harness.backends.antigravity import AntigravityBackend
+
+    assert "plan_file" not in AntigravityBackend.capabilities()
+
+
+def test_antigravity_backend_has_structured_output_capability():
+    """agy supports structured_output (--json-schema + result.structured_output)."""
+    from autoswe.harness.backends.antigravity import AntigravityBackend
+
+    assert "structured_output" in AntigravityBackend.capabilities()
+
+
+def test_antigravity_backend_retries_on_error_and_killed():
+    """AntigravityBackend retries on the CLI-subprocess failure surface,
+    like Codex/pi: subtype error/killed, exceptions TimeoutError/OSError."""
+    import asyncio
+
+    from autoswe.harness.backends.antigravity import AntigravityBackend
+
+    assert AntigravityBackend.retryable_subtypes() == {"error", "killed"}
+    assert asyncio.TimeoutError in AntigravityBackend.retryable_exceptions()
+    assert OSError in AntigravityBackend.retryable_exceptions()
+
+
+def test_antigravity_backend_fork_spec_resumes_in_place():
+    """A fork spec (resume + fork_session) still reaches agy as plain
+    ``--conversation`` — no fork primitive, and no invented fork flag."""
+    import asyncio
+
+    from autoswe.harness.backends.antigravity import AntigravityBackend
+    from autoswe.harness.backends.base import RunSpec
+    from tests.fakes.antigravity_fake import AntigravityFake
+
+    spec = RunSpec(
+        prompt="retry",
+        cwd="/tmp",
+        model="gemini-test",
+        resume="last-good-agy",
+        fork_session=True,
+        mode="read_write",
+    )
+
+    with AntigravityFake() as fake:
+        fake.script_fix("done")
+        asyncio.run(AntigravityBackend().run(spec))
+
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["conversation"] == "last-good-agy"
+    assert not any("fork" in part.lower() for part in call["argv"])
+
+
 # ---------- fork-on-retry (session_fork capability) ----------
 
 
@@ -576,6 +673,20 @@ def test_has_read_only_enforcement_pi_is_true():
 
     assert has_read_only_enforcement(
         {"backend": "pi", "model": "claude-sonnet-4-5"}
+    ) is True
+
+
+def test_has_read_only_enforcement_antigravity_is_true():
+    """agy advertises 'mode' (Phase 4 §4.5: per-run --settings permissions
+    block enforces read-only) → read-only enforced.
+
+    The issue #166 loud-degrade stops for this backend;
+    ensure_worktree_unchanged remains only as the unconditional backstop.
+    """
+    from autoswe.harness.runner import has_read_only_enforcement
+
+    assert has_read_only_enforcement(
+        {"backend": "antigravity", "model": "gemini-test"}
     ) is True
 
 

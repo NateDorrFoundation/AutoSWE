@@ -1,0 +1,26 @@
+# systemd user unit for the vendored agy Gemini->OpenAI bridge
+# (scripts/agy-gemini-proxy.py). Install:
+#   mkdir -p ~/.litellm-agy && cp scripts/agy-gemini-proxy.py ~/.litellm-agy/gemini-openai-proxy.py
+#   python3 -m venv ~/.venvs/agy-bridge && ~/.venvs/agy-bridge/bin/pip install fastapi httpx uvicorn
+#   echo 'AGY_PROXY_UPSTREAM_KEY=<real LiteLLM key>' > ~/.litellm-agy/proxy.env
+#   chmod 600 ~/.litellm-agy/proxy.env   (default umask leaves it world-readable)
+#   (the real key lives ONLY in proxy.env — never commit it)
+#   Optional inbound auth: add AGY_BRIDGE_TOKEN=<random> to proxy.env; the bridge
+#   then 401s requests whose x-goog-api-key (agy sends GEMINI_API_KEY there) or
+#   ?key= doesn't match. Unset = allow all. Invoke agy with GEMINI_API_KEY=<same>.
+#   systemctl --user enable --now agy-gemini-proxy
+# (linger on so it survives reboots: loginctl enable-linger $USER)
+[Unit]
+Description=agy Gemini->OpenAI bridge for AutoSWE antigravity backend
+After=network-online.target
+
+[Service]
+ExecStart=%h/.venvs/agy-bridge/bin/python %h/.litellm-agy/gemini-openai-proxy.py
+Environment=AGY_PROXY_UPSTREAM=http://linux-server1:4000/v1
+EnvironmentFile=%h/.litellm-agy/proxy.env
+WorkingDirectory=%h/.litellm-agy
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

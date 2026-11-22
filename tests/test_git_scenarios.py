@@ -1396,3 +1396,103 @@ class TestCatchup:
 
         assert result.done_content.startswith("DONE_SUMMARY\tAlready up to date")
         assert not git_world.worktree_path_for(1).exists()
+
+
+# ------------------------------------------------------------------
+# Group K: antigravity read-only rollback backstop (issue #320 Phase 3)
+# ------------------------------------------------------------------
+
+
+class TestAntigravityReadOnlyEnforcement:
+    """K1 (Phase 4 rewrite): an agy plan run's write attempt is BLOCKED, not rolled back.
+
+    Before Phase 4, antigravity advertised neither "mode" nor "can_use_tool"
+    and the ONLY guarantee was the planner's ``ensure_worktree_unchanged``
+    backstop (issue #166).  It now enforces read-only per-run through the
+    staged ``--settings`` deny block, so the violation this scenario used to
+    stage is **expected blocked**: the fake replays the real
+    ``permission_denied.jsonl`` capture — a write_file attempt ending
+    ``state:"ERROR"`` with a "Matches user-configured deny rule" tool_error
+    while the run itself stays SUCCESS — and the tree is never touched.
+    ``ensure_worktree_unchanged`` finding NOTHING to roll back (False) is the
+    proof the enforcement, not the backstop, did the work.
+    """
+
+    def test_K1_agy_plan_write_blocked_tree_stays_clean(self, git_world: GitWorld):
+        import asyncio
+        from unittest.mock import patch
+
+        import autoswe.harness.backends.antigravity as agy_mod
+        from autoswe.harness.backends.antigravity import AntigravityBackend
+        from autoswe.harness.backends.base import RunSpec
+        from autoswe.vcs.worktree import ensure_worktree_unchanged, is_dirty
+        from tests.fakes.antigravity_fake import AntigravityFake
+
+        world = git_world
+        world.init_remote(initial_files={"src/app.py": "x = 1\n"})
+        world.make_main_clone()
+        wt = world.make_worktree(1)
+
+        head_before = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+        fake = AntigravityFake()
+        # The P2b real-CLI capture verbatim: denied write/command steps + a
+        # SUCCESS result (denied tools ≠ failed run).  _add is the scripted-
+        # stream append point; the fake re-stamps init.permission_mode from
+        # the argv at spawn (plan → no skip flag → request-review, matching
+        # the §4.4 self-check's expectation — no refusal fires).
+        fixture = (
+            Path(__file__).parent / "fixtures" / "antigravity" / "permission_denied.jsonl"
+        )
+        fake._add(
+            fixture.read_text(encoding="utf-8").splitlines(),
+            stderr=(
+                b"Warning: tool write_file requires approval; headless mode "
+                b"cannot prompt for it, so it was auto-denied.\n"
+            ),
+        )
+
+        spec = RunSpec(
+            prompt="Plan the fix.",
+            cwd=str(wt),
+            model="gemini-test",
+            mode="plan",          # enforced: read-only deny block is staged
+            timeout=30,
+        )
+
+        with patch.object(agy_mod, "log") as log_spy:
+            with fake:
+                result = asyncio.run(AntigravityBackend().run(spec))
+
+        # The run succeeded — the agent tried to write, the deny block said
+        # no, and auto-denial is not a run failure.
+        assert result.subtype == "success"
+        call = fake.calls[0]
+        assert call["cwd"] == str(wt)
+        assert call["skip_permissions"] is False, "read-only phase must carry no skip flag"
+        assert call.get("settings_path"), "the deny block rides the per-run --settings file"
+
+        # The violation was blocked, not buffered for the backstop: the tree
+        # stayed clean the whole time.
+        assert not any(p.name == "agent_edit.py" for p in wt.iterdir())
+        assert is_dirty(wt) is False, "enforcement alone must leave the tree clean"
+        assert ensure_worktree_unchanged(wt, head_before) is False, (
+            "nothing to roll back — the backstop must be idle when enforcement works"
+        )
+
+        # §4.4: on a read-only run the soft-deny notice is the deny block
+        # WORKING — logged at info level, never as a [WARN].
+        msgs = [str(c.args[0]) for c in log_spy.call_args_list if c.args]
+        soft = [m for m in msgs if "soft-denied" in m]
+        assert soft, "the scripted denial should surface once"
+        assert all(not m.startswith("[WARN]") for m in soft), soft
+        assert all("expected, read-only" in m for m in soft)
+
+        head_after = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert head_after == head_before

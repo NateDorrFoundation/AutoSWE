@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tests.fakes.antigravity_fake import AntigravityFake
 from tests.fakes.azure_fake import AzureFake
 from tests.fakes.claude_fake import ClaudeFake
 from tests.fakes.codex_fake import CodexFake
@@ -37,6 +38,7 @@ from tests.fakes.git_fake import GitFake
 from tests.fakes.github_fake import GitHubFake
 from tests.fakes.pi_fake import PiFake
 from tests.scenarios.runner import (  # noqa: F401
+    assert_antigravity_calls,
     assert_claude_calls,
     assert_codex_calls,
     assert_comments_posted,
@@ -63,6 +65,7 @@ class HarnessWorld:
     claude: ClaudeFake | None
     codex: CodexFake | None
     pi: PiFake | None
+    antigravity: AntigravityFake | None
     git: GitFake
     autoswe_dir: Path
     concurrent: bool = False
@@ -192,6 +195,19 @@ class _PatchManager:
 
         self.add(restore)
 
+    def patch_antigravity(self, ag_fake: AntigravityFake) -> None:
+        """Patch asyncio.create_subprocess_exec AND the agy resolver.
+
+        Unlike ``patch_pi``/``patch_codex`` (which restore only the subprocess
+        seam, since codex/pi fall back gracefully when their CLI is absent),
+        ``AntigravityFake.patch()`` additionally pins
+        ``antigravity._resolve_agy_executable`` to ``("agy", [])`` — agy is
+        deliberately not on the test host's PATH.  Restore through the fake's
+        own ``unpatch`` so BOTH the seam and the resolver pin are unwound.
+        """
+        module, original = ag_fake.patch()
+        self.add(lambda: ag_fake.unpatch(module, original))
+
     def patch_concurrent(self, force: bool) -> None:
         """Stub _is_task_running to simulate a concurrent dispatch."""
         import autoswe.orch.loop as loop_mod
@@ -299,6 +315,39 @@ def _setup_pi_harness(isolated_dir: Path) -> None:
     cfg_mod._harnesses_cache.clear()
 
 
+def _setup_antigravity_harness(isolated_dir: Path) -> None:
+    """Write harnesses.json with an antigravity profile for scenario tests.
+
+    Mirrors ``_setup_codex_harness``/``_setup_pi_harness``: a
+    ``"antigravity"`` profile so ``resolve_harness`` returns the antigravity
+    backend for all phases.  ``cli_path`` is pinned to ``"agy"`` purely for
+    realism — ``AntigravityFake.patch()`` replaces
+    ``_resolve_agy_executable`` wholesale while patched, so the value never
+    hits PATH.
+    """
+    import json
+
+    harnesses_dir = isolated_dir / "config"
+    harnesses_dir.mkdir(parents=True, exist_ok=True)
+
+    harnesses_cfg = {
+        "antigravity": {
+            "backend": "antigravity",
+            "model": "gemini-test",
+            "cli_path": "agy",
+        }
+    }
+
+    harnesses_path = harnesses_dir / "harnesses.json"
+    harnesses_path.write_text(json.dumps(harnesses_cfg, indent=2), encoding="utf-8")
+
+    # Clear the harnesses cache so the next load picks up our file
+    import autoswe.core.config as cfg_mod
+
+    cfg_mod.HARNESSES_CONFIG_FILE = harnesses_path
+    cfg_mod._harnesses_cache.clear()
+
+
 @contextmanager
 def patched_world(
     provider: str,
@@ -329,10 +378,11 @@ def patched_world(
         directly for the post-resolution push).
     :param isolated_dir: The per-test AUTOSWE_DIR path.
     :param backend: ``"claude_code"`` (default, patches ``runner.run``),
-        ``"codex"`` or ``"pi"`` (both patch
+        or one of ``"codex"``, ``"pi"``, ``"antigravity"`` (all patch
         ``asyncio.create_subprocess_exec`` so the real CLI backend runs
-        end-to-end).  When ``"codex"``/``"pi"``, the existing
-        ``claude_responses`` dicts are fed through ``CodexFake``/``PiFake``.
+        end-to-end; antigravity additionally pins the agy executable
+        resolver).  For CLI backends, the existing ``claude_responses`` dicts
+        are fed through ``CodexFake``/``PiFake``/``AntigravityFake``.
     :yields: ``HarnessWorld`` with access to all fakes.
     """
     claude_responses = claude_responses or []
@@ -345,6 +395,7 @@ def patched_world(
     if backend == "codex":
         cx_fake = CodexFake()
         pi_fake = None
+        ag_fake = None
         cl_fake = None
         # Feed the existing claude_responses dicts through CodexFake
         for resp in claude_responses:
@@ -353,9 +404,58 @@ def patched_world(
                 session_id=resp.get("session_id", "s1"),
                 subtype=resp.get("subtype", "success"),
             )
+    elif backend == "antigravity":
+        cx_fake = None
+        pi_fake = None
+        ag_fake = AntigravityFake()
+        cl_fake = None
+        # Feed the existing claude_responses dicts through AntigravityFake.
+        # Beyond text/session_id/subtype, a dict may carry antigravity-only
+        # keys (other backend feeders ignore them, so the row stays identical
+        # on its default axis):
+        #   structured_output - schema-validated payload (PLAN/REVIEW_SCHEMA)
+        #                       landing on RunResult.structured_output
+        #   error             - the CLI's own error text (error/config_error kinds)
+        #   status            - result-status override, e.g. "WAITING" for a
+        #                       session that ended waiting on interactive input
+        #   permission_mode   - pin the init attestation (skip the spawn-time
+        #                       derivation from the flags) — scripts the §4.4
+        #                       read-only self-check mismatch row
+        # Beyond those, a dict may carry an ``"mcp_tool"`` key naming one of
+        # the autoswe_comment tools ("post_plan" / "post_question") so a
+        # transition row can script the eager ``mcp_autoswe_comment_*`` tool
+        # pair (ACTIVE+DONE sharing a step_index, §5.3); the row's "text" is
+        # then the tag-free assistant text that accompanied the tool call (the
+        # plan/question is on the thread via MCP, not in the text).
+        for resp in claude_responses:
+            mcp_tool = resp.get("mcp_tool")
+            if mcp_tool:
+                # The script_mcp_* builders are success-only (the MCP tool
+                # call is the whole point of the row), so no subtype is
+                # threaded.  plan_posted_body threads the same body the claude
+                # axis scripts (issue #241 parity); fall back to the text.
+                scripter = {
+                    "post_plan": ag_fake.script_mcp_plan,
+                    "post_question": ag_fake.script_mcp_question,
+                }[mcp_tool]
+                scripter(
+                    resp.get("plan_posted_body") or resp["text"],
+                    session_id=resp.get("session_id", "s1"),
+                )
+            else:
+                ag_fake.script_response(
+                    resp["text"],
+                    session_id=resp.get("session_id", "s1"),
+                    subtype=resp.get("subtype", "success"),
+                    structured_output=resp.get("structured_output"),
+                    error=resp.get("error"),
+                    status=resp.get("status"),
+                    permission_mode=resp.get("permission_mode"),
+                )
     elif backend == "pi":
         cx_fake = None
         pi_fake = PiFake()
+        ag_fake = None
         cl_fake = None
         # Feed the existing claude_responses dicts through PiFake.
         # A response dict may carry an ``"mcp_tool"`` key naming one of the
@@ -388,6 +488,7 @@ def patched_world(
     else:
         cx_fake = None
         pi_fake = None
+        ag_fake = None
         cl_fake = ClaudeFake()
         for resp in claude_responses:
             cl_fake.script_response(
@@ -421,6 +522,8 @@ def patched_world(
         _setup_codex_harness(isolated_dir)
     elif backend == "pi":
         _setup_pi_harness(isolated_dir)
+    elif backend == "antigravity":
+        _setup_antigravity_harness(isolated_dir)
 
     # ---- Apply all patches ----
     with _PatchManager() as pm:
@@ -432,6 +535,22 @@ def patched_world(
             pm.patch_codex(cx_fake)
         elif backend == "pi":
             pm.patch_pi(pi_fake)
+        elif backend == "antigravity":
+            pm.patch_antigravity(ag_fake)
+            # Phase 5: an agy run with a sticky comment carries mcp_servers, so
+            # the backend merges its entry into the GLOBAL
+            # ~/.gemini/config/mcp_config.json. Redirect that into the
+            # isolated dir — the test host's real agy config must never be
+            # touched (and the merge stays observable for assertions).
+            import autoswe.harness.backends.antigravity as agy_mod
+
+            agy_orig_path = agy_mod.antigravity_mcp_config_path
+            agy_mod.antigravity_mcp_config_path = lambda: (
+                isolated_dir / ".gemini-config" / "mcp_config.json"
+            )
+            pm.add(lambda: setattr(
+                agy_mod, "antigravity_mcp_config_path", agy_orig_path
+            ))
         else:
             pm.patch_claude(cl_fake)
 
@@ -457,6 +576,7 @@ def patched_world(
             claude=cl_fake,
             codex=cx_fake,
             pi=pi_fake,
+            antigravity=ag_fake,
             git=gt_fake,
             autoswe_dir=isolated_dir,
             concurrent=concurrent,
@@ -545,9 +665,10 @@ def _script_git_ops(
 def build_test_cfg(isolated_dir: Path, provider: str = "github", backend: str = "claude_code") -> dict:
     """Build a standard config dict for scenario tests.
 
-    When *backend* is ``"codex"`` or ``"pi"``, the returned config sets
-    ``PLAN_HARNESS``, ``FIX_HARNESS``, and ``REVIEW_HARNESS`` to that backend
-    so that all three phases resolve to the corresponding CLI backend.
+    When *backend* is ``"codex"``, ``"pi"``, or ``"antigravity"``, the
+    returned config sets ``PLAN_HARNESS``, ``FIX_HARNESS``, and
+    ``REVIEW_HARNESS`` to that backend so that all three phases resolve to
+    the corresponding CLI backend.
     """
     # Disable the CLAUDE.md init session in tests — it would consume a
     # scripted ClaudeFake response and break the transition matrix.
@@ -571,7 +692,7 @@ def build_test_cfg(isolated_dir: Path, provider: str = "github", backend: str = 
         "ANTHROPIC_BASE_URL": "",
         "WORKTREE_DIR": str(isolated_dir / "worktrees"),
     }
-    if backend in ("codex", "pi"):
+    if backend in ("codex", "pi", "antigravity"):
         cfg["PLAN_HARNESS"] = backend
         cfg["FIX_HARNESS"] = backend
         cfg["REVIEW_HARNESS"] = backend

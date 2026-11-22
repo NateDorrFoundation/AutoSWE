@@ -359,6 +359,41 @@ def assert_pi_calls(pi_fake, expected_calls: list[dict]) -> None:
                 )
 
 
+def assert_antigravity_calls(ag_fake, expected_calls: list[dict]) -> None:
+    """Assert antigravity (agy) subprocess calls match expectations.
+
+    Each entry in *expected_calls* is a dict with optional keys (see
+    ``AntigravityFake._record_call`` for the recorded fields):
+        is_fresh - True for a fresh run (no ``--conversation``)
+        is_resume - True when ``--conversation <id>`` re-opens a session
+        conversation - the session id ``--conversation`` carries
+        model - expected ``--model`` value
+        skip_permissions - whether ``--dangerously-skip-permissions`` is present
+        disable_slash_commands - whether ``--disable-slash-commands`` is present
+        json_schema_path - temp file path a ``--json-schema`` run wrote, or None
+        print_timeout - the ``--print-timeout`` value (e.g. ``"7200s"``)
+    """
+    if not expected_calls:
+        return
+
+    for i, exp in enumerate(expected_calls):
+        if i >= len(ag_fake.calls):
+            raise AssertionError(
+                f"Expected {len(expected_calls)} antigravity call(s), "
+                f"only {len(ag_fake.calls)} made."
+            )
+
+        call = ag_fake.calls[i]
+        for key in ("is_fresh", "is_resume", "conversation", "model",
+                    "skip_permissions", "disable_slash_commands",
+                    "json_schema_path", "print_timeout"):
+            if key in exp:
+                assert call.get(key) == exp[key], (
+                    f"Call {i}: expected {key}={exp[key]!r}, "
+                    f"got {call.get(key)!r}"
+                )
+
+
 def assert_queue_task(autoswe_dir: Path, task_id: str,
                       expected_fields: dict[str, Any]) -> None:
     """Assert specific fields on a queue task match expectations."""

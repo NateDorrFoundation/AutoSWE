@@ -4,17 +4,17 @@
 
 Loaded by `core/config.py:load_harnesses_config()`. Keys starting with `_` are skipped.
 
-A **harness profile** bundles a coding backend (`claude_code`, `codex`, `pi`) with its model and any auth/runtime settings. Phases (`plan`, `fix`, `review`) reference a profile by name via `plan_harness`, `fix_harness`, or `review_harness` in `repos.json` (or `PLAN_HARNESS`, `FIX_HARNESS`, `REVIEW_HARNESS` in `autoswe.env`).
+A **harness profile** bundles a coding backend (`claude_code`, `codex`, `pi`, `antigravity`) with its model and any auth/runtime settings. Phases (`plan`, `fix`, `review`) reference a profile by name via `plan_harness`, `fix_harness`, or `review_harness` in `repos.json` (or `PLAN_HARNESS`, `FIX_HARNESS`, `REVIEW_HARNESS` in `autoswe.env`).
 
 ### Profile Schema
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-----------|
-| `backend` | **Yes** | — | Backend implementation: `"claude_code"`, `"codex"`, or `"pi"` |
-| `model` | No for `claude_code`, **required** for `codex` and `pi` | `""` | Model ID (e.g. `"claude-opus-5"`, `"gpt-5.6-terra"`, `"claude-sonnet-4-5"`). No default for `codex` or `pi` — resolution fails if missing (pi would otherwise silently pick a settings default, unacceptable for reproducibility) |
+| `backend` | **Yes** | — | Backend implementation: `"claude_code"`, `"codex"`, `"pi"`, or `"antigravity"` |
+| `model` | No for `claude_code`, **required** for `codex`, `pi` and `antigravity` | `""` | Model ID (e.g. `"claude-opus-5"`, `"gpt-5.6-terra"`, `"claude-sonnet-4-5"`, `"gemini-4-neon-high"`). No default for `codex`, `pi` or `antigravity` — resolution fails if missing (pi would otherwise silently pick a settings default and agy the account's last-selected model, unacceptable for reproducibility) |
 | `timeout` | No | (from env) | Backend-specific timeout in seconds |
-| `max_turns` | No | `200` (review: `80`) | Turn cap for the agent run (issue #222). Validated as a positive integer on load. **Only honored by backends that expose a turn cap** — `claude_code` today; `codex` and `pi` treat it as a documented no-op (their anti-runaway guard is the wall-clock `timeout`). When set it beats the per-repo `agent_max_turns` and the global `MAX_TURNS`/`REVIEW_MAX_TURNS`. See [Turn cap (`max_turns`)](#turn-cap-max_turns) |
-| `cli_path` | No | (from env) | Path to the CLI binary (e.g. `claude` or `codex`) |
+| `max_turns` | No | `200` (review: `80`) | Turn cap for the agent run (issue #222). Validated as a positive integer on load. **Only honored by backends that expose a turn cap** — `claude_code` today; `codex`, `pi` and `antigravity` treat it as a documented no-op (their anti-runaway guard is the wall-clock `timeout`). When set it beats the per-repo `agent_max_turns` and the global `MAX_TURNS`/`REVIEW_MAX_TURNS`. See [Turn cap (`max_turns`)](#turn-cap-max_turns) |
+| `cli_path` | No | (from env) | Path to the CLI binary (e.g. `claude` or `codex`). For `antigravity` it must be **absolute on the box** (e.g. `~/.local/bin/agy`) — `agy` is not on the default non-login PATH, so `shutil.which("agy")` fails under cron |
 | `codex_api_key` | No | — | API key for Codex backend (sets `CODEX_API_KEY` env var) |
 | `openai_api_key` | No | — | Alternative API key for Codex backend (sets `OPENAI_API_KEY` env var) |
 | `bypass_approvals` | No | `true` (Codex only) | Explicit switch for Codex's `--dangerously-bypass-approvals-and-sandbox` flag. `true` (default) grants full write + network access — intended for the dedicated isolated machine (see [safeguards.md](safeguards.md)). Set `false` to drop the flag on a shared host. Overridable via the `CODEX_BYPASS_APPROVALS_AND_SANDBOX` env var (see below) |
@@ -29,10 +29,20 @@ A **harness profile** bundles a coding backend (`claude_code`, `codex`, `pi`) wi
 | `approve_project` | No | `true` (pi only) | Trust the project. Non-interactive pi modes ignore project-local resources unless `--approve` is passed (the dedicated-machine posture is to trust). Set `false` on a shared host to drop the flag |
 | `system_prompt` | No | — | Replaces pi's system prompt entirely (pi only, `--system-prompt`); context files and skills are still appended |
 | `append_system_prompt` | No | — | Appended to pi's system prompt (pi only, `--append-system-prompt`) |
+| `effort` | No | — | Reasoning effort (antigravity only): validated against `low`/`medium`/`high`/`xhigh`/`max` at load (typo fails fast), emitted via `--effort`. Which values a given model accepts is enforced by the CLI at run time; **Orchestrator models ignore `effort`** (the factory logs it as not adjustable) |
+| `agent` | No | — | Agent name (antigravity only): emitted via `--agent` |
+| `gemini_api_key` | No | — | API key for the Antigravity backend (sets `GEMINI_API_KEY` env var on the subprocess; redacted from logs) |
+| `skip_permissions` | No | `true` (antigravity only) | Switch for the `--dangerously-skip-permissions` flag, emitted on **`read_write` runs only** — read-only phases never get it (that is the whole point of `mode`). The dedicated-box default grants it; set `false` on a shared host |
+| `sandbox` | No | `false` (antigravity only) | Emit `--sandbox`. Spike P4: the staged deny rules alone already block writes on Linux — the sandbox added nothing observable — so it stays opt-in |
+| `log_dir` | No | — | Antigravity only: keeps the CLI's own log next to `logs/<slug>/` — emits `--log-file <log_dir>/<run uuid>.log` (the conversation id is not known before the run; the stream's `init`/`result` carry the mapping) |
+| `config_home` | No | — | Antigravity only: optional layer home — only `<config_home>/base-settings.json` is ever read, merged into every run's staged `--settings` (see the antigravity section). Default `<AUTOSWE_DIR>/agy-home/<sanitized model>` |
 | `env` | No | — | Extra environment variables (a `{key: value}` map) merged into the backend's child process. Values override backend defaults; ``${VAR}``/``${VAR:-default}`` supported. See [Per-profile `env`](#per-profile-env) |
 
 String values support ``${VAR}`` and ``${VAR:-default}`` environment variable
 interpolation (expanded at load time from the current process environment).
+`system_prompt` is deliberately **absent** for `antigravity`: the agy CLI exposes no
+system-prompt flag, so steering happens through the prompt templates (as with Codex)
+and the repo's `.agents/` rules load by design.
 
 ### Turn cap (`max_turns`, issue #222)
 
@@ -53,8 +63,9 @@ hard-coded 200. It resolves per run in this precedence order (highest wins):
 Code path: `config.resolve_max_turns(phase, repo_cfg, cfg, harness_cfg)`.
 
 **Only backends that expose a turn cap honor it.** `claude_code` passes the
-resolved value to the Agent SDK. `codex` and `pi` have **no turn cap** (Codex
-`exec` dropped the `agent.max_turns` config key; pi has no cap) — they treat
+resolved value to the Agent SDK. `codex`, `pi` and `antigravity` have **no turn
+cap** (Codex `exec` dropped the `agent.max_turns` config key; pi has no cap; agy
+exposes no cap flag) — they treat
 `max_turns` as a documented no-op, so the wall-clock `timeout` is their
 anti-runaway guard. The value is still resolved and passed on `RunSpec.max_turns`
 for contract parity.
@@ -130,6 +141,7 @@ Different phases can use different backends. Common patterns:
 
 - **Claude for plan, Codex for fix**: Claude's deeper reasoning for architecture, Codex for execution speed.
 - **Codex for plan+fix, Claude for review**: Codex does the work, Claude provides the quality gate.
+- **Antigravity Orchestrator for fix, Claude for review**: agy does the work on the dedicated box (per-run `--settings` isolation), Claude provides the quality gate.
 - **All Claude**: Full feature set (MCP, AskUserQuestion, plan files).
 - **All Codex**: No Claude API dependency, but MCP/AskUserQuestion features degrade gracefully.
 
@@ -159,15 +171,19 @@ a self-hosted OpenAI-compatible endpoint via `OPENAI_API_BASE`).
   `agent_dir` field (`PI_CODING_AGENT_DIR`) sits *below* `env`, so `env` can
   still redirect pi's config directory. The API key is *not* injected as an env
   var — the `api_key` field is carried on the `--api-key` flag instead.
+- **antigravity** — merged into the `agy` subprocess environment. The named
+  `gemini_api_key` field (`GEMINI_API_KEY`) sits *below* `env`. The per-task
+  MCP comment-server `env` block also rides this env (the MCP child inherits
+  it — see the antigravity section's env-vs-config rule).
 
 **Precedence** (highest wins):
 
-| Claude Code | Codex | pi |
-|-------------|-------|----|
-| 1. `spec.env_overrides` (internal) | 1. `spec.env_overrides` (internal) | 1. `spec.env_overrides` (internal) |
-| 2. profile `env` | 2. profile `env` | 2. profile `env` |
-| 3. backend defaults (e.g. `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`, Anthropic creds) | 3. api-key fields (`OPENAI_API_KEY` / `CODEX_API_KEY`) | 3. named fields (`agent_dir` → `PI_CODING_AGENT_DIR`) |
-| 4. inherited `os.environ` | 4. inherited `os.environ` | 4. inherited `os.environ` |
+| Claude Code | Codex | pi | antigravity |
+|-------------|-------|----|-------------|
+| 1. `spec.env_overrides` (internal) | 1. `spec.env_overrides` (internal) | 1. `spec.env_overrides` (internal) | 1. `spec.env_overrides` (internal) |
+| 2. profile `env` | 2. profile `env` | 2. profile `env` | 2. profile `env` |
+| 3. backend defaults (e.g. `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`, Anthropic creds) | 3. api-key fields (`OPENAI_API_KEY` / `CODEX_API_KEY`) | 3. named fields (`agent_dir` → `PI_CODING_AGENT_DIR`) | 3. named fields (`gemini_api_key` → `GEMINI_API_KEY`) |
+| 4. inherited `os.environ` | 4. inherited `os.environ` | 4. inherited `os.environ` | 4. inherited `os.environ` |
 
 So a profile `env` value overrides a backend default but loses to the internal
 `env_overrides` seam. `${VAR}` / `${VAR:-default}` expansion is applied to `env`
@@ -526,18 +542,298 @@ There is no price table analogous to `codex_pricing.py`.
 - **Large JSON line handling (issue #251).** The subprocess (and the MCP warm-up) is spawned with a StreamReader ``limit=_MAX_STREAM_BYTES + 1`` (16 MiB + 1) so that either pipe can hold a legitimately large single JSON line — the asyncio default is only 64 KiB. If a line still exceeds that limit, ``readline()`` raises ``ValueError``; the backend catches it, sets the run's error flag, and drains the rest of stdout, so the run surfaces as ``subtype="error"`` instead of the uncaught exception propagating out of the runner and crashing the poller.
 - Duration is tracked via ``time.monotonic()`` locally.
 
+#### `antigravity`
+
+Two transports exist; the Phase 0 spike picked the headless CLI as the core, with the
+Python SDK deferred to Phase 7:
+
+- **Headless CLI (chosen core transport)** — `agy --print=…` (print mode) with
+  `--input-format stream-json` / `--output-format stream-json` for machine-readable
+  streams: the same pi/codex-style subprocess shape. Verified end-to-end in
+  [spike-antigravity.md](spike-antigravity.md) (T1–T14, P1–P5, M1–M5) against committed fixtures in
+  `tests/fixtures/antigravity/`; BYOK auth (no Google login) via the vendored bridge
+  `scripts/agy-gemini-proxy.py`.
+- **Python SDK (deferred, Phase 7)** — `pip install google-antigravity`,
+  `from google.antigravity import Agent, LocalOpenAIAgentConfig`, async `agent.chat()`.
+  The unique reason to go here: `pre_tool_call_decide` is the only non-Claude
+  `can_use_tool` analogue (AskUserQuestion → `autoswe:waiting`). It also offers
+  `BuiltinTools` allowlists and first-class MCP config, and `LocalOpenAIAgentConfig`
+  talks the OpenAI wire directly (no bridge), but it spawns its own harness binary
+  underneath, so it buys no process-model advantage.
+
+Canonical reference: `docs/antigravity/` (mirror of antigravity.google docs, raw `.md`
+endpoints — see its README for the ToC and refresh commands). Start with
+`cli-headless.md`, `cli-reference.md`, then `sdk-overview.md`, `sdk-tools.md`, `sdk-mcp.md`.
+
+**Implementation plan:** `docs/autoswe/PLAN-antigravity-backend/` (README + Phases 0–7,
+proposed 2026-11-18; Phases 0–5 complete — Phase 5 MCP comment posting is issue #322).
+
+**Resolved by the Phase 0 spike** (go/no-go table in `spike-antigravity.md`):
+headless print mode **does** emit a usable streaming protocol — `init →
+step_update* → result` NDJSON, confirmed in every committed fixture
+(`tests/fixtures/antigravity/`); CLI resume **works** headless (`--conversation`,
+same `conversation_id` across runs — T7; SDK resume deferred to Phase 7);
+`cost_usd` is **`None`** on the BYOK bridge path (the bridge reports no usage, and
+there are no Google credits to map — never estimate, same rule as pi); stdin
+single-turn transport, per-run `--settings` read-only isolation, and MCP
+eager-tool naming + env inheritance are all **GO**.
+
+**Requirements:** the `agy` CLI, installed user-level (it self-updates — the
+repo's update scripts never touch it). First use must be interactive once to
+authenticate: `setup.sh` / `setup.ps1` detect any `backend: antigravity`
+profile, print `agy --version`, and emit the "run `agy` interactively once to
+authenticate" hint. The pinned CLI floor is `MIN_AGY_VERSION = "1.5.11"` (the
+Phase 0 spike-validated version; `agy --version` prints exactly one line) —
+below it the backend logs `[WARN][ANTIGRAVITY] … below the pinned floor …`
+once per process and the run proceeds; `tests/test_agy_cli_version.py`
+enforces the floor with the usual skip semantics (no `agy` on the box →
+skip). No MCP cold-start warm-up is needed (unlike pi): eager registration
+makes the comment tools first-class stream steps from the very first run.
+The CLI lives off the default non-login PATH (e.g. `~/.local/bin/agy`), so a
+profile must set an absolute `cli_path` — `shutil.which("agy")` fails under
+cron. BYOK key via `gemini_api_key` → `GEMINI_API_KEY`.
+
+**Profile fields:**
+- `backend`: `"antigravity"` (required)
+- `model`: **required** `agy models` slug (e.g. `"gemini-4-neon-high"`, `"gemini-3.8-flash-medium"`, `"Orchestrator (Neon)"`). There is no built-in default — a missing `model` fails resolution with a `ValueError` (omitting `--model` would let agy fall back to the account's last-selected model, unacceptable for reproducibility)
+- `effort`: reasoning effort — emits `--effort`; validated against `low`/`medium`/`high`/`xhigh`/`max` at load (typo fails fast); per-model acceptance is enforced by the CLI, and **Orchestrator models ignore `effort`**
+- `agent`: agent name — emits `--agent`
+- `cli_path`: **absolute on the box** (e.g. `~/.local/bin/agy`) — `agy` is not on the default non-login PATH, so `shutil.which("agy")` fails under cron; an unresolvable executable raises `RuntimeError` (outside retry)
+- `gemini_api_key`: API key (sets `GEMINI_API_KEY` on the subprocess; the resolved key is redacted from logs)
+- `skip_permissions`: boolean, **default `true`** — emits `--dangerously-skip-permissions` on `read_write` runs only (read-only phases never get it)
+- `sandbox`: boolean, **default `false`** — emits `--sandbox` (spike P4: the deny rules already block on Linux; opt-in only)
+- `log_dir`: emits `--log-file <log_dir>/<run uuid>.log` (the conversation id is unknown pre-run; `init`/`result` carry the mapping)
+- `config_home`: optional home for the `<config_home>/base-settings.json` layer only; default `<AUTOSWE_DIR>/agy-home/<sanitized model>`
+- `timeout`: Override the default timeout (optional)
+- `max_turns`: accepted (contract parity) but a **documented no-op** — agy has no turn cap; the guard is the wall-clock timeout
+- `env`: Extra environment variables (a `{key: value}` map) merged into the `agy` subprocess (optional). User values win over the named fields (e.g. `GEMINI_API_KEY` from `gemini_api_key`); see [Per-profile `env`](#per-profile-env)
+- **No `system_prompt` field, deliberately** — the agy CLI exposes no system-prompt flag; steering happens through the prompt templates (as with Codex) and the repo's `.agents/` rules load by design
+
+**Capabilities:** `mode`, `mcp`, `resume`, `progress_stream`, `structured_output`.
+Not advertised: `session_fork` (no primitive), `can_use_tool`, `plan_file`.
+
+**Real read-only enforcement (Phase 4, issue #321 — `mode` is advertised, so
+plan/review do NOT loudly degrade).** Unlike Codex ([No
+`mode`](#codex-phase-4)) — which accepts `RunSpec.mode` but enforces nothing —
+antigravity enforces read-only at the CLI level, so
+`has_read_only_enforcement` is `True` for an agy profile and the planner and
+reviewer keep their read-only guarantees; `ensure_worktree_unchanged` stays
+only as the backstop it always was. Two facts shape the mechanism:
+
+- **`--mode plan` is advisory only** (spike P1 FAIL — the agent can keep
+  writing; live re-confirm 2026-11-20: the CLI itself warns `--mode plan has
+  no effect while slash command expansion is disabled`, and autoSWE always
+  passes `--disable-slash-commands` (T11 mandatory), so on the agy profile
+  the flag is provably inert belt — the staged deny rules are the ONLY
+  enforcement layer). It is still passed on `plan` runs as intent, but it is
+  never the security boundary. The same live check confirmed the §4.4
+  self-check's expected attestation spelling on the real binary
+  (`init.permission_mode == "request-review"` under `--mode plan` + staged
+  `--settings`), so the fail-closed path does not misfire.
+- **The lever is `--settings <path>`** — a live-binary flag (absent from the
+  mirrored docs) meaning "settings for this session only, never saved".
+  `antigravity.py:_stage_run_config` (the ONE seam) stages a throwaway
+  `settings.json` in a private `mkdtemp` dir per run — profile
+  `base-settings.json` (or `{}`) merged with the mode-derived
+  `permissions.deny`/`allow` block — passes `--settings <path>` in argv, and
+  deletes the run dir in a `finally` (success, failure, kill and cancel all
+  reclaim it). The host-global `~/.gemini/antigravity-cli/settings.json` is
+  **never** written: it is shared, so per-run writes there would race a
+  concurrent `/fix` under `MAX_CONCURRENT > 1` and leak a lockdown on crash.
+  Distinct temp dirs make concurrent runs race-free by construction.
+- **`--settings` LAYERS over the host-global file — it never replaces it**
+  (live-verified on the dedicated box: an isolated `HOME` whose global
+  settings carried only the model-provider config resolved that custom model
+  normally under a `--settings` file containing *only* a permissions block —
+  consistent with the flag text "for this session only, never saved").
+  Consequently `config_home/base-settings.json` is an **optional per-profile
+  override layer, not a required seed**: a fresh install with no such file
+  loses nothing — `/plan` and `/fix` keep whatever the unsandboxed CLI has
+  (`useG1Credits`, `modelProvider`/custom models, …). Author it only to
+  override host config for one profile or to park per-profile state (the
+  Phase 5 MCP registration). Do **not** auto-copy the host-global file into
+  `config_home` — under layering that buys nothing and would freeze a stale
+  snapshot the host later changes.
+
+**Mode → permissions mapping (deny targets are directory prefixes WITH a
+trailing slash — globs silently do NOT match, spike P2):**
+
+| `RunSpec.mode` | `permissions.deny` | `permissions.allow` |
+|---|---|---|
+| `plan` / `read_only` | every mutating tool (`write_file`/`replace_file_content`/`multi_replace_file_content`/`sed_file`/`notebook_edit`) against the worktree, `write_file(<cwd>/.git/)`, `command(*)`, the three `ask_*` | `read_file`/`view_file`/`search` + `grep_search`/`list_dir` against the worktree, `mcp(autoswe_comment/*)` (+ `read_only` also `mcp(autoswe_inline_comment/*)`); `read_only` also gets no `--mode` flag, `plan` gets the advisory `--mode plan` |
+| `read_write` / unset | `write_file(<cwd>/.git/)` belt-and-braces, the three `ask_*` | *(none — default posture)* |
+
+`ask_question`/`ask_permission`/`ask_custom_permission` are denied in **every**
+mode (headless print mode can never answer a prompt — spike T10: a question
+step completes with no selection; denying is deterministic). Deny > Ask >
+Allow, so the allow list only rescues reads and can never reopen a denied
+tool (P5 confirmed deny + MCP allow coexist in one run). The read-only modes
+also never receive `--dangerously-skip-permissions`. `spec.disallowed_tools_override`
+maps to the equivalent agy rule (`Bash→command(*)`, `Write→write_file(<cwd>/)`,
+`mcp__server__tool→mcp(server/tool)`); names without a clean equivalent are
+logged and ignored, pi-style.
+
+**Live-pass checklist (Phase 6).** Remaining rows the dedicated box must
+confirm before the mechanism is called fully live-verified:
+
+- **Grep allow-rule stream spelling** — **resolved.** Branch evidence:
+  every one of the 12 live-captured fixtures that carry an `init` event lists
+  `grep_search`, and `antigravity.py` allows BOTH `search(<cwd>/)` and
+  `grep_search(<cwd>/)`. An unmatched ALLOW entry is a no-op under
+  deny>ask>allow, so the dual spelling is a design guarantee that grep can
+  never be silently lost regardless of which name the matcher honors. This
+  is no longer an open safety question: the live pass only records which
+  spelling actually matches so the dead one can be dropped.
+
+**The `permission_mode` self-check (§4.4).** After `init`, the CLI-attested
+`init.permission_mode` is compared against the posture the run asked for
+(`request-review` for read-only phases; `always-proceed` for `read_write`
+with the skip flag). A **read-only** run attesting anything else means the
+staged deny rules were not honored — a plan run that silently has write
+access is worse than a failed plan run, so the backend logs
+`[ERROR][ANTIGRAVITY] read-only not in effect…` and **raises**
+(`RuntimeError`, outside `retryable_exceptions()` → one attempt). Failing
+**without** attestation fails closed too: under staged `--settings` the CLI
+always stamps `init.permission_mode`, so a parsed init that carries none is
+treated as an unverified guard (`…CLI did not attest permission_mode…`, same
+ERROR + raise path). Only streams that die *before* `init` keep their normal
+error/killed mapping — there was never an attestation to check. The raise,
+not just an error-flagged result, is load-bearing: the planner never inspects
+`RunResult.subtype`, so a returned-but-flagged run would park the task in
+`waiting` as if legitimate; the raise flows through the handler's exception
+boundary into the `FAILED:` comment (transition row
+`agy_plan_permission_mode_mismatch`). A `read_write` posture drift only warns
+(`[WARN]… the skip flag may not be in effect`). Soft-deny notices on stderr
+are logged at **info** level on a read-only run — there they are the deny
+block *working* — and at `[WARN]` elsewhere.
+
+**Capabilities (not yet supported):** `session_fork` (agy resumes in place via
+`--conversation`; `/retry` degrades to a fresh run), and the Claude-only SDK
+levers `can_use_tool`/`plan_permission`/`plan_file`.
+
+**MCP comment posting (Phase 5, issue #322 — `mcp` is advertised).** When a
+run's `spec.mcp_servers` names `autoswe_comment`
+(`antigravity.py:_mcp_comment_active`, the same trigger as pi):
+
+- **Global `~/.gemini/config/mcp_config.json`, entry-scoped merge.**
+  `antigravity.py:_merge_antigravity_mcp_config` (path helper
+  `mcp_config.antigravity_mcp_config_path()`, home resolved at call time)
+  merges ONLY autoSWE's owned keys (`autoswe_comment`, optionally
+  `autoswe_inline_comment`) into the operator's file: foreign servers and
+  top-level keys are preserved, owned keys absent from the current run's
+  owned set are pruned as stale (e.g. an `autoswe_inline_comment` left by a
+  GitHub fix run now facing a plan/Azure run), the payload is compared
+  before writing, and any `OSError` or decode failure (e.g. a UTF-16 file
+  from a PowerShell `>` redirect) is logged and never raised — the run
+  degrades to the text fallback. The whole read-modify-write (read, merge,
+  prune, write) is serialised under an **advisory exclusive lock on a
+  sibling `<file>.lock`** (`fcntl.flock` / `msvcrt.locking`, best-effort: a
+  lock failure logs and proceeds), and the final write is a same-dir temp
+  plus `os.replace()` — an atomic rename as far as the lock-free `agy`
+  reader is concerned, which never sees a truncated file. The prune makes
+  concurrent runs' owned sets differ, so identical-bytes last-writer-wins
+  is not a safety argument here — the lock and the atomic replace are. A workspace `.agents/mcp_config.json` can never shadow
+  the global `autoswe_comment` entry (spike M4), which is what makes the
+  global file safe under Phase 4's Option C (`--settings`) instead of a run
+  dir.
+- **Eager registration.** The entry is seeded from the spec-mandated builder
+  `mcp_config.build_antigravity_mcp_config` (which wraps
+  `mcp_config.antigravity_comment_server`, shared launch triple with pi via
+  `comment_server_launch`) so builder and backend cannot drift; it marks
+  `post_plan`/`post_question`/
+  `update_progress` `"eager": true`, making them first-class stream steps
+  named `mcp_autoswe_comment_<tool>` — single underscores; M2 pinned
+  `mcp_autoswe_comment_post_plan` on the live binary. The lazy
+  `call_mcp_tool` proxy shape (`{ServerName, ToolName, Arguments}`,
+  `Arguments` possibly a JSON string) is still parsed as a fallback by
+  `antigravity.py:_classify_mcp_comment_call`. The names the prompt renders
+  (`comment_tool_names()`) are exactly the names the parser keys on.
+- **Per-task env rides the subprocess env only** (M3): the server entry's
+  `env` block (comment id, PAT, provider, …) is merged into the `agy`
+  process env and NEVER into the config file. Never write a worktree
+  `.agents/mcp_config.json`.
+- **ACTIVE-classify + DONE/ERROR un-set (§5.3, stricter than pi).** Flags
+  are set optimistically on the ACTIVE step; the paired terminal step (same
+  `step_index`) carrying `tool_info.error` un-sets them, so an
+  answered-but-failed post never suppresses the planner's text fallback.
+  Per-role call counts keep an earlier successful post's flag set when a
+  later one fails. `post_question` then `post_plan` in one run: the plan is
+  ignored (question-terminal, issue #230). `update_progress` feeds the live
+  progress callback with its body.
+- With `mcp` advertised the planner's `has_mcp` branch engages for agy:
+  `plan_posted` → PLAN_READY (plus the #241 sticky re-push of
+  `plan_posted_body`), `question_posted` → WAITING. Text/structured capture
+  still works when the tool was never called — `fresh_plan_command` is the
+  kept text-fallback row on this axis; transition rows
+  `agy_plan_mcp_post_plan` / `agy_plan_mcp_post_question` pin the MCP path
+  end-to-end.
+
+**Retry semantics (resume-in-place — no fork, like Codex and unlike pi).**
+`agy --conversation <id>` *continues* the existing conversation in place; agy
+has no fork primitive (analogous to Codex — pi is the subprocess backend that
+*can* branch). So an agy `/retry` either resumes the same conversation
+(mutating it) or starts a fresh one — it cannot branch from a checkpoint while
+leaving the original intact. The backend does not advertise `"session_fork"`,
+so `_run_retry`'s capability gate leaves `fork_session` off, and the backend
+additionally logs-and-ignores `RunSpec.fork_session` (treats it as resume) as
+a belt. See [harnesses.md#retry-semantics](#retry-semantics) for the Claude
+fork-on-retry contrast.
+
+**Command mapping:**
+- Fresh run: `agy --input-format stream-json --output-format stream-json --disable-slash-commands --model <model> [--effort <lvl>] [--agent <a>] [--mode plan] [--dangerously-skip-permissions] [--sandbox] [--json-schema <tmp>] --print-timeout <timeout>s [--log-file <log_dir>/<uuid>.log] --settings <staged per-run file>` — **no session flags** (the CLI creates the conversation). The prompt is never in argv: it is written to stdin as a single NDJSON line `{"event":"user","message":{"content": …}}`, and closing stdin ends the run.
+- Resume: same, with `--conversation <spec.resume>` appended.
+- Fork: not supported — `spec.fork_session` is logged and treated as resume.
+
+**Session identity (parse-only — weaker than pi's).** `RunResult.session_id`
+is the `conversation_id` parsed from `init`, overridden by the `result`
+event's if it differs (the mismatch is logged and the result id wins, as it
+reflects the conversation agy really used). Unlike pi — which pins the id
+with `--session-id` and pre-seeds the accumulator, so the id survives even a
+pre-header death — the id is unknown until the stream delivers it: a run that
+dies before `init` reports `session_id=None`, the same as Codex.
+
+**Retryable subtypes:** `{"error", "killed"}` — agy failure is mostly
+return-value-driven (in-stream error → `error`; killed → `killed`). The runner
+inspects `RunResult.subtype` and retries when `AGENT_RETRY_ON_FAILURE > 0`.
+Override with `AGENT_RETRY_ON_SUBTYPE`. **`config_error` is deliberately
+excluded**: it marks an auth/config death (stderr or result text matching
+"not recognized as a known model", "invalid model selection",
+"authentication failed", "authentication required", or "authentication timed
+out") — it does not fix itself on retry, and retrying would just burn more
+auth round trips. **Retryable exceptions:** `retryable_exceptions()` returns
+`(asyncio.TimeoutError, OSError)` — transport-level failures at the subprocess
+boundary (agy has no SDK; same surface as Codex/pi). Also outside retry:
+`AgyConfigError` (a malformed `base-settings.json`) and the
+unresolvable-executable `RuntimeError` (the spawn-time `FileNotFoundError` is
+caught and re-raised as `RuntimeError` so a broken config never burns the
+retry budget, pi-style).
+
+**Cost is never reported.** `cost_usd` is always `None` — the stream carries
+tokens, never money (spike lesson #7), and nothing is estimated (same rule as
+pi). One `[ANTIGRAVITY] usage input=… output=… thinking=… cache_read=…
+total=…` line is logged per run for the operator.
+
+**Known limitations:**
+- `RunSpec.max_turns` is **not honored** — agy exposes no turn cap (the guard is the wall-clock timeout, `timeout` profile field / `AGENT_TIMEOUT`).
+- **No AskUserQuestion / WAITING flow:** the `ask_*` tools are denied in every mode and headless print mode can never answer a prompt (spike T10); the `pre_tool_call_decide` analogue that would enable the flow lives in the Python SDK, deferred to Phase 7.
+- **No system-prompt knob:** no CLI flag exists; steering is via the prompt templates (as with Codex).
+- **No plan file:** `plan_file_path` is always `None` (the `plan_file` capability is not advertised; the planner's `~/.claude/plans/` scan stays skipped).
+- **`--mode plan` is advisory only** — intent, never a boundary; the staged `--settings` deny rules are the enforcement (see [Real read-only enforcement](#antigravity)).
+- **Orchestrator models ignore `effort`** — the CLI reports it as not adjustable for the Orchestrator pair.
+
 ### Shared RunSpec → RunResult contract (backends/base.py)
 
 All backends implement the `CodingBackend` protocol and share two cross-cutting
 behaviors, exercised identically in the runner's retry loop:
 
 - **`retryable_subtypes()`** — the set of return-value `subtype` strings that
-  trigger a retry (empty for `claude_code`; `{"error", "killed"}` for `codex`
-  and `pi`).
+  trigger a retry (empty for `claude_code`; `{"error", "killed"}` for `codex`,
+  `pi` and `antigravity` — agy additionally maps auth/config deaths to
+  `config_error`, deliberately outside the set).
 - **`retryable_exceptions()`** — the tuple of exception types that trigger a
   retry (S6 / issue #169 F-09). The runner uses the *resolved backend's* tuple,
   so each backend retries on its own failure modes: `claude_code` on its SDK
-  exceptions, `codex` and `pi` on `asyncio.TimeoutError`/`OSError`. A backend
+  exceptions, `codex`, `pi` and `antigravity` on `asyncio.TimeoutError`/`OSError`. A backend
   missing the method gets an empty tuple (no exception-based retry) —
   `runner.run()` never hard-codes Claude's set.
 
@@ -549,7 +845,7 @@ an explicit `ok=` wins.
 
 Backend instances are created by `autoswe/harness/backends/factory.py:get_backend(harness_cfg)`. Dispatch on `harness_cfg["backend"]` field. Mirrors the provider factory pattern (`providers/factory.py`).
 
-Unknown backend names raise `ValueError`. A `codex` or `pi` profile without `model` also raises `ValueError` (neither CLI has a default model). Case-insensitive matching.
+Unknown backend names raise `ValueError`. A `codex`, `pi` or `antigravity` profile without `model` also raises `ValueError` (none of those CLIs gets a reproducible default model). Case-insensitive matching.
 
 ### Backward Compatibility
 

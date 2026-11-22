@@ -1366,6 +1366,43 @@ def test_run_plan_pi_mcp_plan_posted_returns_plan_ready_no_tag(tmp_path, mock_gh
     assert len(mock_gh_post_comment.posted) == 0
 
 
+def test_run_plan_antigravity_mcp_flags_take_the_has_mcp_branch(tmp_path, mock_gh_post_comment):
+    """Phase 5: an agy profile advertises ``mcp``, so the planner's has_mcp
+    branch engages for it exactly as for pi — plan_posted → PLAN_READY and
+    question_posted → WAITING, with no tag-scrape repost. The flags arrive on
+    the RunResult from the agy stream parser (eager mcp_autoswe_comment_*
+    tool steps), not from any text tag."""
+    task = make_task()
+
+    with _patch_worktree(tmp_path):
+        with FETCH_COMMENTS_PATCH:
+            with patch("autoswe.harness.planner.resolve_harness",
+                       return_value={"backend": "antigravity", "model": "gemini-test"}):
+                with patch("autoswe.harness.runner.run",
+                           return_value=RunResult(
+                               "Posted the plan to the issue.", "conv-1", "success",
+                               plan_posted=True, plan_posted_body="## Plan\n\nStep 1",
+                           )):
+                    from autoswe.harness.planner import run_plan
+                    result = run_plan(task, {}, {"GITHUB_TOKEN": "tok"})
+    assert result.done_content == "PLAN_READY"
+    assert len(mock_gh_post_comment.posted) == 0
+
+    with _patch_worktree(tmp_path):
+        with FETCH_COMMENTS_PATCH:
+            with patch("autoswe.harness.planner.resolve_harness",
+                       return_value={"backend": "antigravity", "model": "gemini-test"}):
+                with patch("autoswe.harness.runner.run",
+                           return_value=RunResult(
+                               "Asked the user a question.", "conv-2", "success",
+                               question_posted=True,
+                           )):
+                    from autoswe.harness.planner import run_plan
+                    result = run_plan(task, {}, {"GITHUB_TOKEN": "tok"})
+    assert result.done_content.startswith("WAITING:")
+    assert len(mock_gh_post_comment.posted) == 0
+
+
 def test_run_plan_returns_waiting_on_post_question_tool_use(tmp_path, mock_gh_post_comment):
     """When RunResult has question_posted=True, run_plan should return WAITING: questions."""
     task = make_task()

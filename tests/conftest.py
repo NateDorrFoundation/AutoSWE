@@ -15,7 +15,9 @@ Exposes:
 - git_fake: scripted worktree operations fake (scenario tests)
 - scenario_cfg: pre-configured cfg dict + repos.json for scenario tests
 """
+import contextlib
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -42,6 +44,40 @@ def fixture_path(name: str) -> Path:
 
 def load_fixture(name: str):
     return json.loads(fixture_path(name).read_text(encoding="utf-8"))
+
+
+@contextlib.contextmanager
+def caplog_autoswe(caplog, level=logging.WARNING):
+    """Capture ``autoswe.debug`` records (log(), _dbg.*) into caplog.
+
+    ``init_debug_logger`` deliberately sets ``autoswe.debug`` to
+    ``propagate=False`` (so records don't double-emit through root handlers),
+    which blinds caplog's root-level handler. Any module imported before the
+    test (e.g. a module-level ``get_debug_logger()`` in a backend) can trip
+    this, making a bare caplog assertion import-order dependent. Re-enable
+    propagation for the duration of the capture and restore it after.
+
+    get_debug_logger() is called first (idempotent) so the logger exists —
+    with propagation already disabled — before we flip it; a lazy init inside
+    the captured call would otherwise re-disable propagation mid-capture.
+
+    Usage::
+
+        with caplog_autoswe(caplog, logging.INFO):
+            do_the_thing()
+        assert "expected warning" in caplog.text
+    """
+    from autoswe.core.logging_utils import get_debug_logger
+
+    get_debug_logger()  # idempotent: guarantees handlers exist before we flip propagate
+    dbg = logging.getLogger("autoswe.debug")
+    prev_propagate = dbg.propagate
+    dbg.propagate = True
+    try:
+        with caplog.at_level(level):
+            yield
+    finally:
+        dbg.propagate = prev_propagate
 
 
 @pytest.fixture

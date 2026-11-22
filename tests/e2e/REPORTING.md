@@ -13,7 +13,7 @@ file that instead, against this directory.
 
 ```markdown
 **Case:** E2E-NN — <case title>
-**Pass:** A-claude | B-codex | C-mixed | D-pi
+**Pass:** A-claude | B-codex | C-mixed | D-pi | E-antigravity
 **Provider:** github | azure
 **Test issue:** <link to the issue in the test project>
 **Step:** <n> — <what openclaw posted>

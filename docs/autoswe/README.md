@@ -21,7 +21,7 @@ autoSWE is **queue-driven**, not label-driven:
 | [labels.md](labels.md) | The `autoswe:*` labels as a read-only mirror of `autoswe_status`; bot-marker convention |
 | [slash-commands.md](slash-commands.md) | User-facing commands, parsing, auto-resume, multi-command-last-wins |
 | [config.md](config.md) | autoswe.env keys, repos.json fields, model resolution, prompt templates |
-| [harnesses.md](harnesses.md) | Harness profiles (`harnesses.json`), pluggable coding backends (`claude_code`, `codex`, `pi`), per-phase resolution, capability degradation |
+| [harnesses.md](harnesses.md) | Harness profiles (`harnesses.json`), pluggable coding backends (`claude_code`, `codex`, `pi`, `antigravity`), per-phase resolution, capability degradation |
 | [providers.md](providers.md) | IssueTracker/VCSProvider protocols, GitHub + Azure backends, factory |
 | [git-worktrees.md](git-worktrees.md) | Per-repo clones, per-issue worktrees, branch naming, GC |
 | [safeguards.md](safeguards.md) | MAX_CONCURRENT, MAX_ATTEMPTS, time limits, completion anchor |
@@ -29,6 +29,17 @@ autoSWE is **queue-driven**, not label-driven:
 | [testing.md](testing.md) | Test harness, pytest structure, test seams, CI strategy |
 | [../../tests/e2e/README.md](../../tests/e2e/README.md) | **Lives outside this folder.** The live E2E suite — one file per test case (the issue, the steps, the process autoSWE must follow), driven by an agent against a real GitHub/Azure test project |
 | [technical-reference.md](technical-reference.md) | Consolidated pipeline internals (CLI entry points, status transitions, three-layer architecture) |
+
+## Reference Doc Mirrors (sibling folders under `docs/`)
+
+Vendor/tool docs mirrored locally as the canonical reference for backend work —
+refresh commands live in each folder's README:
+
+- `docs/claude-agent-sdk/` — Claude Agent SDK (default backend)
+- `docs/codex/` — Codex CLI/app surfaces
+- `docs/pi/` — pi coding agent (JSON/RPC transports)
+- `docs/antigravity/` — Google Antigravity SDK + headless CLI (`agy -p`), MCP/tools
+- `docs/github-api/`, `docs/azure-devops-api/` — provider API references
 
 ## Derivation Rule
 
