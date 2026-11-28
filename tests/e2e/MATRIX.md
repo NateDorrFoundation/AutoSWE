@@ -20,10 +20,17 @@ against `config/harnesses.json` — see [`../../docs/autoswe/harnesses.md`](../.
 | **B — Codex** | `codex` | `codex` | `codex` | no MCP → planner text-parse fallback; no `session_fork` → resume in place; no read-only enforcement in the plan phase |
 | **C — Mixed** | `codex` | `claude_code` | `claude_code` | `last_good_session_backend` provenance — a Codex checkpoint must never be resumed into the Claude SDK ([E2E-12](cases/E2E-12.md) is the whole reason this pass exists) |
 | **D — pi** | `pi` | `pi` | `pi` | read-only via tool allowlist, session fork, MCP comment posting through the pi-mcp-adapter |
+| **E — Antigravity** | `agy-live` | `agy-live` | `agy-live` | stream-json transport with the prompt over stdin; no fork primitive — `/retry` is a fresh run even on its own checkpoint; eager MCP `post_plan` / `post_question` (Phase 5); per-run `--settings` read-only enforcement with fail-closed `permission_mode` attestation; no AskUserQuestion/WAITING — plan questions arrive via MCP `post_question` or the text fallback, never an intercepted tool |
 
 Run **A** first. It is the reference: if a case is red under A, it is a bug in autoSWE, not a
-backend divergence. A case that is green under A and red under B, C or D is a backend-binding
-bug, which is a different report — say which pass in the finding.
+backend divergence. A case that is green under A and red under B, C, D or E is a
+backend-binding bug, which is a different report — say which pass in the finding.
+
+Pass E is the live counterpart of the offline `ANTIGRAVITY_TRANSITIONS` axis
+(`tests/scenarios/transitions.py`, run by `test_transition_antigravity` on **both** providers).
+Where that axis pins a divergence the pass has no live precedent for, the expectation below is
+flagged *pinned expectation pending first live pass* — still the assertion, but first run
+confidence.
 
 ### Cases that differ by backend
 
@@ -31,9 +38,9 @@ Everything not listed here must produce an identical process in every pass.
 
 | Case | Divergence |
 |---|---|
-| [E2E-02](cases/E2E-02.md) | Claude/pi reach `waiting` through the MCP question tool; Codex through the planner's text-parse fallback. Same state, different route. |
-| [E2E-03b](cases/E2E-03b.md) | needs mid-`/fix` tool interception. Claude and pi only — on Codex it runs straight to `fixed`; score **skipped**, not failed. |
-| [E2E-12](cases/E2E-12.md) | the `/retry` step: A and D fork the checkpoint session, B resumes in place, C must refuse the checkpoint outright. |
+| [E2E-02](cases/E2E-02.md) | Claude/pi reach `waiting` through the MCP question tool; Codex through the planner's text-parse fallback. Antigravity reaches it through the **eager MCP** pair like Claude — `post_plan` / `post_question` (`agy_plan_mcp_post_plan`, `agy_plan_mcp_post_question`) — never text-parse and never an intercepted tool. Same state, different route. |
+| [E2E-03b](cases/E2E-03b.md) | needs mid-`/fix` question routing. Claude and pi only — on Codex it runs straight to `fixed`; score **skipped**, not failed. Antigravity advertises MCP, so it behaves like Claude/pi: no native `can_use_tool` interception, but the question arrives via MCP `post_question` and parks the task in `waiting`. The offline axis pins this route only on the plan side (`agy_plan_waiting_status`, `agy_plan_mcp_post_plan`); the mid-`/fix` shape is a **pinned expectation pending first live pass**. |
+| [E2E-12](cases/E2E-12.md) | the `/retry` step: A and D fork the checkpoint session, B resumes in place, C must refuse the checkpoint outright. E never forks: fresh run even when the checkpoint is its own agy conversation (`agy_retry_fresh_even_with_agy_checkpoint`), and never `--conversation` a foreign-backend id (`retry_forks_from_last_good_session`). |
 
 ---
 

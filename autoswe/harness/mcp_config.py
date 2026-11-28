@@ -94,6 +94,22 @@ def build_pi_mcp_json(python_path: str, repo_root: str) -> dict:
     }
 
 
+def comment_server_launch(python_path: str, repo_root: str) -> dict:
+    """The shared ``autoswe_comment`` launch triple (command/args/cwd).
+
+    Every backend starts the comment server the same way — the same resolved
+    Python, the same module, the same cwd (the autoSWE checkout root, NOT the
+    target worktree, so the ``mcp_servers`` package resolves).  pi and
+    antigravity each spread this and add only their adapter-specific keys, so
+    the two configs can never drift apart on the launch part.
+    """
+    return {
+        "command": python_path,
+        "args": ["-m", "mcp_servers.autoswe_comment_server"],
+        "cwd": repo_root,
+    }
+
+
 def pi_mcp_comment_server(python_path: str, repo_root: str) -> dict:
     """The ``autoswe_comment`` server entry alone (the ``mcpServers`` value).
 
@@ -101,17 +117,74 @@ def pi_mcp_comment_server(python_path: str, repo_root: str) -> dict:
     ``mcp.json`` without clobbering other operators' servers.
     """
     return {
-        "command": python_path,
-        "args": ["-m", "mcp_servers.autoswe_comment_server"],
-        "cwd": repo_root,
+        **comment_server_launch(python_path, repo_root),
         "toolPrefix": "mcp",
         "directTools": ["post_plan", "post_question", "update_progress"],
+    }
+
+
+def antigravity_comment_server(python_path: str, repo_root: str) -> dict:
+    """The ``autoswe_comment`` entry for the agy ``mcp_config.json``.
+
+    Same launch triple as pi (``comment_server_launch``) plus the two agy
+    keys per ``docs/autoswe/PLAN-antigravity-backend`` §5.1 /
+    ``docs/antigravity/mcp.md``:
+
+    - ``timeoutSeconds`` — the server's tool calls patch a sticky comment via
+      the provider API; 120 s mirrors pi's implicit patience.
+    - ``tools.*.eager: true`` — eager registration makes the three tools
+      first-class stream steps named ``mcp_autoswe_comment_<tool>`` (M2:
+      exactly ``mcp_autoswe_comment_post_plan``).  Lazy tools go through
+      ``call_mcp_tool``, which costs an extra file-read turn and gives the
+      model a reason to skip the tool; the lazy proxy shape is still parsed
+      as a fallback in the stream classifier.
+    """
+    return {
+        **comment_server_launch(python_path, repo_root),
+        "timeoutSeconds": 120,
+        "tools": {
+            "post_plan": {"eager": True},
+            "post_question": {"eager": True},
+            "update_progress": {"eager": True},
+        },
+    }
+
+
+def build_antigravity_mcp_config(python_path: str, repo_root: str) -> dict:
+    """The agy global ``mcp_config.json`` dict carrying only the autoSWE entry.
+
+    The agy backend merges this entry-scoped into the existing file (foreign
+    servers preserved); this builder alone never overwrites a host's config.
+    Only stable values are baked in (python path, repo root) — per-task env
+    rides the ``agy`` subprocess env instead (M3), so the file is host-stable
+    and written at most once.
+    """
+    return {
+        "mcpServers": {
+            "autoswe_comment": antigravity_comment_server(python_path, repo_root),
+        },
     }
 
 
 def pi_mcp_json_path(agent_dir: str) -> Path:
     """Path to the agent-dir ``mcp.json`` (``<agent dir>/mcp.json``)."""
     return Path(agent_dir).expanduser() / "mcp.json"
+
+
+def antigravity_mcp_config_path() -> Path:
+    """The agy **global** ``mcp_config.json`` (``~/.gemini/config/...``).
+
+    The file autoSWE owns the ``autoswe_comment``/``autoswe_inline_comment``
+    entries of (docs/antigravity/mcp.md "Global configuration").  Phase 4
+    chose Option C (per-run ``--settings``), so there is no Option-A run dir
+    and this global file is the only MCP config surface; that is safe because
+    M4 proved a workspace ``.agents/mcp_config.json`` can never shadow the
+    global ``autoswe_comment`` entry, and M3 proved per-task env reaches the
+    MCP child through the ``agy`` process env, so the file carries stable
+    values only.  ``Path.home()`` resolves at call time, so tests (and a
+    relocated ``HOME``) redirect it.
+    """
+    return Path.home() / ".gemini" / "config" / "mcp_config.json"
 
 
 def pi_mcp_cache_path(agent_dir: str) -> Path:

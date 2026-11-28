@@ -26,6 +26,7 @@ from tests.scenarios.harness import (
     setup_repos,
 )
 from tests.scenarios.transitions import (
+    ANTIGRAVITY_TRANSITIONS,
     CODEX_TRANSITIONS,
     PI_TRANSITIONS,
     TRANSITIONS,
@@ -111,6 +112,10 @@ def test_transition(
     skip_providers = row.get("skip_providers", [])
     if provider in skip_providers:
         pytest.skip(f"{transition_name} skipped for {provider}: known limitation")
+    # Backend-axis sibling of skip_providers: rows whose scripted failure has
+    # no meaning on the default claude_code axis (the §4.4 agy self-check).
+    if "claude_code" in row.get("skip_backends", []):
+        pytest.skip(f"{transition_name} is antigravity-only: no claude_code behavior")
     expect = row.get("expect", {})
 
     state = build_github_state(row) if provider == "github" else build_azure_state(row)
@@ -491,6 +496,252 @@ def test_transition_pi(
     # row's ``claude_calls`` axis describes the DEFAULT claude_code behavior,
     # which intentionally diverges for the pi fork row and is asserted by
     # the generic test_transition instead.)
+
+    # Git call assertions
+    if git_calls:
+        assert_git_calls(hw.git, git_calls)
+    elif expect.get("no_git_calls"):
+        assert_no_git_calls(hw.git)
+
+
+# ---------------------------------------------------------------------------
+# Antigravity backend — parametrized test (both providers)
+
+antigravity_transition_names = list(ANTIGRAVITY_TRANSITIONS)
+
+
+@pytest.mark.transition
+@pytest.mark.parametrize("provider", ["github", "azure"])
+@pytest.mark.parametrize("transition_name", antigravity_transition_names)
+def test_transition_antigravity(
+    transition_name: str,
+    provider: str,
+    isolated_autoswe_dir: Path,
+    monkeypatch,
+):
+    """Run a curated transition row through the real AntigravityBackend.
+
+    End-to-end through AntigravityBackend → stream-json parser → RunResult
+    → planner/coder/reviewer → emit → label/comment/queue.  Unlike the
+    codex/pi axes, this one runs on BOTH providers (the agy divergence
+    surface is provider-independent; see ANTIGRAVITY_TRANSITIONS).
+
+    Asserts the Phase 1/2 agy-specific divergences per row:
+    * the argv contract every agy run carries (--disable-slash-commands,
+      harness model, --print-timeout);
+    * read-only ENFORCEMENT on plan/review via the staged per-run --settings
+      block (Phase 4: 'mode' advertised → no loud-degrade, no skip flag);
+    * the §4.4 permission_mode self-check failing a read-only run whose init
+      attests the wrong posture (agy_plan_permission_mode_mismatch → failed);
+    * --json-schema requested on every plan and review run (the
+      structured_output capability);
+    * --conversation as the ONLY session channel: fix-from-planned resumes,
+      but /retry never carries a session id (no session_fork capability, so
+      the provenance gate declines even its own checkpoint);
+    * config_error never retries (one spawn despite a retry budget).
+    """
+    row = _get_row(transition_name)
+    expect = row.get("expect", {})
+
+    # Collect planner/reviewer log() lines: the conftest autouse fixture
+    # no-ops autoswe's log() module-wide before these handlers bind it, so
+    # stdout capture cannot see the loud-degrade line (issue #166 warning).
+    # Re-patch the two handler modules with a recorder for this test only.
+    import autoswe.harness.planner as planner_mod
+    import autoswe.harness.reviewer as reviewer_mod
+
+    logged: list[str] = []
+    monkeypatch.setattr(planner_mod, "log", logged.append)
+    monkeypatch.setattr(reviewer_mod, "log", logged.append)
+
+    state = build_github_state(row) if provider == "github" else build_azure_state(row)
+    queue_task = build_queue_task(row, provider)
+
+    # Seed queue
+    seed_queue(isolated_autoswe_dir, queue_task)
+
+    # Set up repos.json (row may override the repo config, e.g. test_command)
+    setup_repos(isolated_autoswe_dir, provider, state, repos_extra=row.get("repos"))
+
+    # Build config with the antigravity backend
+    cfg = build_test_cfg(isolated_autoswe_dir, provider, backend="antigravity")
+
+    # A row may pin a retry budget via meta (agy_fix_config_error uses it to
+    # prove config_error stays OUTSIDE retryable_subtypes — one attempt even
+    # with AGENT_RETRY_ON_FAILURE=1).
+    row_meta = row.get("meta") or {}
+    if row_meta.get("runner_retries"):
+        cfg["AGENT_RETRY_ON_FAILURE"] = row_meta["runner_retries"]
+
+    claude_responses = row.get("claude_responses", [])
+    git_calls = row.get("git_calls", [])
+
+    with patched_world(
+        provider,
+        state=state,
+        claude_responses=claude_responses,
+        scripted_git=git_calls,
+        isolated_dir=isolated_autoswe_dir,
+        row_meta=row.get("meta"),
+        backend="antigravity",
+    ) as hw:
+        from tests.scenarios.runner import run_one_turn
+
+        if provider == "github":
+            owner, repo = state["owner"], state["repo"]
+        else:
+            owner, repo = state["org"], state["project"]
+
+        run_one_turn(owner, repo, cfg, isolated_autoswe_dir)
+
+    # ---- Assertions (label/queue/comments: same as every other axis) ----
+    issue_num = 42
+
+    if "label_after" in expect:
+        if provider == "github":
+            assert_label_is(hw.fake, issue_num, expect["label_after"])
+        else:
+            _assert_azure_tag(hw.fake, issue_num, expect["label_after"])
+
+    # Issue #279: labels that must never appear at ANY point this turn
+    _assert_labels_never(hw.fake, issue_num, expect)
+
+    queue_fields = {}
+    for key in ("autoswe_status", "session_id", "pending_command", "attempt_count",
+                "plan_branch", "rereview_after_fix", "pr_number",
+                # Gate-brake bookkeeping (issue #276 review F1): rows can pin
+                # the shared recoverable-gate counters/watermarks.
+                "gate_attempt_count", "gate_last_fixed_sha", "test_failed_sha"):
+        if key in expect:
+            queue_fields[key] = expect[key]
+    if queue_fields:
+        task_id = queue_task["id"] if queue_task else (
+            f"gh:{state['owner']}_{state['repo']}_{issue_num}"
+            if provider == "github"
+            else f"ado:{state['org']}_{state['project']}/testrepo_{issue_num}"
+        )
+        assert_queue_task(isolated_autoswe_dir, task_id, queue_fields)
+
+    if "comment_contains" in expect:
+        assert_comments_posted(hw.fake, [{"body_contains": expect["comment_contains"]}])
+
+    # ---- Antigravity-specific call assertions (per-row shape is authoritative) ----
+    if expect.get("no_claude_calls", False):
+        assert len(hw.antigravity.calls) == 0, "Expected no antigravity calls"
+        return
+
+    assert hw.antigravity.calls, f"{transition_name}: expected agy calls, got none"
+    call = hw.antigravity.calls[0]
+
+    # Every agy run carries the Phase 1 argv contract.
+    assert call["disable_slash_commands"] is True, "agy must always run with slash commands disabled"
+    assert call["model"] == "gemini-test", "agy must run the harness profile's model"
+    assert call["print_timeout"] == "7200s", "agy must pin --print-timeout from AGENT_TIMEOUT"
+
+    if transition_name == "fresh_plan_command":
+        # Phase 4 §4.5: agy advertises 'mode' → the planner must NOT degrade.
+        # Enforcement is the staged per-run --settings deny block (§4.3);
+        # ensure_worktree_unchanged stays only as the backstop.
+        assert call["is_fresh"] is True
+        assert call.get("json_schema_path") is not None, (
+            "agy has structured_output → every plan run requests --json-schema"
+        )
+        assert not any("no read-only enforcement" in ln for ln in logged), (
+            "plan on agy must NOT degrade now that 'mode' is advertised (§4.5)"
+        )
+        assert call["skip_permissions"] is False, (
+            "a read-only phase must never receive --dangerously-skip-permissions"
+        )
+        assert call.get("settings_path"), (
+            "plan must stage a per-run --settings permissions block (§4.3)"
+        )
+        assert call.get("mode") == "plan", (
+            "plan phase signals intent with the advisory --mode plan flag"
+        )
+    elif transition_name == "agy_plan_structured_output":
+        # The PLAN_SCHEMA payload path: schema requested, structured body
+        # preferred over the text tags (same posted comment, other source).
+        assert call["is_fresh"] is True
+        assert call.get("json_schema_path") is not None
+    elif transition_name == "agy_plan_waiting_status":
+        # WAITING result → error subtype, but the planner parks the task in
+        # waiting regardless (resumable): one fresh plan run, nothing resumed.
+        assert call["is_fresh"] is True
+    elif transition_name == "fresh_fix_command":
+        assert call["is_fresh"] is True
+        assert call.get("conversation") is None, "fresh fix must not carry --conversation"
+        assert call["skip_permissions"] is True, (
+            "fix defaults to --dangerously-skip-permissions (full-permission agent by design)"
+        )
+        assert call.get("settings_path"), (
+            "fix still stages the belt-and-braces .git deny block (§4.3)"
+        )
+        assert call.get("mode") is None, "read_write runs at the CLI default mode"
+    elif transition_name == "plan_ready_then_fix":
+        # Fix from planned resumes the plan checkpoint IN PLACE via
+        # --conversation (agy's only session channel; no fork semantics).
+        assert call["is_resume"] is True
+        assert call.get("conversation") == "s-plan-42", (
+            f"--conversation must re-open the plan checkpoint; got {call.get('conversation')!r}"
+        )
+    elif transition_name == "agy_fix_config_error":
+        # config_error is OUTSIDE retryable_subtypes: exactly one spawn even
+        # though the row pinned AGENT_RETRY_ON_FAILURE=1.
+        assert len(hw.antigravity.calls) == 1, (
+            "config_error must never be retried — a broken profile is not a transient failure"
+        )
+    elif transition_name == "retry_forks_from_last_good_session":
+        # Mixed backends: checkpoint written by claude_code, fix on agy. agy
+        # has no session_fork → fresh; the claude session id must NEVER be
+        # handed to --conversation (it would name a conversation agy never had).
+        assert call["is_fresh"] is True, (
+            "agy has no session_fork capability → /retry must run fresh"
+        )
+        assert call.get("conversation") is None, (
+            "must not resume a foreign-backend (claude_code) checkpoint"
+        )
+        assert "s-plan-good-42" not in call["argv"], (
+            "a claude session id must never appear in agy's argv"
+        )
+    elif transition_name == "agy_retry_fresh_even_with_agy_checkpoint":
+        # Matching provenance does not help: the gate first requires the fix
+        # backend to advertise session_fork, which agy does not.
+        assert call["is_fresh"] is True, (
+            "matching provenance must not fork/resume on a backend without session_fork"
+        )
+        assert call.get("conversation") is None
+        assert "s-agy-plan-good-42" not in call["argv"], (
+            "even an antigravity-written checkpoint must not be resumed on /retry"
+        )
+    elif transition_name in ("planned_then_review", "planned_then_review_blocked"):
+        # Review on agy also requests --json-schema (REVIEW_SCHEMA); the
+        # structured verdict drives reviewed vs review_blocked without the
+        # "## Verdict" markdown regex.
+        assert call.get("json_schema_path") is not None, (
+            "agy has structured_output → every review run requests --json-schema"
+        )
+        assert call["is_fresh"] is True, "review is always a one-off session"
+        # Review is the second read-only phase: enforced via the staged
+        # --settings block (Phase 4), NOT degraded — and read_only uses the
+        # CLI default mode (no --mode flag), unlike plan.
+        assert not any("no read-only enforcement" in ln for ln in logged), (
+            "review on agy must NOT degrade now that 'mode' is advertised (§4.5)"
+        )
+        assert call["skip_permissions"] is False, (
+            "a read-only phase must never receive --dangerously-skip-permissions"
+        )
+        assert call.get("settings_path"), (
+            "review must stage a per-run --settings permissions block (§4.3)"
+        )
+        assert call.get("mode") is None, "read_only runs at the CLI default mode"
+    elif transition_name == "agy_plan_permission_mode_mismatch":
+        # §4.4 self-check: the run's init attests always-proceed on a
+        # read-only phase (scripted override) — the staged deny rules were
+        # not honored, so the backend refuses the run instead of letting a
+        # plan with write access pass for a clean one.
+        assert call["is_fresh"] is True
+        assert call["skip_permissions"] is False, "the attempt was still read-only-flagged"
+        assert call.get("settings_path"), "the check compares against staged rules"
 
     # Git call assertions
     if git_calls:

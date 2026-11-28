@@ -2033,6 +2033,317 @@ TRANSITIONS: list[dict[str, Any]] = [
             ],
         },
     },
+    # ---- Antigravity backend rows (issue #320 Phase 3) ----
+    #
+    # These rows are full matrix rows (they run on the default claude_code axis
+    # too).  Antigravity-only scripting lives in keys the other feeders ignore:
+    # claude_responses[].structured_output / .error / .status — see
+    # ``patched_world``'s antigravity branch.  The authoritative agy assertions
+    # live in ``test_transition_antigravity``.
+    {
+        "name": "agy_plan_structured_output",
+        "description": (
+            "antigravity-specific: /plan whose run returns a schema-validated "
+            "PLAN_SCHEMA payload (agy advertises structured_output, so the "
+            "planner requests --json-schema). _interpret_plan_result prefers the "
+            "structured payload over the text-tag fallback. On the default "
+            "claude_code axis structured_output is ignored (ClaudeFake has no "
+            "structured channel) and the identical <AUTOSWE_PLAN> tag posts the "
+            "same body, so both axes reach planned with the same comment — only "
+            "the SOURCE of the plan differs."
+        ),
+        "start": {
+            "issue": {"body": "/plan"},
+            "queue_task": None,
+        },
+        "claude_responses": [
+            {
+                "text": "<AUTOSWE_PLAN>Adopt the structured payload.</AUTOSWE_PLAN>",
+                "session_id": "s-agy-plan-42",
+                "subtype": "success",
+                "structured_output": {
+                    "is_plan_ready": True,
+                    "plan_markdown": "Adopt the structured payload.",
+                },
+            },
+        ],
+        "git_calls": ["create_worktree"],
+        "expect": {
+            "label_after": "autoswe:planned",
+            "autoswe_status": "planned",
+            "session_id": "s-agy-plan-42",
+            "pending_command": None,
+            "comment_contains": ["## Plan", "Adopt the structured payload."],
+            "claude_permission": "plan",
+        },
+    },
+    {
+        "name": "agy_plan_waiting_status",
+        "description": (
+            "antigravity-specific: /plan whose agy run ends with result status "
+            "WAITING (the CLI paused on interactive input under --print mode). "
+            "Phase 1 maps WAITING→error subtype; the planner never inspects the "
+            "subtype, so a tagless response falls through to the raw-text branch "
+            "and the task parks in waiting (resumable) on BOTH axes."
+        ),
+        "start": {
+            "issue": {"body": "/plan"},
+            "queue_task": None,
+        },
+        "claude_responses": [
+            {
+                "text": "I need to check the deployment target interactively before planning.",
+                "session_id": "s-agy-plan-42",
+                "subtype": "success",
+                "status": "WAITING",
+            },
+        ],
+        "git_calls": ["create_worktree"],
+        "expect": {
+            "label_after": "autoswe:waiting",
+            "autoswe_status": "waiting",
+            "session_id": "s-agy-plan-42",
+            "comment_contains": ["Claude's response", "deployment target"],
+            "claude_permission": "plan",
+        },
+    },
+    {
+        "name": "agy_plan_mcp_post_plan",
+        "description": (
+            "Phase 5: fresh /plan where the agent posts through the comment MCP "
+            "server — the agy stream carries the eager post_plan pair "
+            "(ACTIVE+DONE sharing one step_index), the parser sets "
+            "plan_posted/plan_posted_body, and the planner's has_mcp branch "
+            "returns PLAN_READY with no text tag and no structured payload. "
+            "The captured body is re-pushed through the sticky progress "
+            "comment (issue #241). On the default claude_code axis ClaudeFake "
+            "honors the same plan_posted=True (mcp_tool is agy-feed-only), so "
+            "both axes reach planned with the same '## Plan' comment — only "
+            "the mechanism that observed the post differs."
+        ),
+        "meta": {"mcp_plan_posted": True},
+        "start": {
+            "issue": {"body": "/plan"},
+            "queue_task": None,
+        },
+        "claude_responses": [
+            {
+                "text": "Posted the plan to the issue.",  # tag-free on purpose
+                "session_id": "s-agy-plan-42",
+                "subtype": "success",
+                "plan_posted": True,
+                "mcp_tool": "post_plan",
+                "plan_posted_body": "Step 1: wire the stream parser.",
+            },
+        ],
+        "git_calls": ["create_worktree"],
+        "expect": {
+            "label_after": "autoswe:planned",
+            "autoswe_status": "planned",
+            "session_id": "s-agy-plan-42",
+            "pending_command": None,
+            # The plan lands on the thread via the sticky PATCH channel, not
+            # as a separate new comment from tag-scraping.
+            "comment_contains": ["## Plan", "Step 1: wire the stream parser."],
+            "claude_permission": "plan",
+        },
+    },
+    {
+        "name": "agy_plan_mcp_post_question",
+        "description": (
+            "Phase 5: fresh /plan where the agent asks through the comment MCP "
+            "server — the agy stream carries the eager post_question pair, the "
+            "parser sets question_posted, and the planner's has_mcp branch "
+            "returns WAITING: questions with tag-free text (question-terminal, "
+            "issue #230). The sticky freezes on the question; the task parks "
+            "in waiting on BOTH axes (ClaudeFake honors question_posted=True)."
+        ),
+        "start": {
+            "issue": {"body": "/plan"},
+            "queue_task": None,
+        },
+        "claude_responses": [
+            {
+                "text": "Asked the user which DB to target.",  # tag-free
+                "session_id": "s-agy-plan-42",
+                "subtype": "success",
+                "question_posted": True,
+                "mcp_tool": "post_question",
+            },
+        ],
+        "git_calls": ["create_worktree"],
+        "expect": {
+            "label_after": "autoswe:waiting",
+            "autoswe_status": "waiting",
+            "session_id": "s-agy-plan-42",
+            "claude_permission": "plan",
+        },
+    },
+    {
+        "name": "agy_plan_permission_mode_mismatch",
+        "description": (
+            "antigravity-specific (Phase 4 §4.4): /plan whose init attests "
+            "permission_mode=always-proceed even though the run was launched "
+            "read-only (no skip flag + staged --settings deny block) — the CLI "
+            "ignored the per-run permissions block. A plan run that silently "
+            "has write access is worse than a failed plan run, so the backend "
+            "logs [ERROR][ANTIGRAVITY] read-only not in effect and refuses "
+            "the result (RuntimeError, outside retryable_exceptions → one "
+            "attempt). The planner's exception boundary turns that into the "
+            "FAILED comment; the task parks in failed with the /retry hint, "
+            "and the successful-looking plan text never reaches the thread."
+        ),
+        # The failure only exists where the self-check does: on the default
+        # claude_code axis the very same response is just a successful plan,
+        # so the shared expect cannot describe both (unlike the other agy
+        # rows, which are deliberately dual-axis).
+        "skip_backends": ["claude_code"],
+        "start": {
+            "issue": {"body": "/plan"},
+            "queue_task": None,
+        },
+        "claude_responses": [
+            {
+                "text": "<AUTOSWE_PLAN>This plan would have shipped anyway.</AUTOSWE_PLAN>",
+                "session_id": "s-agy-plan-42",
+                "subtype": "success",
+                # Pin the init posture to override the spawn-time derivation
+                # (which would otherwise attest request-review, matching the
+                # read-only flags, and the check would pass).
+                "permission_mode": "always-proceed",
+            },
+        ],
+        "git_calls": ["create_worktree"],
+        "expect": {
+            "label_after": "autoswe:failed",
+            "autoswe_status": "failed",
+            "comment_contains": [
+                "Failed:",
+                "read-only not in effect",
+            ],
+        },
+    },
+    {
+        "name": "agy_fix_killed",
+        "description": (
+            "/fix whose agy run is interrupted mid-flight (result ERROR with "
+            "finished_reason \"interrupted\" — the CLI trapped our SIGTERM → "
+            "subtype \"killed\") → failed with the /retry hint. killed is a "
+            "RETRYABLE subtype, but a plain dispatch never burns the retry budget "
+            "(AGENT_RETRY_ON_FAILURE defaults to 0), so the task reaches the same "
+            "parked-failed state as any other error subtype."
+        ),
+        "start": {
+            "issue": {"body": "/fix"},
+            "queue_task": None,
+        },
+        "claude_responses": [
+            {"text": "", "session_id": "s-fix-42", "subtype": "killed"},
+        ],
+        "git_calls": ["create_worktree"],
+        "expect": {
+            "label_after": "autoswe:failed",
+            "autoswe_status": "failed",
+            "comment_contains": ["Failed:", "/retry", "subtype=killed"],
+        },
+    },
+    {
+        "name": "agy_fix_config_error",
+        "description": (
+            "antigravity-specific: /fix where the harness names a model the CLI "
+            "rejects (unknown_model.jsonl shape: a bare ERROR result naming a "
+            "config-level failure → subtype \"config_error\"). config_error stays "
+            "OUTSIDE every backend's retryable_subtypes — with "
+            "AGENT_RETRY_ON_FAILURE=1 (row meta runner_retries) the runner must "
+            "still make exactly ONE attempt, and the FAILED comment names the "
+            "subtype so the operator fixes the profile, not the task."
+        ),
+        "meta": {"runner_retries": 1},
+        "start": {
+            "issue": {"body": "/fix"},
+            "queue_task": None,
+        },
+        "claude_responses": [
+            {
+                "text": (
+                    'invalid model selection (--model "does-not-exist"): model '
+                    "does-not-exist is not recognized as a known model or custom model in settings"
+                ),
+                "session_id": "s-fix-42",
+                "subtype": "config_error",
+            },
+        ],
+        "git_calls": ["create_worktree"],
+        "expect": {
+            "label_after": "autoswe:failed",
+            "autoswe_status": "failed",
+            "comment_contains": ["Failed:", "/retry", "subtype=config_error"],
+        },
+    },
+    {
+        "name": "agy_retry_fresh_even_with_agy_checkpoint",
+        "description": (
+            "antigravity-specific: /retry from failed with a checkpoint produced "
+            "BY the antigravity backend itself (last_good_session_backend="
+            "'antigravity') — provenance MATCHES, but agy has no session_fork "
+            "capability, so the provenance gate (which requires the fix backend "
+            "to advertise session_fork before forking anything) still declines: "
+            "the fix runs FRESH, and the checkpoint id is never handed to "
+            "--conversation. The same gate rejects a foreign-backend checkpoint "
+            "(claude checkpoint vs agy fix) — see retry_forks_from_last_good_"
+            "session run on the antigravity axis."
+        ),
+        "start": {
+            "issue": {"body": "/fix"},
+            "labels": ["autoswe:failed"],
+            "comments": [
+                {
+                    "body": "Failed: timeout\n\nPost `/retry` to continue.\n<!-- autoswe-bot -->",
+                    "created_at": "2026-01-01T01:00:00Z",
+                    "author_association": "OWNER",
+                    "user": {"login": "owner", "id": 1, "type": "User"},
+                },
+                {
+                    "body": "/retry",
+                    "created_at": "2026-01-01T02:00:00Z",
+                    "author_association": "OWNER",
+                    "user": {"login": "owner", "id": 1, "type": "User"},
+                },
+            ],
+            "queue_task": {
+                "id": "gh:owner_repo_42",
+                "owner": "owner", "repo": "repo", "issue_number": 42,
+                "title": "Test issue", "body": "/fix",
+                "autoswe_status": "failed",
+                "base_branch": "main",
+                "attempt_count": 2,
+                "last_dispatched_command": "/fix",
+                # Checkpoint produced BY antigravity — provenance matches the
+                # agy fix backend, but the fix backend still lacks session_fork,
+                # so no resume is attempted at all.
+                "session_id": None,
+                "last_good_session_id": "s-agy-plan-good-42",
+                "last_good_session_backend": "antigravity",
+                "first_dispatched_at": None,
+                "provider": "github",
+            },
+        },
+        "claude_responses": [
+            {"text": "DONE_SUMMARY\tFixed\tabc1234", "session_id": "s-agy-fix-42", "subtype": "success"},
+        ],
+        "git_calls": ["create_worktree", "commit_and_push"],
+        "expect": {
+            "label_after": "autoswe:fixed",
+            "autoswe_status": "fixed",
+            "comment_contains": ["Completed with command"],
+            # Default claude_code axis: checkpoint backend 'antigravity' is also
+            # foreign to claude_code (no session_fork capability on agy's side
+            # either) → fresh, no fork.
+            "claude_calls": [
+                {"resume": None, "fork_session": False},
+            ],
+        },
+    },
     {
         "name": "dispatched_command_noop",
         "description": "Task in planning state; new /fix command → noop",
@@ -2424,7 +2735,19 @@ TRANSITIONS: list[dict[str, Any]] = [
             },
         },
         "claude_responses": [
-            {"text": "## Summary\n\nPlan looks solid.\n\n## Verdict\n\nLGTM", "session_id": "s-review-42", "subtype": "success"},
+            {
+                "text": "## Summary\n\nPlan looks solid.\n\n## Verdict\n\nLGTM",
+                "session_id": "s-review-42",
+                "subtype": "success",
+                # antigravity axis: REVIEW_SCHEMA payload — report_markdown
+                # replaces the text report, and the structured verdict wins
+                # before the "## Verdict" regex (_verdict_from_result). Other
+                # feeders ignore the key, keeping the claude axis unchanged.
+                "structured_output": {
+                    "report_markdown": "## Summary\n\nPlan looks solid.\n\n## Verdict\n\nLGTM",
+                    "verdict": "LGTM",
+                },
+            },
         ],
         "git_calls": ["worktree_path", "create_worktree", "sync_branch"],
         "expect": {
@@ -2468,7 +2791,17 @@ TRANSITIONS: list[dict[str, Any]] = [
             },
         },
         "claude_responses": [
-            {"text": "## Findings\n\n[CRITICAL] count_vowels misses uppercase.\n\n## Verdict\n\nBlocked", "session_id": "s-review-42", "subtype": "success"},
+            {
+                "text": "## Findings\n\n[CRITICAL] count_vowels misses uppercase.\n\n## Verdict\n\nBlocked",
+                "session_id": "s-review-42",
+                "subtype": "success",
+                # antigravity axis: the structured verdict ("Blocked") drives
+                # review_blocked through the gate without the markdown regex.
+                "structured_output": {
+                    "report_markdown": "## Findings\n\n[CRITICAL] count_vowels misses uppercase.\n\n## Verdict\n\nBlocked",
+                    "verdict": "Blocked",
+                },
+            },
         ],
         "git_calls": ["worktree_path", "create_worktree", "sync_branch"],
         "expect": {
@@ -3334,6 +3667,42 @@ PI_TRANSITIONS: list[str] = [
     "pi_retry_forks_from_pi_checkpoint",               # /retry: pi forks (--fork) from a pi checkpoint
     "retry_no_fork_when_checkpoint_backend_mismatches",  # codex checkpoint vs pi fix → fresh (provenance gate rejects)
     "waiting_resume_mcp_post_plan",                    # waiting -> planned via MCP post_plan on the pi axis (MCP event drives PLAN_READY, no tag in text)
+]
+
+
+# ---------------------------------------------------------------------------
+# Antigravity backend transition rows
+
+# Curated set of transition names to run against the antigravity (agy) backend.
+# These cover the Phase 1/2 divergences: read-only ENFORCEMENT via the staged
+# per-run --settings block (Phase 4 — no loud-degrade, skip flag never reaches
+# plan/review, and the §4.4 permission_mode self-check fails a misattested
+# read-only run), structured_output on every plan/review
+# run (--json-schema always requested), --conversation resume semantics, the
+# provenance gate declining EVERY /retry (agy has no session_fork capability,
+# even when the checkpoint's backend matches), the killed/config_error subtype
+# split (killed retryable, config_error never), and the WAITING result status.
+#
+# Unlike the codex/pi axes (GitHub-only to bound the matrix), this axis runs on
+# BOTH providers: the agy divergence surface is provider-independent, and the
+# azure conversion of these rows is itself part of the Phase 3 exit criteria.
+
+ANTIGRAVITY_TRANSITIONS: list[str] = [
+    "fresh_plan_command",                       # text-pattern plan + staged --settings enforcement (mode, no skip flag); Phase 5: also the kept text-fallback row — mcp advertised, tool never called, planner falls through to tag parse
+    "agy_plan_structured_output",               # --json-schema plan payload preferred over the tags
+    "agy_plan_waiting_status",                  # result WAITING → planner parks the task in waiting
+    "agy_plan_mcp_post_plan",                   # Phase 5: eager post_plan tool pair → has_mcp PLAN_READY + #241 re-push
+    "agy_plan_mcp_post_question",               # Phase 5: eager post_question tool pair → has_mcp WAITING (question-terminal)
+    "agy_plan_permission_mode_mismatch",        # §4.4: init attests always-proceed on a plan run → backend refuses → failed
+    "fresh_fix_command",                        # Fix phase: fresh run, default --dangerously-skip-permissions
+    "plan_ready_then_fix",                      # fix from planned → --conversation resumes the checkpoint
+    "fresh_fix_fails",                          # error subtype → failed (retryable subtype, budget not spent)
+    "agy_fix_killed",                           # interrupted run → subtype killed → failed
+    "agy_fix_config_error",                     # unknown model → config_error: ONE attempt even with retry budget
+    "retry_forks_from_last_good_session",       # claude checkpoint vs agy fix → fresh (mixed backends, never --conversation a claude id)
+    "agy_retry_fresh_even_with_agy_checkpoint",  # matching provenance but no session_fork capability → still fresh
+    "planned_then_review",                      # review verdict via structured REVIEW_SCHEMA
+    "planned_then_review_blocked",              # structured "Blocked" verdict gates /pr
 ]
 
 

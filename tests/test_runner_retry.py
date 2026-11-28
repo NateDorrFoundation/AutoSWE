@@ -268,6 +268,39 @@ def test_runner_exhausts_retries_returns_last_result():
     assert len(calls) == 3
 
 
+def test_runner_no_retry_on_config_error_subtype():
+    """config_error subtype is NEVER retried (Phase 1 agy / codex contract).
+
+    A config-level failure (unknown model, auth) means the profile is wrong;
+    burning retries cannot fix it.  It must stay outside every backend's
+    retryable_subtypes so the runner returns the FIRST result immediately and
+    the FAILED comment carries the CLI's own text (no second run).
+    """
+    from autoswe.harness import runner
+
+    backend = _SequenceBackend(["config_error", "success"])
+    calls: list[str] = []
+
+    original_run = backend.run
+    def tracking_run(spec):
+        coro = original_run(spec)
+        calls.append("call")
+        return coro
+    backend.run = tracking_run
+
+    with patch("autoswe.harness.runner.ClaudeCodeBackend", return_value=backend):
+        result = runner.run(
+            "test",
+            cwd="/tmp",
+            cfg=_cfg(retries=2),
+        )
+
+    assert result.subtype == "config_error", (
+        "config_error must not be retried — the profile is wrong, not the run"
+    )
+    assert len(calls) == 1, f"Expected 1 call (no retry), got {len(calls)}"
+
+
 # ---------------------------------------------------------------------------
 # Exception-based retry — each backend owns its retryable set (S6 / #169 F-09)
 # ---------------------------------------------------------------------------
@@ -343,6 +376,80 @@ def test_runner_does_not_retry_on_foreign_exception():
             runner.run("test", cwd="/tmp", cfg=_cfg(retries=1))
 
     assert backend.attempts == 1, "foreign exception must not be retried"
+
+
+class _CliSurfaceBackend:
+    """Backend with the antigravity/Codex/pi exception surface.
+
+    ``retryable_exceptions()`` is the CLI-subprocess tuple
+    (asyncio.TimeoutError, OSError): the first run raises a spawn-time
+    OSError (transient exec failure), the second succeeds.  A RuntimeError
+    (the backend's config-death shape from _resolve_agy_executable) is
+    raised OUTSIDE the tuple and must propagate untouched.
+    """
+
+    def __init__(self, raise_on: type[BaseException], attempts_before_success: int = 1):
+        self._raise_on = raise_on
+        self._failures_left = attempts_before_success
+        self.attempts = 0
+
+    @classmethod
+    def capabilities(cls) -> set[str]:
+        return {"resume", "progress_stream", "structured_output"}
+
+    @classmethod
+    def retryable_subtypes(cls) -> set[str]:
+        return {"error", "killed"}
+
+    @classmethod
+    def retryable_exceptions(cls) -> tuple:
+        import asyncio
+
+        return (asyncio.TimeoutError, OSError)
+
+    def run(self, spec: RunSpec):
+        async def _go():
+            self.attempts += 1
+            if self._failures_left > 0:
+                self._failures_left -= 1
+                raise self._raise_on("spawn failure")
+            return _make_result("success")
+        return _go()
+
+
+def test_runner_retries_spawn_oserror_under_cli_tuple():
+    """A spawn-time OSError is retried when the resolved backend declares it.
+
+    This is the agy spawn surface (AntigravityBackend wraps
+    create_subprocess_exec's PermissionError/OSError into a retryable
+    OSError; _build_argv failures surface elsewhere).  The tuple comes from
+    the backend, never from a hard-coded Claude set.
+    """
+    from autoswe.harness import runner
+
+    backend = _CliSurfaceBackend(OSError)
+    with patch("autoswe.harness.runner.ClaudeCodeBackend", return_value=backend):
+        result = runner.run("test", cwd="/tmp", cfg=_cfg(retries=1))
+
+    assert result.subtype == "success", "OSError in the backend tuple must retry"
+    assert backend.attempts == 2
+
+
+def test_runner_does_not_retry_runtimeerror_config_death():
+    """RuntimeError (agy's config-error conversion) is outside the CLI tuple.
+
+    _resolve_agy_executable and the spawn-time FileNotFoundError catch both
+    raise RuntimeError precisely so the runner does NOT burn every attempt
+    on a broken profile — it must surface after ONE attempt.
+    """
+    from autoswe.harness import runner
+
+    backend = _CliSurfaceBackend(RuntimeError)
+    with patch("autoswe.harness.runner.ClaudeCodeBackend", return_value=backend):
+        with pytest.raises(RuntimeError):
+            runner.run("test", cwd="/tmp", cfg=_cfg(retries=2))
+
+    assert backend.attempts == 1, "RuntimeError config death must not be retried"
 
 
 def test_runner_retryable_exceptions_fallback_when_missing():

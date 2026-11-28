@@ -884,6 +884,49 @@ def test_plan_does_not_warn_when_backend_enforces_read_only(
     )
 
 
+def test_plan_does_not_degrade_on_antigravity_now_that_mode_is_advertised(
+    tmp_path, mock_gh_post_comment
+):
+    """Phase 4 §4.5: antigravity advertises 'mode' (per-run --settings deny
+    block), so the planner must NOT emit the #166 loud-degrade — the same
+    silent-degrade gap that previously applied to agy is now closed."""
+    run_calls = []
+
+    def fake_run(prompt, **kwargs):
+        run_calls.append(kwargs)
+        from autoswe.harness.runner import RunResult
+        return RunResult("<AUTOSWE_PLAN>\nPlan\n</AUTOSWE_PLAN>", "sess", "success")
+
+    task = {
+        "id": "o_r_1", "owner": "o", "repo": "r", "issue_number": 1,
+        "title": "Test", "body": "/plan", "base_branch": "master",
+        "session_id": None, "_token": "ghp_fake",
+    }
+
+    agy_harness = {"backend": "antigravity", "model": "gemini-test"}
+    log_mock = MagicMock()
+    with patch("autoswe.harness.planner.create_worktree", return_value=tmp_path):
+        with patch("autoswe.harness.planner._find_latest_plan_file", return_value=None):
+            with patch("autoswe.tracking.api._fetch_comments", return_value=[]):
+                with patch(
+                    "autoswe.harness.planner.resolve_harness",
+                    return_value=agy_harness,
+                ):
+                    with patch("autoswe.harness.planner.log", log_mock):
+                        with patch("autoswe.harness.runner.run", side_effect=fake_run):
+                            from autoswe.harness.planner import run_plan
+                            run_plan(task, {}, {"GITHUB_TOKEN": "tok"})
+
+    assert len(run_calls) == 1
+    assert run_calls[0]["mode"] == "plan", "agy plan runs still signal plan intent"
+    warn_msgs = [str(c.args[0]) for c in log_mock.call_args_list
+                 if c.args and "read-only enforcement" in str(c.args[0])]
+    assert not warn_msgs, (
+        "antigravity now advertises 'mode' (§4.5) — the loud-degrade path "
+        "must no longer fire for it"
+    )
+
+
 # The behavioral read-only guarantee (a mode="plan" run cannot leave the
 # worktree dirty, asserted identically on both backends) lives in
 # tests/test_backend_parity.py::TestReadOnlyBehavioralParity — the single

@@ -27,6 +27,16 @@ Both floors are enforced by the offline suite, each with an actionable failure m
 Raising either floor is a one-line change in the corresponding test (`MIN_SDK_VERSION` /
 `MIN_CLI_VERSION`) plus the version quoted here.
 
+The **Antigravity CLI** carries its own independent floor: **`agy 1.5.11`**, exposed as
+`MIN_AGY_VERSION` in `autoswe/harness/backends/antigravity.py` and enforced by
+`tests/test_agy_cli_version.py` with the same skip semantics as `test_cli_version.py` —
+it skips when no `agy` resolves or the version can't be queried, so CI without `agy`
+stays green. The backend itself never fails a run on version: it logs
+`[WARN][ANTIGRAVITY] ... below the pinned floor ...` once per process. `agy` self-updates
+on interactive launch, so `update.sh`/`update.ps1` deliberately never touch it (only
+`autoswe` code goes through the update scripts). Raising this floor is a one-line change
+to `MIN_AGY_VERSION` plus the version quoted here.
+
 ## GitHub API version pin
 
 Every autoSWE call to the GitHub REST API sends a pinned
@@ -164,9 +174,11 @@ Keys are validated: missing ``provider`` raises ``ValueError``, any entry withou
 
 Loaded by ``core/config.py:load_harnesses_config()``. Keys starting with ``_`` are skipped.
 
-Defines **named harness profiles** that bundle a coding backend (``claude_code``, ``codex``) with its model and auth/runtime settings. Phases reference a profile by name via ``plan_harness``, ``fix_harness``, or ``review_harness`` in repos.json (or ``PLAN_HARNESS``, ``FIX_HARNESS``, ``REVIEW_HARNESS`` in autoswe.env).
+Defines **named harness profiles** that bundle a coding backend (``claude_code``, ``codex``, ``pi``, ``antigravity``) with its model and auth/runtime settings. Phases reference a profile by name via ``plan_harness``, ``fix_harness``, or ``review_harness`` in repos.json (or ``PLAN_HARNESS``, ``FIX_HARNESS``, ``REVIEW_HARNESS`` in autoswe.env).
 
-Each profile requires a ``backend`` field (``"claude_code"`` or ``"codex"``). ``model`` is required for ``codex`` profiles (no built-in default); optional otherwise. Other optional fields: ``timeout``, ``cli_path``, ``api_key_env``, ``anthropic_base_url``, ``anthropic_auth_token``, ``env`` (a ``{key: value}`` map of extra environment variables merged into the backend's child process — see [harnesses.md](harnesses.md#per-profile-env)).
+Each profile requires a ``backend`` field (``"claude_code"``, ``"codex"``, ``"pi"``, or ``"antigravity"``). ``model`` is required for ``codex``, ``pi``, and ``antigravity`` profiles — none of these CLIs has a reproducible built-in default (pi would silently pick a settings default; agy falls back to the account's last-selected model); optional otherwise. Other optional fields: ``timeout``, ``cli_path``, ``api_key_env``, ``anthropic_base_url``, ``anthropic_auth_token``, ``env`` (a ``{key: value}`` map of extra environment variables merged into the backend's child process — see [harnesses.md](harnesses.md#per-profile-env)).
+
+``harnesses.json.example`` ships pi profiles (``pi-opus``, ``pi-gpt``, ``pi-local``) and the antigravity ones: ``agy-neon`` (auth via a one-time interactive ``agy`` login on the host, or ``gemini_api_key``; set ``useG1Credits=false`` in ``~/.gemini/antigravity-cli/settings.json`` to avoid overage billing), ``agy-flash`` (BYOK via ``gemini_api_key: ${GEMINI_API_KEY}``), and ``agy-orchestrator`` (the ``"Orchestrator (Neon)"`` Planner+Hydrogen pair — ``effort`` does not apply to it). The antigravity CLI is a user-level install with interactive auth: ``agy`` is **not** on the default non-login PATH (its install dir is ``~/.local/bin``), so live profiles must pin an absolute ``cli_path``.
 
 Full documentation: [harnesses.md](harnesses.md).
 
@@ -185,7 +197,7 @@ For each phase (plan, fix, review):
 1. ``repos.json`` phase-specific: ``plan_model`` (for `/plan`), ``fix_model`` (for `/fix`), or ``review_model`` (for `/review`)
 2. ``autoswe.env`` phase-specific: ``PLAN_MODEL``, ``FIX_MODEL``, or ``REVIEW_MODEL``
 3. ``repos.json`` generic: ``model``
-4. Backend default (e.g. Claude Code's built-in default model; Codex has no built-in default — its profile must set ``model``)
+4. Backend default (e.g. Claude Code's built-in default model; Codex, pi, and antigravity have no reproducible built-in default — their profiles must set ``model``)
 
 Code path: ``config.py:resolve_harness()`` → ``config.py:load_harnesses_config()``. Model fallback inside synthesized profile uses the same chain as handlers (e.g. ``planner.py``, ``coder.py``, ``reviewer.py``).
 
